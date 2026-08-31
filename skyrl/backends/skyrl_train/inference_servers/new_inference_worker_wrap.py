@@ -254,6 +254,13 @@ def _load_checkpoint_weights(
     **kwargs: Any,
 ) -> Any:
     """Load ordinary checkpoint tensors and compact batched-MoE FP8 tensors."""
+    from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
+        is_rwkv_model,
+        load_rwkv_checkpoint_weights,
+    )
+
+    if is_rwkv_model(model):
+        return load_rwkv_checkpoint_weights(model, list(weights))
     params_dict: dict[str, torch.nn.Parameter] | None = None
     ordinary_weights: list[tuple[str, torch.Tensor]] = []
     for name, weight in weights:

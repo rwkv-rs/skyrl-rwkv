@@ -94,7 +94,7 @@ skyrl-train = [
     "tensordict",
     "jaxtyping",
     "skyrl-gym",
-    "flash-attn==2.8.3; sys_platform == 'linux'",
+
     "polars",
     "s3fs",
     "s5cmd>=0.3.3; sys_platform == 'linux'",
@@ -116,6 +116,7 @@ skyrl-train = [
 
 fsdp = [
     "skyrl[skyrl-train]",
+    "transformers>=5.6.1,<=5.16.1; sys_platform == 'linux'",
     "vllm==0.30.0; sys_platform == 'linux'",
     "vllm-router; sys_platform == 'linux'",
     # The `nixl` shim provides that namespace and dispatches on `torch.version.cuda`,
@@ -134,8 +135,18 @@ fsdp = [
     "torchvision; sys_platform == 'linux'",
 ]
 
+rwkv = [
+    "skyrl[skyrl-train]",
+    "torch==2.13.0; sys_platform == 'linux'",
+    "transformers==5.16.0.dev0; sys_platform == 'linux'",
+    "vllm; sys_platform == 'linux'",
+    "FlashRWKV2==0.1.0a13; sys_platform == 'linux'",
+    "tokenizers; sys_platform == 'linux'",
+]
+
 megatron = [
     "skyrl[skyrl-train]",
+    "transformers>=5.6.1,<=5.16.1; sys_platform == 'linux'",
     "transformer-engine[pytorch]==2.19.0; sys_platform == 'linux'",
     # Declared directly (not just via transformer-engine[pytorch]) so the
     # [tool.uv.sources] index below is honored — uv ignores sources for
@@ -277,14 +288,25 @@ conflicts = [
         { extra = "jax" },
         { extra = "megatron" },
         { extra = "fsdp" },
+        { extra = "rwkv" },
     ],
     [
         { extra = "megatron" },
         { extra = "gpu" },
         { extra = "tpu" },
         { extra = "miniswe" },
-    ]
+    ],
+    [
+        { extra = "rwkv" },
+        { extra = "fa4" },
+    ],
+    [
+        { extra = "rwkv" },
+        { extra = "gpu" },
+        { extra = "tpu" },
+    ],
 ]
+
 # disable build isolation for megatron related dependencies
 no-build-isolation-package = [
     "nv-grouped-gemm",
@@ -345,9 +367,64 @@ override-dependencies = [
     "torchvision==0.28.0; sys_platform == 'linux'",
 ]
 
+# The RWKV vLLM fork computes its metadata dynamically from requirements/rwkv.txt.
+# Keep the exact fork version resolvable while binding it to this extra's exact
+# Transformers and tokenizer revisions through the sources below.
+[[tool.uv.dependency-metadata]]
+name = "vllm"
+version = "0.23.1rc1.dev3063+g024fc92a2.rwkv"
+requires-python = ">=3.10,<3.15"
+requires-dist = [
+    "torch==2.13.0",
+    "transformers==5.16.0.dev0",
+    "tokenizers==0.23.2.dev0",
+    "FlashRWKV2==0.1.0a13",
+    "ninja",
+    "setuptools>=77.0.3,<81.0.0",
+    "regex",
+    "cachetools",
+    "psutil",
+    "numpy",
+    "requests>=2.26.0",
+    "tqdm",
+    "blake3",
+    "py-cpuinfo",
+    "huggingface_hub>=1.28.0",
+    "safetensors>=0.6.2",
+    "protobuf>=5.29.6,!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*",
+    "typing_extensions>=4.10",
+    "filelock>=3.16.1",
+    "pyyaml",
+    "cloudpickle",
+    "packaging>=24.2",
+    "jinja2>=3.1.6",
+    "einops",
+    "pillow",
+    "fastapi[standard]>=0.133.0,<0.137.0",
+    "starlette>=1.0.1",
+    "aiohttp>=3.13.3",
+    "openai>=2.0.0",
+    "openai-harmony>=0.0.3",
+    "partial-json-parser",
+    "pydantic>=2.12.0",
+    "prometheus_client>=0.18.0",
+    "prometheus-fastapi-instrumentator>=8.0.0",
+    "pyzmq>=25.0.0",
+    "msgspec",
+    "model-hosting-container-standards>=0.1.14,<1.0.0",
+    "watchfiles",
+    "python-json-logger",
+    "setproctitle",
+    "pybase64",
+    "cbor2",
+    "jsonschema>=4.23.0",
+    "xgrammar>=0.2.1,<1.0.0",
+]
+
 [tool.uv.extra-build-dependencies]
 flash-attn = [{requirement = "torch", match-runtime = true}]
 fast-hadamard-transform = ["torch==2.13.0", "ninja"]
+vllm = ["torch==2.13.0"]
 
 [tool.uv.extra-build-variables]
 flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE"}
@@ -356,6 +433,7 @@ fast-hadamard-transform = { FAST_HADAMARD_TRANSFORM_FORCE_BUILD = "TRUE"}
 # only adds CUPTI's include dir and fails with `cuda.h: No such file or directory` unless
 # the toolkit's headers are on the default include path, so skip building it.
 nvidia-resiliency-ext = { STRAGGLER_DET_SKIP_CUPTI_EXT_BUILD = "1" }
+vllm = { VLLM_BUILD_PROFILE = "rwkv" }
 
 
 [[tool.uv.index]]
@@ -397,6 +475,9 @@ explicit = true
 [tool.uv.sources]
 skyrl-gym = { path = "./skyrl-gym", editable = true }
 skycap = { path = "./skycap", editable = true }
+transformers = { git = "https://github.com/rwkv-rs/transformers-rwkv", rev = "55a890b5d5f7d46e49232757748a36044956d1fe", extra = "rwkv" }
+vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "024fc92a22684a45ff8b19acb400787dcdb008e5", extra = "rwkv" }
+tokenizers = { git = "https://github.com/rwkv-rs/tokenizers-rwkv", rev = "c5d8dde5ff49c70e4656199d5033a84e03c21b2b", subdirectory = "bindings/python", extra = "rwkv" }
 # Match torch's CUDA variant (cu130).
 flashinfer-jit-cache = { index = "flashinfer-cu130", marker = "sys_platform == 'linux'" }
 flashinfer-cubin = { index = "flashinfer", marker = "sys_platform == 'linux'" }

@@ -349,7 +349,8 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
     def _set_pad_token_id(self, pad_token_id):
         # NOTE (sumanthrh): self.model -> HFModelWrapper; self.model.model -> AutoModelForCausalLM
-        self.model.model.config.pad_token_id = pad_token_id
+        if not self.model.is_recurrent:
+            self.model.model.config.pad_token_id = pad_token_id
 
     def forward(
         self,

@@ -270,7 +270,11 @@ class HFModelWrapper(nn.Module):
             bucket_indices = torch.nonzero(valid_lengths == sequence_length_tensor, as_tuple=True)[0]
             bucket_sequences = sequences.index_select(0, bucket_indices)[:, -sequence_length:]
             bucket_labels = torch.roll(bucket_sequences, shifts=-1, dims=1)
-            bucket_output = self.model(bucket_sequences)
+            # RWKV's training kernels require native BF16 throughout the model.
+            # CUDA autocast promotes LayerNorm to FP32, so disable an enclosing
+            # trainer/ref autocast region while the recurrent model runs.
+            with torch.autocast(device_type=bucket_sequences.device.type, enabled=False):
+                bucket_output = self.model(bucket_sequences)
             bucket_logits = bucket_output["logits"]
             bucket_logits.div_(temperature)
             bucket_log_probs = logprobs_from_logits(

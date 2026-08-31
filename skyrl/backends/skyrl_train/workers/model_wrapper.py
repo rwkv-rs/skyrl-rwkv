@@ -259,7 +259,7 @@ class HFModelWrapper(nn.Module):
         compute_entropy: bool,
         entropy_requires_grad: bool,
     ) -> torch.Tensor:
-        """Run independent recurrent streams grouped by their unpadded length."""
+        """Run independent recurrent streams without left padding."""
         batch_size, padded_length = sequences.shape
         valid_lengths = attention_mask.sum(dim=-1)
         log_probs = None
@@ -267,20 +267,27 @@ class HFModelWrapper(nn.Module):
 
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             # FSDP collectives must be entered the same number of times on every
-            # rank. Local length buckets can differ across ranks, while the
-            # per-rank microbatch size is shared, so use one stream per call.
-            buckets = (
-                (valid_lengths[index], valid_lengths.new_tensor([index])) for index in range(batch_size)
-            )
+            # rank. Local length buckets can differ across ranks, so use one
+            # right-padded bucket per microbatch. Tail padding cannot affect
+            # earlier logits in a causal recurrent model.
+            buckets = ((valid_lengths, torch.arange(batch_size, device=sequences.device)),)
         else:
             buckets = (
-                (sequence_length, torch.nonzero(valid_lengths == sequence_length, as_tuple=True)[0])
+                (
+                    valid_lengths[valid_lengths == sequence_length],
+                    torch.nonzero(valid_lengths == sequence_length, as_tuple=True)[0],
+                )
                 for sequence_length in valid_lengths.unique(sorted=True)
             )
 
-        for sequence_length_tensor, bucket_indices in buckets:
-            sequence_length = int(sequence_length_tensor.item())
-            bucket_sequences = sequences.index_select(0, bucket_indices)[:, -sequence_length:]
+        for bucket_lengths, bucket_indices in buckets:
+            bucket_length = int(bucket_lengths.max().item())
+            bucket_sequences = sequences.new_zeros((bucket_indices.numel(), bucket_length))
+            for bucket_row, (sequence_index, sequence_length_tensor) in enumerate(
+                zip(bucket_indices, bucket_lengths, strict=True)
+            ):
+                sequence_length = int(sequence_length_tensor.item())
+                bucket_sequences[bucket_row, :sequence_length] = sequences[sequence_index, -sequence_length:]
             bucket_labels = torch.roll(bucket_sequences, shifts=-1, dims=1)
             # RWKV's training kernels require native BF16 throughout the model.
             # CUDA autocast promotes LayerNorm to FP32, so disable an enclosing
@@ -303,7 +310,12 @@ class HFModelWrapper(nn.Module):
                 bucket_labels,
                 inplace_backward=True,
             )
-            bucket_log_probs = nn.functional.pad(bucket_log_probs, (padded_length - sequence_length, 0))
+            bucket_log_probs = torch.stack(
+                [
+                    nn.functional.pad(row[: int(length.item())], (padded_length - int(length.item()), 0))
+                    for row, length in zip(bucket_log_probs, bucket_lengths, strict=True)
+                ]
+            )
             if log_probs is None:
                 log_probs = bucket_log_probs.new_zeros((batch_size, padded_length))
             log_probs = log_probs.index_copy(0, bucket_indices, bucket_log_probs)
@@ -315,7 +327,12 @@ class HFModelWrapper(nn.Module):
                     attention_mask=None,
                     chunk_size=self.logprobs_chunk_size,
                 )
-                bucket_entropy = nn.functional.pad(bucket_entropy, (padded_length - sequence_length, 0))
+                bucket_entropy = torch.stack(
+                    [
+                        nn.functional.pad(row[: int(length.item())], (padded_length - int(length.item()), 0))
+                        for row, length in zip(bucket_entropy, bucket_lengths, strict=True)
+                    ]
+                )
                 if entropy is None:
                     entropy = bucket_entropy.new_zeros((batch_size, padded_length))
                 entropy = entropy.index_copy(0, bucket_indices, bucket_entropy)

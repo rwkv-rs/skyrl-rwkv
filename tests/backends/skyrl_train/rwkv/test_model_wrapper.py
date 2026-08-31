@@ -6,6 +6,10 @@ import torch
 from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
     get_vllm_sampling_params,
 )
+from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
+    load_rwkv_checkpoint_weights,
+    refresh_rwkv_runtime_weights,
+)
 from skyrl.backends.skyrl_train.utils import torch_utils as torch_utils_module
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
 from skyrl.backends.skyrl_train.workers import model_wrapper as model_wrapper_module
@@ -29,6 +33,59 @@ class ToyCausalLM(torch.nn.Module):
     def forward(self, input_ids, **kwargs):
         self.calls.append((input_ids.detach().clone(), kwargs))
         return {"logits": self.lm_head(self.embed_tokens(input_ids))}
+
+
+class ToyRwkvAttention(torch.nn.Module):
+    def __init__(self, layer_idx: int) -> None:
+        super().__init__()
+        self.layer_idx = layer_idx
+        for name in ("w1", "a1", "g1", "w2", "a2", "g2", "v1", "v2"):
+            self.register_parameter(name, torch.nn.Parameter(torch.randn(2, 3)))
+        for name in (
+            "w1_canonical",
+            "a1_canonical",
+            "g1_canonical",
+            "w2_canonical",
+            "a2_canonical",
+            "g2_canonical",
+            "v1_canonical",
+            "v2_canonical",
+        ):
+            self.register_buffer(name, torch.full((3, 2), torch.nan))
+        self.register_buffer("layer_zero_v0", torch.full((2,), torch.nan))
+        self.register_buffer("layer_zero_v1_runtime", torch.full((2, 3), torch.nan))
+        self.register_buffer("layer_zero_v2_runtime", torch.full((3, 2), torch.nan))
+
+
+class ToyRwkvLayer(torch.nn.Module):
+    def __init__(self, layer_idx: int) -> None:
+        super().__init__()
+        self.linear_attn = ToyRwkvAttention(layer_idx)
+        self.mlp = torch.nn.Module()
+        self.mlp.value = torch.nn.Module()
+        self.mlp.value.weight = torch.nn.Parameter(torch.empty(4, 2))
+
+
+class ToyVllmRwkv(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(model_type="rwkv")
+        self.model = torch.nn.Module()
+        self.model.config = SimpleNamespace(layer_norm_epsilon=1e-5)
+        self.model.embed_tokens = torch.nn.Embedding(5, 2, dtype=torch.float16)
+        self.model.embedding_norm = torch.nn.LayerNorm(2, dtype=torch.bfloat16)
+        self.model.layers = torch.nn.ModuleList([ToyRwkvLayer(0), ToyRwkvLayer(1)])
+        self.model.start_layer = 0
+        self.model.end_layer = 2
+        self.model._embedding_norm_folded = False
+
+    def load_weights(self, weights):
+        loaded = set()
+        with torch.no_grad():
+            for name, weight in weights:
+                self.get_parameter(name).copy_(weight)
+                loaded.add(name)
+        return loaded
 
 
 def expected_action_log_probs(model, sequences, attention_mask, num_actions):
@@ -90,6 +147,37 @@ def test_rwkv_recurrent_forward_preserves_gradients():
     assert torch.isfinite(model.lm_head.weight.grad).all()
 
 
+def test_rwkv_weight_reload_preserves_runtime_layout_and_derived_storage():
+    model = ToyVllmRwkv()
+    checkpoint_value = torch.arange(8, dtype=torch.float16).view(2, 4)
+    checkpoint_embedding = torch.arange(10, dtype=torch.float16).view(5, 2)
+    canonical = model.model.layers[1].linear_attn.w1_canonical
+    canonical_data_ptr = canonical.data_ptr()
+
+    loaded = load_rwkv_checkpoint_weights(
+        model,
+        [
+            ("model.layers.0.mlp.value.weight", checkpoint_value),
+            ("model.embed_tokens.weight", checkpoint_embedding),
+        ],
+    )
+    refresh_rwkv_runtime_weights(
+        model,
+        lambda embedding, weight, bias, eps: embedding.to(torch.float16) + 1,
+    )
+
+    assert loaded == {
+        "model.layers.0.mlp.value.weight",
+        "model.embed_tokens.weight",
+    }
+    assert torch.equal(model.model.layers[0].mlp.value.weight, checkpoint_value.T)
+    assert torch.equal(model.model.embed_tokens.weight, checkpoint_embedding + 1)
+    assert model.model._embedding_norm_folded
+    assert canonical.data_ptr() == canonical_data_ptr
+    assert torch.equal(canonical, model.model.layers[1].linear_attn.w1.T)
+    assert torch.count_nonzero(model.model.layers[0].linear_attn.v1_canonical) == 0
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -121,7 +209,7 @@ def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):
         model_type="rwkv",
         vision_config=None,
         use_cache=True,
-        to_dict=lambda: {},
+        to_dict=dict,
     )
     model = ToyCausalLM()
     model.config = config

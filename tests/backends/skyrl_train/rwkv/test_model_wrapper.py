@@ -35,6 +35,16 @@ class ToyCausalLM(torch.nn.Module):
         return {"logits": self.lm_head(self.embed_tokens(input_ids))}
 
 
+class AutocastAwareToyCausalLM(ToyCausalLM):
+    def __init__(self, model_type: str) -> None:
+        super().__init__(model_type=model_type)
+        self.autocast_states = []
+
+    def forward(self, input_ids, **kwargs):
+        self.autocast_states.append(torch.is_autocast_enabled(input_ids.device.type))
+        return super().forward(input_ids, **kwargs)
+
+
 class ToyRwkvAttention(torch.nn.Module):
     def __init__(self, layer_idx: int) -> None:
         super().__init__()
@@ -202,6 +212,20 @@ def test_non_rwkv_model_keeps_direct_forward_path():
     assert len(model.calls) == 1
     assert torch.equal(model.calls[0][0], sequences)
     assert torch.equal(model.calls[0][1]["attention_mask"], attention_mask)
+
+
+def test_rwkv_disables_outer_autocast_without_changing_direct_forward():
+    sequences = torch.tensor([[1, 2, 3]])
+    attention_mask = torch.ones_like(sequences)
+    rwkv_model = AutocastAwareToyCausalLM("rwkv")
+    direct_model = AutocastAwareToyCausalLM("llama")
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        HFModelWrapper(rwkv_model)(sequences, num_actions=2, attention_mask=attention_mask)
+        HFModelWrapper(direct_model)(sequences, num_actions=2, attention_mask=attention_mask)
+
+    assert rwkv_model.autocast_states == [False]
+    assert direct_model.autocast_states == [True]
 
 
 def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):

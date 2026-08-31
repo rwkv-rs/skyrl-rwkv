@@ -205,6 +205,7 @@ def test_rwkv_recipe_kwargs_parse_through_typed_config():
     config = SkyRLTrainConfig.from_cli_overrides(
         [
             "generator.chat_template_kwargs={rwkv_prompt_template: bot, rwkv_generation_prompt: open_think}",
+            "generator.inference_engine.model_dtype=float16",
             "generator.sampling_params.additional_kwargs={presence_penalty: 0.0, frequency_penalty: 0.0, penalty_decay: 1.0}",
             "generator.eval_sampling_params.additional_kwargs={presence_penalty: 1.0, frequency_penalty: 0.1, penalty_decay: 0.988}",
         ]
@@ -214,6 +215,7 @@ def test_rwkv_recipe_kwargs_parse_through_typed_config():
         "rwkv_prompt_template": "bot",
         "rwkv_generation_prompt": "open_think",
     }
+    assert config.generator.inference_engine.model_dtype == "float16"
     assert config.generator.sampling_params.additional_kwargs == {
         "presence_penalty": 0.0,
         "frequency_penalty": 0.0,

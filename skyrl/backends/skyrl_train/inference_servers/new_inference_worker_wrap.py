@@ -31,6 +31,7 @@ import torch
 from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
     LayerwiseReloadWorkerMixin,
     _empty_cuda_cache_rocm,
+    load_rwkv_checkpoint_weights,
 )
 from skyrl.backends.skyrl_train.patches.vllm.patch_hybrid_fp8_kv_wake import (
     patch_hybrid_fp8_kv_wake,
@@ -56,7 +57,7 @@ except ModuleNotFoundError:
 # (e.g. a trainer process), and a missing optional dep must not break them.
 try:
     from skyrl.backends.skyrl_train.weight_sync.sharded_rdt import (
-        rdt_vllm_register,  # noqa: F401
+        rdt_vllm_register,
     )
 
     rdt_vllm_register.ensure_registered()
@@ -171,7 +172,10 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
         model = self.model_runner.model
         with set_current_vllm_config(self.vllm_config), torch.device(self.device):
             if self._skyrl_is_checkpoint_format:
-                model.load_weights(weights=weights)
+                if self._skyrl_rwkv_checkpoint_update:
+                    load_rwkv_checkpoint_weights(model, weights)
+                else:
+                    model.load_weights(weights=weights)
                 # vLLM's load only updates the main model; the spec-decode (MTP/Eagle)
                 # drafter is a separate module and must be reloaded from the same
                 # checkpoint-format weights (see spec_decode_utils).
@@ -228,7 +232,10 @@ class NewInferenceWorkerWrap(LayerwiseReloadWorkerMixin):
 
         def _load_weights(weights):
             weights = list(weights)
-            loaded = model.load_weights(weights=weights)
+            if self._skyrl_rwkv_checkpoint_update:
+                loaded = load_rwkv_checkpoint_weights(model, weights)
+            else:
+                loaded = model.load_weights(weights=weights)
             _reload_spec_decode_drafter(self.model_runner, weights)
             return loaded
 

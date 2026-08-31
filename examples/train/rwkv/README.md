@@ -14,6 +14,10 @@ This recipe runs the native SkyRL FSDP Trainer, vLLM InferenceEngines, weight sy
 
 The `[rwkv]` extra pins the matching Transformers, tokenizer, vLLM-RWKV, FlashRWKV2, and torch cu130 dependency chain. Use the project-local `.venv`; do not reuse another project's environment.
 
+```bash
+uv sync --extra rwkv
+```
+
 ## Download and verify the model
 
 ```bash
@@ -28,7 +32,7 @@ hf download "$MODEL_REPO" \
   --local-dir "$MODEL_ROOT"
 
 MODEL_DIR="$MODEL_ROOT/$MODEL_SUBFOLDER"
-MODEL_DIR="$MODEL_DIR" uv run --isolated --extra rwkv python -c \
+MODEL_DIR="$MODEL_DIR" uv run --no-sync --extra rwkv python -c \
   'import json, os; from pathlib import Path; p=Path(os.environ["MODEL_DIR"]); c=json.loads((p/"config.json").read_text()); assert c["model_type"]=="rwkv"; assert c["architecture_version"]=="rwkv7"; assert c["wkv_mode"]=="fp32io16"; print(c["architectures"], c["wkv_mode"])'
 sha256sum "$MODEL_DIR"/*.safetensors
 ```
@@ -40,7 +44,7 @@ Keep the revision and the resulting Safetensors checksums with the run report. T
 The model's own `chat_template.jinja` accepts `rwkv_prompt_template` values `bot`, `assistant`, and `function_calling`, plus `rwkv_generation_prompt` values `open_think` and `fake_think`. Training uses `bot + open_think`.
 
 ```bash
-MODEL_DIR="$MODEL_DIR" uv run --isolated --extra rwkv python - <<'PY'
+MODEL_DIR="$MODEL_DIR" uv run --no-sync --extra rwkv python - <<'PY'
 import os
 from transformers import AutoTokenizer
 
@@ -62,7 +66,7 @@ PY
 ## Prepare GSM8K
 
 ```bash
-uv run --isolated --extra skyrl-train examples/train/gsm8k/gsm8k_dataset.py \
+uv run --no-sync --extra rwkv examples/train/gsm8k/gsm8k_dataset.py \
   --output_dir "$HOME/data/gsm8k"
 ```
 

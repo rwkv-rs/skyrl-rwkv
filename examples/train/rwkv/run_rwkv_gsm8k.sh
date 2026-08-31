@@ -9,8 +9,10 @@ set -euo pipefail
 : "${LOGGER:=wandb}"
 : "${RUN_NAME:=rwkv7-g1j-1.5b-gsm8k-grpo-50step}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
+: "${UV_PROJECT_ENVIRONMENT:=$PWD/.venv}"
+export UV_PROJECT_ENVIRONMENT
 
-uv run --isolated --extra rwkv -m skyrl.train.entrypoints.main_base \
+uv run --no-sync --extra rwkv -m skyrl.train.entrypoints.main_base \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
   trainer.algorithm.advantage_estimator=grpo \

@@ -272,9 +272,18 @@ class HFModelWrapper(nn.Module):
             bucket_labels = torch.roll(bucket_sequences, shifts=-1, dims=1)
             # RWKV's training kernels require native BF16 throughout the model.
             # CUDA autocast promotes LayerNorm to FP32, so disable an enclosing
-            # trainer/ref autocast region while the recurrent model runs.
-            with torch.autocast(device_type=bucket_sequences.device.type, enabled=False):
-                bucket_output = self.model(bucket_sequences)
+            # trainer/ref autocast region while the recurrent model runs.  The
+            # BF16 CausalLM head is also selected by ``training=True``; RWKV has
+            # no dropout, so a reference-policy forward can temporarily use that
+            # path while remaining under the caller's no-grad context.
+            was_training = self.model.training
+            if not was_training:
+                self.model.train()
+            try:
+                with torch.autocast(device_type=bucket_sequences.device.type, enabled=False):
+                    bucket_output = self.model(bucket_sequences)
+            finally:
+                self.model.train(was_training)
             bucket_logits = bucket_output["logits"]
             bucket_logits.div_(temperature)
             bucket_log_probs = logprobs_from_logits(

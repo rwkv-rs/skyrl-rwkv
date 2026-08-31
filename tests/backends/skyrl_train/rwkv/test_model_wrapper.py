@@ -126,16 +126,24 @@ def test_rwkv_equal_length_sequences_share_one_forward_bucket():
     assert torch.allclose(actual, expected)
 
 
-def test_rwkv_distributed_forward_uses_one_stream_per_call(monkeypatch):
+def test_rwkv_distributed_forward_uses_one_right_padded_bucket(monkeypatch):
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     model = ToyCausalLM()
     wrapper = HFModelWrapper(model)
-    sequences = torch.tensor([[0, 0, 1, 2, 3], [0, 0, 4, 5, 6]])
-    attention_mask = torch.tensor([[0, 0, 1, 1, 1], [0, 0, 1, 1, 1]])
+    sequences = torch.tensor([[0, 0, 1, 2, 3], [0, 4, 5, 6, 7]])
+    attention_mask = torch.tensor([[0, 0, 1, 1, 1], [0, 1, 1, 1, 1]])
 
-    actual = wrapper(sequences, num_actions=2, attention_mask=attention_mask)
+    actual, output = wrapper(
+        sequences,
+        num_actions=2,
+        attention_mask=attention_mask,
+        compute_entropy=True,
+        return_output=True,
+    )
 
-    assert [tuple(call[0].shape) for call in model.calls] == [(1, 3), (1, 3)]
+    assert len(model.calls) == 1
+    assert torch.equal(model.calls[0][0], torch.tensor([[1, 2, 3, 0], [4, 5, 6, 7]]))
+    assert torch.equal(output["entropy"][0, :2], torch.zeros(2))
     model.calls.clear()
     expected = expected_action_log_probs(model, sequences, attention_mask, num_actions=2)
     assert torch.allclose(actual, expected)

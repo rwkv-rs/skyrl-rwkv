@@ -126,6 +126,21 @@ def test_rwkv_equal_length_sequences_share_one_forward_bucket():
     assert torch.allclose(actual, expected)
 
 
+def test_rwkv_distributed_forward_uses_one_stream_per_call(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    model = ToyCausalLM()
+    wrapper = HFModelWrapper(model)
+    sequences = torch.tensor([[0, 0, 1, 2, 3], [0, 0, 4, 5, 6]])
+    attention_mask = torch.tensor([[0, 0, 1, 1, 1], [0, 0, 1, 1, 1]])
+
+    actual = wrapper(sequences, num_actions=2, attention_mask=attention_mask)
+
+    assert [tuple(call[0].shape) for call in model.calls] == [(1, 3), (1, 3)]
+    model.calls.clear()
+    expected = expected_action_log_probs(model, sequences, attention_mask, num_actions=2)
+    assert torch.allclose(actual, expected)
+
+
 def test_rwkv_ragged_batch_restores_padding_and_entropy_positions():
     model = ToyCausalLM()
     wrapper = HFModelWrapper(model)

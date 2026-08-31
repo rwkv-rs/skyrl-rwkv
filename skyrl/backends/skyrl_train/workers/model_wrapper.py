@@ -9,7 +9,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import transformers
-from flash_attn.bert_padding import pad_input, unpad_input
 from loguru import logger
 from packaging.version import Version
 from peft import LoraConfig, TaskType, get_peft_model
@@ -87,10 +86,6 @@ class HFModelWrapper(nn.Module):
         self.attn_implementation = "flash_attention_2" if use_flash_attention_2 else "sdpa"
         self.remove_microbatch_padding = remove_microbatch_padding
         self.is_vlm = False
-        if remove_microbatch_padding:
-            assert (
-                self.attn_implementation == "flash_attention_2"
-            ), "Flash attention 2 should be used for `remove_microbatch_padding`"
 
         if isinstance(pretrain_or_model, str):
             if load_in_4bit:
@@ -228,6 +223,19 @@ class HFModelWrapper(nn.Module):
         else:
             self.model = pretrain_or_model
 
+        self.is_recurrent = getattr(self.model.config, "model_type", None) == "rwkv"
+        if self.is_recurrent:
+            if self.remove_microbatch_padding:
+                raise ValueError("RWKV does not support remove_microbatch_padding=true")
+            if self.sequence_parallel_size > 1:
+                raise ValueError("RWKV does not support sequence parallelism")
+            if use_torch_compile:
+                raise ValueError("RWKV does not support torch.compile")
+        elif remove_microbatch_padding:
+            assert (
+                self.attn_implementation == "flash_attention_2"
+            ), "Flash attention 2 should be used for `remove_microbatch_padding`"
+
         self.logprobs_chunk_size = logprobs_chunk_size
 
         # TODO (sumanthrh): do the same for `logprobs_from_logits` and test.
@@ -237,6 +245,67 @@ class HFModelWrapper(nn.Module):
             if use_torch_compile
             else chunked_entropy_from_logits
         )
+
+    def _forward_recurrent(
+        self,
+        sequences: torch.LongTensor,
+        num_actions: Union[int, list[int]],
+        attention_mask: torch.Tensor,
+        temperature: float,
+        return_output: bool,
+        compute_entropy: bool,
+        entropy_requires_grad: bool,
+    ) -> torch.Tensor:
+        """Run independent recurrent streams grouped by their unpadded length."""
+        batch_size, padded_length = sequences.shape
+        valid_lengths = attention_mask.sum(dim=-1)
+        log_probs = None
+        entropy = None
+
+        for sequence_length_tensor in valid_lengths.unique(sorted=True):
+            sequence_length = int(sequence_length_tensor.item())
+            bucket_indices = torch.nonzero(valid_lengths == sequence_length_tensor, as_tuple=True)[0]
+            bucket_sequences = sequences.index_select(0, bucket_indices)[:, -sequence_length:]
+            bucket_labels = torch.roll(bucket_sequences, shifts=-1, dims=1)
+            bucket_output = self.model(bucket_sequences)
+            bucket_logits = bucket_output["logits"]
+            bucket_logits.div_(temperature)
+            bucket_log_probs = logprobs_from_logits(
+                bucket_logits,
+                bucket_labels,
+                inplace_backward=True,
+            )
+            bucket_log_probs = nn.functional.pad(bucket_log_probs, (padded_length - sequence_length, 0))
+            if log_probs is None:
+                log_probs = bucket_log_probs.new_zeros((batch_size, padded_length))
+            log_probs = log_probs.index_copy(0, bucket_indices, bucket_log_probs)
+
+            if compute_entropy:
+                bucket_entropy = self.chunked_entropy_from_logits_fn(
+                    bucket_logits,
+                    requires_grad=entropy_requires_grad,
+                    attention_mask=None,
+                    chunk_size=self.logprobs_chunk_size,
+                )
+                bucket_entropy = nn.functional.pad(bucket_entropy, (padded_length - sequence_length, 0))
+                if entropy is None:
+                    entropy = bucket_entropy.new_zeros((batch_size, padded_length))
+                entropy = entropy.index_copy(0, bucket_indices, bucket_entropy)
+
+        output = {}
+        if compute_entropy:
+            output["entropy"] = entropy
+
+        if isinstance(num_actions, list):
+            if len(num_actions) == 1:
+                num_actions = num_actions[0]
+            else:
+                num_actions = np.array(num_actions)
+        action_log_probs = log_probs[:, -num_actions - 1 : -1]
+
+        if return_output:
+            return (action_log_probs, output)
+        return action_log_probs
 
     def forward(
         self,
@@ -252,6 +321,17 @@ class HFModelWrapper(nn.Module):
         mm_token_type_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Returns action log probs"""
+        if self.is_recurrent:
+            return self._forward_recurrent(
+                sequences,
+                num_actions,
+                attention_mask,
+                temperature,
+                return_output,
+                compute_entropy,
+                entropy_requires_grad,
+            )
+
         has_image_inputs = pixel_values is not None or image_grid_thw is not None
         if self.is_vlm:
             # VLMs use model specific 3D positional IDs, meaning sequence packing can not be supported.
@@ -276,6 +356,8 @@ class HFModelWrapper(nn.Module):
         position_ids_fwd = position_ids
         attention_mask_fwd = attention_mask
         if self.remove_microbatch_padding:
+            from flash_attn.bert_padding import unpad_input
+
             with torch.no_grad():
                 # Removes padding to get a packed tensor. `unpad_input` expects 3 dimensional tensor so we unsqueeze first
                 sequences_fwd, nnz_indices, _, _, _ = unpad_input(
@@ -348,6 +430,8 @@ class HFModelWrapper(nn.Module):
             )  # shape can be (1, nnz) - with packing or (B, S) - without packing
 
         if self.remove_microbatch_padding:
+            from flash_attn.bert_padding import pad_input
+
             # add padding back - postprocess logprobs to be compatible with original tensor
             batch_size, seqlen = attention_mask.shape
             # (1, nnz-1) -> (batch_size, seqlen). Pad token ID used by flash attention is 0.
@@ -377,6 +461,8 @@ class HFModelWrapper(nn.Module):
                     entropy_BS, gather_dim=dim, unpad_dim=dim, padding_size=pad_size
                 )  # shape can be (1, nnz) - with packing or (B,S) - without packing
             if self.remove_microbatch_padding:
+                from flash_attn.bert_padding import pad_input
+
                 entropy_BS = pad_input(
                     entropy_BS.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
                 ).squeeze(
@@ -447,6 +533,8 @@ def _get_critic_model(
             attention_mask_fwd = attention_mask
 
             if self.remove_microbatch_padding:
+                from flash_attn.bert_padding import unpad_input
+
                 with torch.no_grad():
                     # remove padding. `unpad_input` expects 3 dimensional tensor
                     input_ids_fwd, nnz_indices, _, _, _ = unpad_input(
@@ -491,6 +579,8 @@ def _get_critic_model(
             values_BSH = getattr(self, self.value_head_prefix)(last_hidden_states_BSH)
 
             if self.remove_microbatch_padding:
+                from flash_attn.bert_padding import pad_input
+
                 # add padding back - postprocess logits to be compatible with original tensors
                 batch_size, seqlen = attention_mask.shape
                 # (1, nnz, 1) -> (nnz, 1) -> (batch_size, seqlen, 1)

@@ -17,7 +17,7 @@ dependencies = [
     "rich>=14.1.0",
     "safetensors>=0.6.2",
     "tokenizers>=0.21.2",
-    "transformers>=5.6.1,<=5.8.0",
+    "transformers>=5.6.1,<=5.16.0",
     "typer>=0.17.4",
     "peft==0.18.1",
     "hf_transfer",
@@ -91,7 +91,6 @@ skyrl-train = [
     "tensordict",
     "jaxtyping",
     "skyrl-gym",
-    "flash-attn==2.8.3+cu.13.0.torch.2.11; sys_platform == 'linux'",
     "polars",
     "s3fs",
     "s5cmd>=0.3.3; sys_platform == 'linux'",
@@ -113,6 +112,7 @@ skyrl-train = [
 
 fsdp = [
     "skyrl[skyrl-train]",
+    "transformers>=5.6.1,<=5.8.0; sys_platform == 'linux'",
     "vllm==0.26.0; sys_platform == 'linux'",
     "vllm-router; sys_platform == 'linux'",
     # The `nixl` shim provides that namespace and dispatches on `torch.version.cuda`,
@@ -131,8 +131,18 @@ fsdp = [
     "torchvision; sys_platform == 'linux'",
 ]
 
+rwkv = [
+    "skyrl[skyrl-train]",
+    "torch==2.13.0; sys_platform == 'linux'",
+    "transformers==5.16.0.dev0; sys_platform == 'linux'",
+    "vllm; sys_platform == 'linux'",
+    "FlashRWKV2==0.1.0a13; sys_platform == 'linux'",
+    "tokenizers; sys_platform == 'linux'",
+]
+
 megatron = [
     "skyrl[skyrl-train]",
+    "transformers>=5.8.1,<5.9.0; sys_platform == 'linux'",
     "transformer-engine[pytorch]==2.16.0; sys_platform == 'linux'",
     # Declared directly (not just via transformer-engine[pytorch]) so the
     # [tool.uv.sources] index below is honored — uv ignores sources for
@@ -219,14 +229,21 @@ conflicts = [
         { extra = "jax" },
         { extra = "megatron" },
         { extra = "fsdp" },
+        { extra = "rwkv" },
     ],
     [
         { extra = "megatron" },
         { extra = "gpu" },
         { extra = "tpu" },
         { extra = "miniswe" },
-    ]
+    ],
+    [
+        { extra = "rwkv" },
+        { extra = "gpu" },
+        { extra = "tpu" },
+    ],
 ]
+
 # disable build isolation for megatron related dependencies
 no-build-isolation-package = [
     "nv-grouped-gemm",
@@ -236,7 +253,6 @@ no-build-isolation-package = [
 override-dependencies = [
     "nvidia-resiliency-ext; sys_platform == 'never'",
     "transformer-engine[pytorch]==2.16.0; sys_platform == 'linux'",
-    "transformers>=5.6.1,<=5.8.0; sys_platform == 'linux'",
     "megatron-core>=0.16.0; sys_platform == 'linux' and python_version >= '3.12'",
     "ml_dtypes>=0.5.0; sys_platform == 'linux'",
     # `nixl` hard-depends on both nixl-cu12 and nixl-cu13; drop the cu12 variant
@@ -270,11 +286,67 @@ override-dependencies = [
     "apache-tvm-ffi==0.1.10; sys_platform == 'linux'",
 ]
 
+# The RWKV vLLM fork computes its metadata dynamically from requirements/rwkv.txt.
+# Keep the exact fork version resolvable while binding it to this extra's exact
+# Transformers and tokenizer revisions through the sources below.
+[[tool.uv.dependency-metadata]]
+name = "vllm"
+version = "0.23.1rc1.dev3063+g024fc92a2.rwkv"
+requires-python = ">=3.10,<3.15"
+requires-dist = [
+    "torch==2.13.0",
+    "transformers==5.16.0.dev0",
+    "tokenizers==0.23.2.dev0",
+    "FlashRWKV2==0.1.0a13",
+    "ninja",
+    "setuptools>=77.0.3,<81.0.0",
+    "regex",
+    "cachetools",
+    "psutil",
+    "numpy",
+    "requests>=2.26.0",
+    "tqdm",
+    "blake3",
+    "py-cpuinfo",
+    "huggingface_hub>=1.28.0",
+    "safetensors>=0.6.2",
+    "protobuf>=5.29.6,!=6.30.*,!=6.31.*,!=6.32.*,!=6.33.0.*,!=6.33.1.*,!=6.33.2.*,!=6.33.3.*,!=6.33.4.*",
+    "typing_extensions>=4.10",
+    "filelock>=3.16.1",
+    "pyyaml",
+    "cloudpickle",
+    "packaging>=24.2",
+    "jinja2>=3.1.6",
+    "einops",
+    "pillow",
+    "fastapi[standard]>=0.133.0,<0.137.0",
+    "starlette>=1.0.1",
+    "aiohttp>=3.13.3",
+    "openai>=2.0.0",
+    "openai-harmony>=0.0.3",
+    "partial-json-parser",
+    "pydantic>=2.12.0",
+    "prometheus_client>=0.18.0",
+    "prometheus-fastapi-instrumentator>=8.0.0",
+    "pyzmq>=25.0.0",
+    "msgspec",
+    "model-hosting-container-standards>=0.1.14,<1.0.0",
+    "watchfiles",
+    "python-json-logger",
+    "setproctitle",
+    "pybase64",
+    "cbor2",
+    "jsonschema>=4.23.0",
+    "xgrammar>=0.2.1,<1.0.0",
+]
+
 [tool.uv.extra-build-dependencies]
 flash-attn = [{requirement = "torch", match-runtime = true}]
+vllm = ["torch==2.13.0"]
 
 [tool.uv.extra-build-variables]
 flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE"}
+vllm = { VLLM_BUILD_PROFILE = "rwkv" }
 
 
 [[tool.uv.index]]
@@ -307,6 +379,9 @@ explicit = true
 
 [tool.uv.sources]
 skyrl-gym = { path = "./skyrl-gym", editable = true }
+transformers = { git = "https://github.com/rwkv-rs/transformers-rwkv", rev = "55a890b5d5f7d46e49232757748a36044956d1fe", extra = "rwkv" }
+vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "024fc92a22684a45ff8b19acb400787dcdb008e5", extra = "rwkv" }
+tokenizers = { git = "https://github.com/rwkv-rs/tokenizers-rwkv", rev = "c5d8dde5ff49c70e4656199d5033a84e03c21b2b", subdirectory = "bindings/python", extra = "rwkv" }
 # Match torch's CUDA variant (cu130).
 flashinfer-jit-cache = { index = "flashinfer-cu130", marker = "sys_platform == 'linux'" }
 

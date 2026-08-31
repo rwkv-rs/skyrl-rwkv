@@ -13,6 +13,7 @@ from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
 from skyrl.backends.skyrl_train.utils import torch_utils as torch_utils_module
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
 from skyrl.backends.skyrl_train.workers import model_wrapper as model_wrapper_module
+from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
 from skyrl.train.config import SamplingParams, SkyRLTrainConfig
 
@@ -233,6 +234,21 @@ def test_rwkv_disables_outer_autocast_without_changing_direct_forward():
     assert rwkv_model.training_states == [True]
     assert direct_model.training_states == [False]
     assert not rwkv_model.training
+
+
+def test_rwkv_policy_does_not_write_tokenizer_padding_into_model_config():
+    rwkv_wrapper = HFModelWrapper(ToyCausalLM("rwkv"))
+    direct_wrapper = HFModelWrapper(ToyCausalLM("llama"))
+    rwkv_worker = object.__new__(FSDPPolicyWorkerBase)
+    direct_worker = object.__new__(FSDPPolicyWorkerBase)
+    rwkv_worker.model = rwkv_wrapper
+    direct_worker.model = direct_wrapper
+
+    rwkv_worker._set_pad_token_id(0)
+    direct_worker._set_pad_token_id(0)
+
+    assert not hasattr(rwkv_wrapper.model.config, "pad_token_id")
+    assert direct_wrapper.model.config.pad_token_id == 0
 
 
 def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):

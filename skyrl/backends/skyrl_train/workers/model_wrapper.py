@@ -107,6 +107,7 @@ class HFModelWrapper(nn.Module):
                 model_class = AutoModelForCausalLM
 
             model_config = AutoConfig.from_pretrained(pretrain_or_model, trust_remote_code=True, **model_config_kwargs)
+            is_recurrent_config = getattr(model_config, "model_type", None) == "rwkv"
 
             if language_model_only:
                 logger.info("[VLM] language_model_only=True, skipping vision encoder initialization")
@@ -122,7 +123,8 @@ class HFModelWrapper(nn.Module):
                     # NOTE: In future transformers releases (> 5.0.0), all multimodal models can use AutoModelForMultimodalLM.
                     model_class = AutoModelForImageTextToText
 
-            model_config._attn_implementation = self.attn_implementation
+            if not is_recurrent_config:
+                model_config._attn_implementation = self.attn_implementation
 
             if meta_init:
                 with torch.device("meta"):
@@ -144,15 +146,16 @@ class HFModelWrapper(nn.Module):
                     if name not in non_persistent_names:
                         buf.data = buf.data.to(target_dtype)
             else:
-                self.model = model_class.from_pretrained(
-                    pretrain_or_model,
+                model_kwargs = dict(
                     config=model_config,
                     trust_remote_code=True,
-                    attn_implementation=self.attn_implementation,
                     quantization_config=nf4_config,
                     torch_dtype=torch.bfloat16 if bf16 else torch.float32,
                     device_map=device_map,
                 )
+                if not is_recurrent_config:
+                    model_kwargs["attn_implementation"] = self.attn_implementation
+                self.model = model_class.from_pretrained(pretrain_or_model, **model_kwargs)
 
             # gpt oss
             if Version(transformers.__version__) >= Version("4.56.2"):

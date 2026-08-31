@@ -7,6 +7,7 @@ from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
     get_vllm_sampling_params,
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
+from skyrl.backends.skyrl_train.workers import model_wrapper as model_wrapper_module
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
 from skyrl.train.config import SamplingParams, SkyRLTrainConfig
 
@@ -107,6 +108,40 @@ def test_non_rwkv_model_keeps_direct_forward_path():
     assert len(model.calls) == 1
     assert torch.equal(model.calls[0][0], sequences)
     assert torch.equal(model.calls[0][1]["attention_mask"], attention_mask)
+
+
+def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):
+    config = SimpleNamespace(
+        model_type="rwkv",
+        vision_config=None,
+        use_cache=True,
+        to_dict=lambda: {},
+    )
+    model = ToyCausalLM()
+    model.config = config
+    captured_kwargs = {}
+
+    monkeypatch.setattr(
+        model_wrapper_module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: config,
+    )
+
+    def fake_from_pretrained(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return model
+
+    monkeypatch.setattr(
+        model_wrapper_module.AutoModelForCausalLM,
+        "from_pretrained",
+        fake_from_pretrained,
+    )
+
+    wrapper = HFModelWrapper("rwkv-checkpoint", bf16=False)
+
+    assert wrapper.is_recurrent
+    assert "attn_implementation" not in captured_kwargs
+    assert not hasattr(config, "_attn_implementation")
 
 
 @pytest.mark.parametrize(

@@ -265,9 +265,21 @@ class HFModelWrapper(nn.Module):
         log_probs = None
         entropy = None
 
-        for sequence_length_tensor in valid_lengths.unique(sorted=True):
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            # FSDP collectives must be entered the same number of times on every
+            # rank. Local length buckets can differ across ranks, while the
+            # per-rank microbatch size is shared, so use one stream per call.
+            buckets = (
+                (valid_lengths[index], valid_lengths.new_tensor([index])) for index in range(batch_size)
+            )
+        else:
+            buckets = (
+                (sequence_length, torch.nonzero(valid_lengths == sequence_length, as_tuple=True)[0])
+                for sequence_length in valid_lengths.unique(sorted=True)
+            )
+
+        for sequence_length_tensor, bucket_indices in buckets:
             sequence_length = int(sequence_length_tensor.item())
-            bucket_indices = torch.nonzero(valid_lengths == sequence_length_tensor, as_tuple=True)[0]
             bucket_sequences = sequences.index_select(0, bucket_indices)[:, -sequence_length:]
             bucket_labels = torch.roll(bucket_sequences, shifts=-1, dims=1)
             # RWKV's training kernels require native BF16 throughout the model.

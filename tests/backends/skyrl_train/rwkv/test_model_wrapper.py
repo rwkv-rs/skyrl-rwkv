@@ -6,10 +6,16 @@ import torch
 from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
     get_vllm_sampling_params,
 )
+from skyrl.backends.skyrl_train.utils import torch_utils as torch_utils_module
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
 from skyrl.backends.skyrl_train.workers import model_wrapper as model_wrapper_module
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
 from skyrl.train.config import SamplingParams, SkyRLTrainConfig
+
+
+@pytest.fixture(autouse=True)
+def use_torch_logprobs(monkeypatch):
+    monkeypatch.setattr(torch_utils_module, "FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE", False)
 
 
 class ToyCausalLM(torch.nn.Module):

@@ -259,6 +259,10 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
             # model's parameters, so there is nothing to reload.
             self.skyrl_begin_lora_update()
             return
+        from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import is_rwkv_model
+
+        if is_rwkv_model(self.model):
+            return
         skyrl_before_weight_update()
         with torch.device(self.device):
             super().start_weight_update()
@@ -302,6 +306,15 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
             restore_moe_kernel_constants,
         )
 
+        from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
+            finalize_rwkv_runtime_weights,
+            is_rwkv_model,
+        )
+
+        if is_rwkv_model(self.model):
+            with torch.device(self.device):
+                finalize_rwkv_runtime_weights(self.model)
+            return
         with torch.device(self.device):
             super().finish_weight_update()
             # A level-2 sleep zeroes MoE kernel constants that no reload rebuilds.

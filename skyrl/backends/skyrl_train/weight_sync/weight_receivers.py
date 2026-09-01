@@ -259,9 +259,7 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
             # model's parameters, so there is nothing to reload.
             self.skyrl_begin_lora_update()
             return
-        from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import is_rwkv_model
-
-        if is_rwkv_model(self.model):
+        if self.model.config.model_type == "rwkv":
             return
         skyrl_before_weight_update()
         with torch.device(self.device):
@@ -283,10 +281,9 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
             return
         from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
             finalize_rwkv_runtime_weights,
-            is_rwkv_model,
         )
 
-        if is_rwkv_model(self.model):
+        if self.model.config.model_type == "rwkv":
             with torch.device(self.device):
                 finalize_rwkv_runtime_weights(self.model)
             return

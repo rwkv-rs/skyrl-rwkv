@@ -107,7 +107,7 @@ class HFModelWrapper(nn.Module):
                 model_class = AutoModelForCausalLM
 
             model_config = AutoConfig.from_pretrained(pretrain_or_model, trust_remote_code=True, **model_config_kwargs)
-            is_recurrent_config = getattr(model_config, "model_type", None) == "rwkv"
+            is_rwkv_config = model_config.model_type == "rwkv"
 
             if language_model_only:
                 logger.info("[VLM] language_model_only=True, skipping vision encoder initialization")
@@ -123,7 +123,7 @@ class HFModelWrapper(nn.Module):
                     # NOTE: In future transformers releases (> 5.0.0), all multimodal models can use AutoModelForMultimodalLM.
                     model_class = AutoModelForImageTextToText
 
-            if not is_recurrent_config:
+            if not is_rwkv_config:
                 model_config._attn_implementation = self.attn_implementation
 
             if meta_init:
@@ -153,7 +153,7 @@ class HFModelWrapper(nn.Module):
                     torch_dtype=torch.bfloat16 if bf16 else torch.float32,
                     device_map=device_map,
                 )
-                if not is_recurrent_config:
+                if not is_rwkv_config:
                     model_kwargs["attn_implementation"] = self.attn_implementation
                 self.model = model_class.from_pretrained(pretrain_or_model, **model_kwargs)
 
@@ -226,8 +226,8 @@ class HFModelWrapper(nn.Module):
         else:
             self.model = pretrain_or_model
 
-        self.is_recurrent = getattr(self.model.config, "model_type", None) == "rwkv"
-        if self.is_recurrent:
+        self.is_rwkv = self.model.config.model_type == "rwkv"
+        if self.is_rwkv:
             if self.remove_microbatch_padding:
                 raise ValueError("RWKV does not support remove_microbatch_padding=true")
             if self.sequence_parallel_size > 1:
@@ -249,7 +249,7 @@ class HFModelWrapper(nn.Module):
             else chunked_entropy_from_logits
         )
 
-    def _forward_recurrent(
+    def _forward_rwkv(
         self,
         sequences: torch.LongTensor,
         num_actions: Union[int, list[int]],
@@ -366,8 +366,8 @@ class HFModelWrapper(nn.Module):
         mm_token_type_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Returns action log probs"""
-        if self.is_recurrent:
-            return self._forward_recurrent(
+        if self.is_rwkv:
+            return self._forward_rwkv(
                 sequences,
                 num_actions,
                 attention_mask,

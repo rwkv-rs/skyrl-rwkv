@@ -303,7 +303,7 @@ def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):
 
     wrapper = HFModelWrapper("rwkv-checkpoint", bf16=False)
 
-    assert wrapper.is_recurrent
+    assert wrapper.is_rwkv
     assert "attn_implementation" not in captured_kwargs
     assert not hasattr(config, "_attn_implementation")
 

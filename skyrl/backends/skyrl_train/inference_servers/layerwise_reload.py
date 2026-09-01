@@ -62,11 +62,6 @@ def patch_numel_loaded():
     _meta.get_numel_loaded = get_numel_loaded
 
 
-def is_rwkv_model(model: torch.nn.Module) -> bool:
-    """Return whether ``model`` uses RWKV's checkpoint-to-runtime transforms."""
-    return getattr(getattr(model, "config", None), "model_type", None) == "rwkv"
-
-
 @torch.no_grad()
 def load_rwkv_checkpoint_weights(
     model: torch.nn.Module,
@@ -225,7 +220,7 @@ class LayerwiseReloadWorkerMixin:
             _PATCHED_LAYERWISE_NUMEL_LOADED = True
 
         model = self.model_runner.model
-        self._skyrl_rwkv_checkpoint_update = is_checkpoint_format and is_rwkv_model(model)
+        self._skyrl_rwkv_checkpoint_update = is_checkpoint_format and model.config.model_type == "rwkv"
         if is_checkpoint_format and not self._skyrl_rwkv_checkpoint_update:
             # Lazy import: vllm is a Linux-only optional dependency, so this module stays importable on macOS / CI.
             from vllm.config import set_current_vllm_config

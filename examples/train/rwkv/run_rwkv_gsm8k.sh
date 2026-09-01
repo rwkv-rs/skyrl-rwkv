@@ -2,6 +2,12 @@
 
 set -euo pipefail
 
+if [[ -f .env ]]; then
+  set -a
+  source .env
+  set +a
+fi
+
 : "${MODEL_DIR:=$HOME/models/rwkv7-g1-st-e1a670a5523742b5cfe8cb6759c1eb8f1d88b637/rwkv7-g1j-1.5b-20260831-ctx16384}"
 : "${DATA_DIR:=$HOME/data/gsm8k}"
 : "${NUM_GPUS:=8}"

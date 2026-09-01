@@ -86,6 +86,8 @@ stat -c '%a %n' .env
 git check-ignore -v .env
 ```
 
+The launch script loads this project-root `.env` without printing its contents.
+
 ## Run
 
 The defaults use a BF16 Trainer, FP16 vLLM-RWKV inference, 8 GPUs, eight TP1 colocated inference engines, GRPO, `train_batch_size=64`, four samples per prompt, global policy mini-batch 64, per-GPU micro-batch 2, gradient checkpointing, and one optimizer step per training step. Step 50 runs evaluation and writes both a resumable checkpoint and an HF export.

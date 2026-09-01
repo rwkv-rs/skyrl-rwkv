@@ -5,11 +5,6 @@ from collections.abc import Callable
 import torch
 
 
-def is_rwkv_model(model: torch.nn.Module) -> bool:
-    """Return whether ``model`` uses RWKV's checkpoint-to-runtime transforms."""
-    return getattr(getattr(model, "config", None), "model_type", None) == "rwkv"
-
-
 @torch.no_grad()
 def load_rwkv_checkpoint_weights(
     model: torch.nn.Module,

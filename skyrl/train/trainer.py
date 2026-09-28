@@ -1162,6 +1162,12 @@ class RayPPOTrainer:
             #   response_mask_float,
             #       (batch_size, response_len):        per-step response mask
             last_step_response_mask = data["response_mask"][is_last_step]
+            last_step_advantage_mask = data["loss_mask"][is_last_step]
+            last_step_advantage_kwargs = (
+                {"loss_mask": last_step_advantage_mask}
+                if self.cfg.trainer.algorithm.advantage_estimator in ("flashreinforce", "flash_reinforce", "bpo")
+                else {}
+            )
             last_step_advantages, last_step_returns = ppo_utils.compute_advantages_and_returns(
                 token_level_rewards=token_level_rewards[is_last_step],
                 response_mask=torch.ones_like(last_step_response_mask, dtype=torch.float),
@@ -1172,6 +1178,7 @@ class RayPPOTrainer:
                 gamma=self.cfg.trainer.algorithm.gamma,
                 lambd=self.cfg.trainer.algorithm.lambd,
                 grpo_norm_by_std=self.cfg.trainer.algorithm.grpo_norm_by_std,
+                **last_step_advantage_kwargs,
             )
             traj_ids = (
                 torch.cat([torch.tensor([False], device=is_last_step.device), is_last_step[:-1]]).int().cumsum(dim=0)
@@ -1184,6 +1191,11 @@ class RayPPOTrainer:
             advantages = last_step_advantages[traj_ids] * response_mask_float
             returns = last_step_returns[traj_ids] * response_mask_float
         else:
+            advantage_kwargs = (
+                {"loss_mask": data["loss_mask"]}
+                if self.cfg.trainer.algorithm.advantage_estimator in ("flashreinforce", "flash_reinforce", "bpo")
+                else {}
+            )
             advantages, returns = ppo_utils.compute_advantages_and_returns(
                 token_level_rewards=token_level_rewards,
                 response_mask=data["response_mask"],
@@ -1194,6 +1206,7 @@ class RayPPOTrainer:
                 gamma=self.cfg.trainer.algorithm.gamma,
                 lambd=self.cfg.trainer.algorithm.lambd,
                 grpo_norm_by_std=self.cfg.trainer.algorithm.grpo_norm_by_std,
+                **advantage_kwargs,
             )
         data["returns"] = returns
         data["advantages"] = advantages

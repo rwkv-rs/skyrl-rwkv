@@ -9,13 +9,19 @@ import torch
 
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
     PolicyLossRegistry,
+    compute_bpo_outcome_advantage,
+    compute_flashreinforce_outcome_advantage,
+    flashreinforce_policy_loss,
+    score_centering_token_loss,
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.train.config import (
     AlgorithmConfig,
+    BPOConfig,
     CISPOConfig,
     ClipCovConfig,
     DPPOConfig,
+    FlashReinforceConfig,
     KLCovConfig,
     OffPolicyCorrectionConfig,
     SAPOConfig,
@@ -732,3 +738,111 @@ def test_dppo_policy_loss(
         assert metrics["clip_ratio"] > 0.0, f"{name}: expected some masking"
     elif expect_clip_gt_zero is False:
         assert metrics["clip_ratio"] == pytest.approx(0.0, abs=1e-6), f"{name}: expected no masking"
+
+
+def test_flashreinforce_centers_independent_batch_and_uses_sample_mean():
+    """The global reward baseline and trajectory normalization match the reference gradient."""
+    token_rewards = torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, 0.0]])
+    response_mask = torch.tensor([[0.0, 0.0, 1.0], [1.0, 1.0, 1.0]])
+    advantages, _ = compute_flashreinforce_outcome_advantage(token_rewards, response_mask)
+    assert torch.allclose(advantages[:, -1], torch.tensor([0.5, -0.5]))
+    padded, _ = compute_flashreinforce_outcome_advantage(
+        torch.tensor([[1.0], [0.0]]),
+        torch.ones(2, 1),
+        loss_mask=torch.tensor([[1.0], [0.0]]),
+    )
+    assert torch.allclose(padded[:, 0], torch.tensor([0.0, -1.0]))
+
+    current = torch.tensor([[-1.0, -1.0, -1.0], [-2.0, -2.0, -2.0]], requires_grad=True)
+    behavior = current.detach() - 0.1
+    # sequence_mean pre-scaling: A / (B * T_i), with lengths 1 and 3.
+    scaled = torch.tensor([[0.0, 0.0, 0.25], [-1 / 6, -1 / 6, -1 / 6]])
+    config = AlgorithmConfig(
+        policy_loss_type="flashreinforce",
+        loss_reduction="sequence_mean",
+        flashreinforce=FlashReinforceConfig(sequence_kl_threshold=float("inf")),
+        off_policy_correction=NULL_OFF_POLICY_CORR,
+    )
+    loss, metrics = flashreinforce_policy_loss(
+        current,
+        None,
+        scaled,
+        config,
+        loss_mask=torch.tensor([[0.0, 0.0, 1.0], [1.0, 1.0, 1.0]]),
+        rollout_logprobs=behavior,
+    )
+    loss.backward()
+    ratio = torch.exp(torch.tensor(0.1))
+    expected = torch.tensor([[0.0, 0.0, -0.25 * ratio], [ratio / 6, ratio / 6, ratio / 6]])
+    torch.testing.assert_close(current.grad, expected, rtol=1e-5, atol=1e-6)
+    assert metrics["flashreinforce/acceptance_rate"] == pytest.approx(1.0)
+
+
+def test_flashreinforce_sequence_gate_rejects_a_whole_trajectory():
+    current = torch.tensor([[-1.0, -1.0], [-1.0, -1.0]], requires_grad=True)
+    behavior = torch.tensor([[-4.0, -1.0], [-1.0, -1.0]])
+    config = AlgorithmConfig(
+        policy_loss_type="flashreinforce",
+        loss_reduction="sequence_mean",
+        flashreinforce=FlashReinforceConfig(sequence_kl_threshold=1e-3),
+        off_policy_correction=NULL_OFF_POLICY_CORR,
+    )
+    loss, metrics = flashreinforce_policy_loss(
+        current,
+        None,
+        torch.tensor([[0.25, 0.25], [-0.25, -0.25]]),
+        config,
+        loss_mask=torch.ones(2, 2),
+        rollout_logprobs=behavior,
+    )
+    loss.backward()
+    assert metrics["flashreinforce/acceptance_rate"] == pytest.approx(0.5)
+    assert torch.allclose(current.grad[0], torch.zeros(2))
+    assert torch.all(current.grad[1] != 0)
+
+
+def test_score_centering_topk_helper_returns_finite_loss():
+    train_logp = torch.log(torch.tensor([[[0.5, 0.3, 0.2]]]))
+    sampler_logp = torch.log(torch.tensor([[[0.5, 0.3]]]))
+    topk_ids = torch.tensor([[[0, 1]]])
+    sampled_token = torch.tensor([[0]])
+    sampled_logp = torch.log(torch.tensor([[0.5]]))
+    loss = score_centering_token_loss(
+        train_logp,
+        sampler_logp,
+        topk_ids,
+        sampled_token,
+        sampled_logp,
+        torch.ones(1, 1),
+    )
+    assert torch.isfinite(loss).all()
+    torch.testing.assert_close(loss, -sampled_logp)
+
+
+def test_bpo_centers_rewards_within_prompt_groups():
+    rewards = torch.tensor([[1.0], [0.0], [0.5]])
+    mask = torch.ones_like(rewards)
+    advantages, _ = compute_bpo_outcome_advantage(rewards, mask, ["p0", "p0", "p1"])
+    torch.testing.assert_close(advantages[:, 0], torch.tensor([0.5, -0.5, 0.0]))
+
+
+def test_bpo_uses_complementary_probability_weight():
+    config = AlgorithmConfig(
+        policy_loss_type="bpo",
+        bpo=BPOConfig(smoothing_epsilon=0.1, weight_cap=3.0),
+        off_policy_correction=NULL_OFF_POLICY_CORR,
+    )
+    current = torch.tensor([[-1.0]], requires_grad=True)
+    behavior = torch.tensor([[-1.2]])
+    advantages = torch.tensor([[1.0]])
+    loss, metrics = PolicyLossRegistry.get("bpo")(
+        current,
+        None,
+        advantages,
+        config,
+        loss_mask=torch.ones_like(current),
+        rollout_logprobs=behavior,
+    )
+    expected_weight = (1.1 - torch.exp(behavior)) / (1.1 - torch.exp(current.detach()))
+    assert metrics["bpo/weight_mean"] == pytest.approx(expected_weight.item())
+    assert torch.isfinite(loss)

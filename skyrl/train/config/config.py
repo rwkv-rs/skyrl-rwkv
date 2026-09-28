@@ -977,6 +977,40 @@ class SAPOConfig(BaseConfig):
 
 
 @dataclass
+class FlashReinforceConfig(BaseConfig):
+    """FlashREINFORCE stability parameters for one-rollout asynchronous policy gradients."""
+
+    sequence_kl_threshold: float = 3e-3
+    """Mean sampled-action Bernoulli KL threshold for whole-trajectory admission; infinity disables the gate."""
+
+    def __post_init__(self) -> None:
+        if self.sequence_kl_threshold < 0:
+            raise ValueError("flashreinforce.sequence_kl_threshold must be nonnegative")
+
+
+@dataclass
+class BPOConfig(BaseConfig):
+    """Bellman Policy Optimization parameters for terminal-reward group rollouts."""
+
+    smoothing_epsilon: float = 0.1
+    """Additive smoothing used in the complementary-probability mismatch weight."""
+    weight_cap: float = 3.0
+    """Upper bound for the smoothed complementary-probability weight."""
+    eps_clip_low: float = 0.2
+    """Lower clipping offset used by the practical BPO admission mask."""
+    eps_clip_high: float = 0.2
+    """Upper clipping offset used by the practical BPO admission mask."""
+
+    def __post_init__(self) -> None:
+        if self.smoothing_epsilon <= 0:
+            raise ValueError("bpo.smoothing_epsilon must be positive")
+        if self.weight_cap <= 0:
+            raise ValueError("bpo.weight_cap must be positive")
+        if self.eps_clip_low < 0 or self.eps_clip_high < 0:
+            raise ValueError("bpo clipping offsets must be nonnegative")
+
+
+@dataclass
 class DynamicSamplingConfig(BaseConfig):
     """Dynamic sampling configuration: resample or filter training batches based on reward signal."""
 
@@ -1088,7 +1122,7 @@ class OffPolicyCorrectionConfig(BaseConfig):
 @dataclass
 class AlgorithmConfig(BaseConfig):
     advantage_estimator: str = "grpo"
-    """``"grpo"``, ``"gae"``, ``"rloo"``, ``"reinforce++"``, or custom via ``AdvantageEstimatorRegistry``."""
+    """``"grpo"``, ``"gae"``, ``"rloo"``, ``"reinforce++"``, ``"flashreinforce"``, ``"bpo"``, or custom via ``AdvantageEstimatorRegistry``."""
     kl_ctrl: KLCtrlConfig = field(default_factory=KLCtrlConfig)
     """Only used when ``use_kl_in_reward=True`` (not applied when ``use_kl_loss=True``).
     Uses ``kl_loss_coef`` as the initial KL coefficient."""
@@ -1142,6 +1176,9 @@ class AlgorithmConfig(BaseConfig):
       divergences rather than probability ratios, improving on PPO clipping behavior.
     - ``"reinforce"``: plain policy gradient ``-A log π`` with no importance ratio, the objective
       score centering builds on (https://arxiv.org/abs/2609.20807).
+    - ``"flashreinforce"``: FlashREINFORCE, with batch-centered signed rewards, rollout
+      importance sampling, a sequence-level Bernoulli-KL gate, and trajectory-normalized loss.
+    - ``"bpo"``: Bellman Policy Optimization's practical complementary-probability mismatch weight.
     """
     loss_reduction: str = "prompt_mean"
     """Loss reduction defaults to ``"prompt_mean"`` and rescales advantages per mini-batch.
@@ -1149,7 +1186,7 @@ class AlgorithmConfig(BaseConfig):
 
     - ``"token_mean"``: average loss over all valid tokens in the batch, as in DAPO
       (https://dapo-sia.github.io/).
-    - ``"sequence_mean"``: per-sequence average token loss, then averaged over the batch.
+    - ``"sequence_mean"``: per-sequence average token loss, then averaged over the batch. This is required by FlashREINFORCE.
     - ``"seq_mean_token_sum_norm"``: sum of token losses per sequence, normalized by
       ``max_seq_len``, then averaged over the batch, as in Dr. GRPO
       (https://arxiv.org/abs/2503.20783). ``max_seq_len`` must be set explicitly for this mode,
@@ -1211,6 +1248,10 @@ class AlgorithmConfig(BaseConfig):
     allow it, otherwise ``False``. ``True`` raises if they do not."""
     sapo: SAPOConfig = field(default_factory=SAPOConfig)
     """Only used when ``policy_loss_type="sapo"``."""
+    flashreinforce: FlashReinforceConfig = field(default_factory=FlashReinforceConfig)
+    """Only used when ``policy_loss_type="flashreinforce"``."""
+    bpo: BPOConfig = field(default_factory=BPOConfig)
+    """Only used when ``policy_loss_type="bpo"``."""
     value_clip: float = 0.2
     """Clip value for the value loss."""
     dynamic_sampling: DynamicSamplingConfig = field(default_factory=DynamicSamplingConfig)

@@ -16,6 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 from collections import defaultdict
 from enum import StrEnum
 from functools import wraps
@@ -409,6 +410,8 @@ class AdvantageEstimator(StrEnum):
     RLOO = "rloo"
     REINFORCE_PP = "reinforce++"
     MAXRL = "maxrl"
+    FLASH_REINFORCE = "flashreinforce"
+    BPO = "bpo"
 
 
 class AdvantageEstimatorRegistry(BaseFunctionRegistry):
@@ -436,6 +439,9 @@ class AdvantageEstimatorRegistry(BaseFunctionRegistry):
             "rloo": [AdvantageEstimator.RLOO, compute_rloo_outcome_advantage],
             "reinforce++": [AdvantageEstimator.REINFORCE_PP, compute_reinforce_plus_plus_outcome_advantage],
             "maxrl": [AdvantageEstimator.MAXRL, compute_maxrl_advantage],
+            "flashreinforce": [AdvantageEstimator.FLASH_REINFORCE, compute_flashreinforce_outcome_advantage],
+            "flash_reinforce": ["flash_reinforce", compute_flashreinforce_outcome_advantage],
+            "bpo": [AdvantageEstimator.BPO, compute_bpo_outcome_advantage],
         }
 
         for ae_name, (ae_type, ae_func) in ae_types.items():
@@ -447,6 +453,8 @@ class PolicyLossType(StrEnum):
     REGULAR = "regular"
     DUAL_CLIP = "dual_clip"
     GSPO = "gspo"
+    FLASH_REINFORCE = "flashreinforce"
+    BPO = "bpo"
     CISPO = "cispo"
     ROLLOUT_IS = "rollout_is"
     CLIP_COV = "clip_cov"
@@ -459,7 +467,15 @@ class PolicyLossType(StrEnum):
 
 # Losses that optimize against rollout logprobs, so the "old" logprobs forward pass can be
 # skipped when nothing else needs them (see `RayPPOTrainer._skip_policy_forward`).
-LOSSES_WITHOUT_OLD_LOGPROBS = frozenset({PolicyLossType.ROLLOUT_IS, PolicyLossType.DPPO})
+LOSSES_WITHOUT_OLD_LOGPROBS = frozenset(
+    {
+        PolicyLossType.ROLLOUT_IS,
+        PolicyLossType.DPPO,
+        PolicyLossType.FLASH_REINFORCE,
+        "flash_reinforce",
+        PolicyLossType.BPO,
+    }
+)
 
 LOSSES_WITH_OLD_LOGPROBS = frozenset(
     {
@@ -508,6 +524,9 @@ class PolicyLossRegistry(BaseFunctionRegistry):
             "importance_sampling": [PolicyLossType.IMPORTANCE_SAMPLING, importance_sampling_loss],
             "dppo": [PolicyLossType.DPPO, dppo_policy_loss],
             "rollout_is": [PolicyLossType.ROLLOUT_IS, rollout_is_policy_loss],
+            "flashreinforce": [PolicyLossType.FLASH_REINFORCE, flashreinforce_policy_loss],
+            "flash_reinforce": ["flash_reinforce", flashreinforce_policy_loss],
+            "bpo": [PolicyLossType.BPO, bpo_policy_loss],
         }
 
         for pl_name, (pl_type, pl_func) in pl_types.items():
@@ -1142,6 +1161,196 @@ def importance_sampling_loss(
     return loss, {"importance_ratio": mean_ratio.item()}
 
 
+@register_policy_loss(PolicyLossType.FLASH_REINFORCE)
+def flashreinforce_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    config: AlgorithmConfig,
+    loss_mask: Optional[torch.Tensor] = None,
+    rollout_logprobs: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, dict[str, float]]:
+    """FlashREINFORCE loss using behavior IS and a sequence-level Bernoulli-KL gate.
+
+    ``advantages`` has already been scaled by the trainer's ``sequence_mean`` reduction:
+    each row therefore contains ``(reward - batch_mean) / (B * T_i)``. The loss is a
+    masked sum so that the resulting gradient is the sample-mean objective without a
+    second length normalization.
+    """
+    del old_log_probs
+    if rollout_logprobs is None:
+        raise ValueError("flashreinforce requires rollout logprobs from the behavior policy")
+    if log_probs.ndim != 2 or not log_probs.numel():
+        raise ValueError("flashreinforce expects a nonempty [batch, response_tokens] tensor")
+    if log_probs.shape != rollout_logprobs.shape:
+        raise ValueError("flashreinforce log_probs and rollout_logprobs must have the same shape")
+
+    action_mask = torch.ones_like(log_probs, dtype=torch.bool) if loss_mask is None else loss_mask.bool()
+    if action_mask.shape != log_probs.shape:
+        raise ValueError("flashreinforce loss_mask must match [batch, response_tokens] log probabilities")
+    if math.isnan(config.flashreinforce.sequence_kl_threshold) or config.flashreinforce.sequence_kl_threshold < 0:
+        raise ValueError("flashreinforce sequence_kl_threshold must be nonnegative")
+
+    # Keep the gate and ratios in float32. In particular, bfloat16 exp/log1p can turn a
+    # small inference/trainer mismatch into a zero or infinite Bernoulli KL.
+    current = torch.where(action_mask, log_probs.float(), torch.zeros_like(log_probs, dtype=torch.float32))
+    behavior = torch.where(
+        action_mask, rollout_logprobs.detach().float(), torch.zeros_like(rollout_logprobs, dtype=torch.float32)
+    )
+    valid_current = current[action_mask]
+    valid_behavior = behavior[action_mask]
+    if valid_current.numel() == 0:
+        return current.sum() * 0.0, {
+            "clip_ratio": 0.0,
+            "flashreinforce/sequence_kl": 0.0,
+            "flashreinforce/sequence_kl_max": 0.0,
+            "flashreinforce/acceptance_rate": 0.0,
+            "flashreinforce/ratio_mean": 0.0,
+            "flashreinforce/active_token_rate": 0.0,
+        }
+    if not torch.isfinite(valid_current).all() or not torch.isfinite(valid_behavior).all():
+        raise ValueError("flashreinforce policy-token log probabilities must be finite")
+    if (valid_current > 0).any() or (valid_behavior > 0).any():
+        raise ValueError("flashreinforce policy-token log probabilities must be <= 0")
+
+    lengths = action_mask.sum(dim=-1)
+    with torch.no_grad():
+        p = behavior.exp().clamp(1e-6, 1 - 1e-6)
+        q = current.detach().exp().clamp(1e-6, 1 - 1e-6)
+        divergence = p * (p.log() - q.log()) + (1 - p) * (torch.log1p(-p) - torch.log1p(-q))
+        sequence_kl = torch.where(action_mask, divergence, torch.zeros_like(divergence)).sum(dim=-1)
+        sequence_kl = sequence_kl / lengths.clamp_min(1).to(sequence_kl.dtype)
+        sequence_kl = sequence_kl.clamp_min(0)
+        admitted = (lengths > 0) & (sequence_kl <= config.flashreinforce.sequence_kl_threshold)
+
+        active = admitted[:, None] & action_mask
+        log_ratio = torch.where(active, current.detach() - behavior, torch.zeros_like(current))
+        # Do not exponentiate rejected trajectories: stale behavior logprobs can make
+        # their ratios enormous, but the sequence gate has already removed them.
+        ratio = torch.where(active, log_ratio, torch.zeros_like(log_ratio)).exp()
+        if not torch.isfinite(ratio[active]).all():
+            raise FloatingPointError("flashreinforce importance ratio overflowed on an admitted token")
+        weights = ratio * advantages.detach().float()
+
+    active_mask = action_mask & admitted[:, None]
+    # ``advantages`` is pre-scaled for sample mean. Multiplying by the detached ratio
+    # preserves the score-function gradient while the current log-prob remains live.
+    loss = -(weights * current * active_mask).sum()
+    active_count = action_mask.sum().clamp_min(1)
+    loss_metrics = {
+        "clip_ratio": 0.0,
+        "flashreinforce/sequence_kl": sequence_kl.mean().item(),
+        "flashreinforce/sequence_kl_max": sequence_kl.max().item(),
+        "flashreinforce/acceptance_rate": admitted.float().mean().item(),
+        "flashreinforce/ratio_mean": ratio[action_mask].mean().item(),
+        "flashreinforce/active_token_rate": active_mask.sum().float().div(active_count).item(),
+    }
+    return loss, loss_metrics
+
+
+@register_policy_loss(PolicyLossType.BPO)
+def bpo_policy_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    config: AlgorithmConfig,
+    loss_mask: Optional[torch.Tensor] = None,
+    rollout_logprobs: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, dict[str, float]]:
+    """Practical BPO loss with a smoothed complementary-probability weight.
+
+    BPO is exposed as a separate group-rollout ablation. It is not silently combined
+    with FlashREINFORCE: BPO estimates a prompt value from sibling responses, whereas
+    FlashREINFORCE deliberately uses one response per prompt and a global batch mean.
+    """
+    del old_log_probs
+    if rollout_logprobs is None:
+        raise ValueError("bpo requires rollout logprobs from the behavior policy")
+    if log_probs.shape != rollout_logprobs.shape:
+        raise ValueError("bpo log_probs and rollout_logprobs must have the same shape")
+    action_mask = torch.ones_like(log_probs, dtype=torch.bool) if loss_mask is None else loss_mask.bool()
+    if action_mask.shape != log_probs.shape:
+        raise ValueError("bpo loss_mask must match [batch, response_tokens] log probabilities")
+    current = torch.where(action_mask, log_probs.float(), torch.zeros_like(log_probs, dtype=torch.float32))
+    behavior = torch.where(
+        action_mask, rollout_logprobs.detach().float(), torch.zeros_like(rollout_logprobs, dtype=torch.float32)
+    )
+    valid_current = current[action_mask]
+    valid_behavior = behavior[action_mask]
+    if not torch.isfinite(valid_current).all() or not torch.isfinite(valid_behavior).all():
+        raise ValueError("bpo policy-token log probabilities must be finite")
+    if (valid_current > 0).any() or (valid_behavior > 0).any():
+        raise ValueError("bpo policy-token log probabilities must be <= 0")
+
+    with torch.no_grad():
+        mu = behavior.exp().clamp(0.0, 1.0)
+        pi = current.detach().exp().clamp(0.0, 1.0)
+        epsilon = config.bpo.smoothing_epsilon
+        weight = (1.0 + epsilon - mu) / (1.0 + epsilon - pi).clamp_min(epsilon)
+        weight = weight.clamp_min(0.0).clamp_max(config.bpo.weight_cap)
+        clipped = ((advantages > 0) & (weight > 1 + config.bpo.eps_clip_high)) | (
+            (advantages < 0) & (weight < 1 - config.bpo.eps_clip_low)
+        )
+        # BPO's practical approximation uses a detached score coefficient; a clipped
+        # direction contributes no policy gradient, matching the GRPO-style mask.
+        effective_weight = torch.where(clipped, torch.zeros_like(weight), weight).detach()
+
+    if loss_mask is None:
+        active_mask = action_mask
+    else:
+        active_mask = loss_mask
+    loss = -(advantages.detach().float() * effective_weight * current * active_mask).sum()
+    masked_weight = weight[action_mask]
+    metrics = {
+        "clip_ratio": clipped[action_mask].float().mean().item() if masked_weight.numel() else 0.0,
+        "bpo/weight_mean": masked_weight.mean().item() if masked_weight.numel() else 0.0,
+        "bpo/weight_max": masked_weight.max().item() if masked_weight.numel() else 0.0,
+        "bpo/clipped_rate": clipped[action_mask].float().mean().item() if masked_weight.numel() else 0.0,
+    }
+    return loss, metrics
+
+
+def score_centering_token_loss(
+    train_logp: torch.Tensor,
+    samp_logp: torch.Tensor,
+    topk_ids: torch.Tensor,
+    sampled_token: torch.Tensor,
+    samp_token_logp: torch.Tensor,
+    advantage: torch.Tensor,
+    weight_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Compute the top-k score-centering correction from the reference implementation.
+
+    This helper is intentionally separate from the default policy losses. SkyRL currently
+    records sampler support IDs but does not pass the trainer's full-vocabulary logits to
+    the policy-loss registry, so enabling this correction in the training path requires a
+    later logits/support plumbing change. Keeping the numerically sensitive formula here
+    makes that future integration testable without pretending chosen-token logprobs are
+    full score centering.
+    """
+    if weight_fn is None:
+        weight_fn = torch.ones_like
+    if train_logp.shape[:-1] != topk_ids.shape[:-1] or samp_logp.shape != topk_ids.shape:
+        raise ValueError("train_logp and sampler top-k tensors have incompatible shapes")
+    if sampled_token.shape != samp_token_logp.shape or sampled_token.shape != train_logp.shape[:-1]:
+        raise ValueError("sampled token tensors have incompatible shapes")
+
+    head_logp = train_logp.float().gather(-1, topk_ids.long())
+    token_logp = train_logp.float().gather(-1, sampled_token.long().unsqueeze(-1)).squeeze(-1)
+    sampler_head_logp = samp_logp.float()
+    p_head, q_head = head_logp.exp(), sampler_head_logp.exp()
+    p_tail = (1 - p_head.sum(dim=-1)).clamp_min(eps)
+    q_tail = (1 - q_head.sum(dim=-1)).clamp_min(eps)
+    rho = q_tail / p_tail
+    alpha = rho * weight_fn(1 / rho)
+    head_weight = weight_fn((head_logp - sampler_head_logp).exp())
+    residual = q_head * head_weight - alpha.unsqueeze(-1) * p_head
+    correction = (residual.detach() * head_logp).sum(dim=-1)
+    token_weight = weight_fn((token_logp - samp_token_logp.float()).exp())
+    return -advantage.detach() * (token_weight.detach() * token_logp - correction)
+
+
 def reduce_loss(
     loss: torch.Tensor,
     loss_mask: Optional[torch.Tensor],
@@ -1426,6 +1635,61 @@ def compute_maxrl_advantage(
         scores = scores.unsqueeze(-1) * response_mask
 
     return scores, scores
+
+
+@register_advantage_estimator(AdvantageEstimator.FLASH_REINFORCE)
+def compute_flashreinforce_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_mask: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Center terminal rewards across one fresh batch of independent trajectories.
+
+    FlashREINFORCE deliberately does not use ``index``: with one rollout per prompt, the
+    control variate is the mean reward of the complete batch rather than a sibling-prompt
+    group mean. The caller must perform this before mini-batch sharding.
+    """
+    del kwargs
+    with torch.no_grad():
+        scores = (token_level_rewards * response_mask).sum(dim=-1)
+        # `pad_training_input_batch` intentionally copies row 0 for shape-bearing
+        # tensors but zeros loss_mask. Exclude those synthetic rows from the global
+        # baseline, otherwise DP padding changes every trajectory's advantage.
+        valid_rows = (
+            response_mask.sum(dim=-1).gt(0) if loss_mask is None else loss_mask.sum(dim=-1, keepdim=False).gt(0)
+        )
+        baseline = scores[valid_rows].mean() if valid_rows.any() else scores.new_zeros(())
+        advantages = scores - baseline
+        advantages = advantages.unsqueeze(-1) * response_mask
+    return advantages, advantages
+
+
+@register_advantage_estimator(AdvantageEstimator.BPO)
+def compute_bpo_outcome_advantage(
+    token_level_rewards: torch.Tensor,
+    response_mask: torch.Tensor,
+    index: np.ndarray,
+    loss_mask: Optional[torch.Tensor] = None,
+    **kwargs,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Estimate BPO's prompt value with the mean reward of each rollout group."""
+    del kwargs
+    scores = (token_level_rewards * response_mask).sum(dim=-1)
+    valid_rows = response_mask.sum(dim=-1).gt(0) if loss_mask is None else loss_mask.sum(dim=-1, keepdim=False).gt(0)
+    id2scores = defaultdict(list)
+    for i, prompt_id in enumerate(index):
+        if valid_rows[i]:
+            id2scores[prompt_id].append(scores[i])
+
+    with torch.no_grad():
+        baselines = {prompt_id: torch.stack(prompt_scores).mean() for prompt_id, prompt_scores in id2scores.items()}
+        centered = torch.zeros_like(scores)
+        for i, prompt_id in enumerate(index):
+            if valid_rows[i]:
+                centered[i] = scores[i] - baselines[prompt_id]
+        advantages = centered.unsqueeze(-1) * response_mask
+    return advantages, advantages
 
 
 def repopulate_all_registries():

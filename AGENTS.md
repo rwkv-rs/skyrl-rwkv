@@ -83,7 +83,8 @@ Please Read ./CLAUDE.md first.
 
 ## Core Objectives
 SkyRL is a mainstream reinforcement learning library in the LLM community. This repository needs to integrate the RWKV model through SkyRL's native Trainer, Generator, InferenceEngine, and Environment interfaces.
-Code principle: For every file/type/function/variable, a similar implementation must be found to serve as a prototype. If that prototype carries a model name, replace it with `RWKV` or another case variant; otherwise keep the same name.
+Correspondence Principle: For every file/type/function/variable, a similar implementation must be found to serve as a prototype. If that prototype carries a model name, replace it with `RWKV` or another case variant; otherwise keep the same name.
+Non-Interference Principle: RWKV and FlashREINFORCE changes must not break SkyRL's native pipeline or alter the training behavior of other models.
 Process principle: Before starting any work on new functionality, first read the official documentation: https://docs.skyrl.ai/docs/
 
 ## Directory Conventions

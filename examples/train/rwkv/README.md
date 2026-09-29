@@ -105,21 +105,16 @@ prompt, batch-centered signed rewards, the actual sampler logprob, a sequence-le
 admission gate, and `sequence_mean` trajectory normalization. Its reference-free base objective
 therefore disables the KL/reference-model terms:
 
+Use the dedicated FlashREINFORCE entry point; do not pass FlashREINFORCE overrides to the GRPO GSM8K entry point:
+
 ```bash
-MODEL_DIR="$MODEL_DIR" bash examples/train/rwkv/run_rwkv_gsm8k.sh \
-  trainer.algorithm.policy_loss_type=flashreinforce \
-  trainer.algorithm.advantage_estimator=flashreinforce \
-  trainer.algorithm.loss_reduction=sequence_mean \
-  trainer.algorithm.use_kl_loss=false \
-  trainer.algorithm.use_kl_in_reward=false \
-  generator.n_samples_per_prompt=1 \
-  generator.sampling_params.logprobs=1
+MODEL_DIR="$MODEL_DIR" bash examples/train/rwkv/run_rwkv_flashreinforce.sh
 ```
 
-For the asynchronous pipeline, use the existing `examples.train.fully_async.main_fully_async`
-entrypoint, set `trainer.fully_async.enabled=true` and `generator.batched=false`, and keep
-`trainer.train_batch_size == trainer.policy_mini_batch_size`; each fresh batch is consumed by exactly
-one optimizer step. The default gate is `3e-3`; monitor
+The synchronous entry point above keeps `trainer.train_batch_size == trainer.policy_mini_batch_size`; each
+fresh batch is consumed by exactly one optimizer step. For the asynchronous pipeline, use the existing
+`examples.train.fully_async.main_fully_async` entrypoint, set `trainer.fully_async.enabled=true` and
+`generator.batched=false`. The default gate is `3e-3`; monitor
 `policy/loss_metrics/flashreinforce/acceptance_rate` and the rollout/trainer logprob-difference
 metrics before tuning it.
 

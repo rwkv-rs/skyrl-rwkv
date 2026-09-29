@@ -97,3 +97,33 @@ MODEL_DIR="$MODEL_DIR" bash examples/train/rwkv/run_rwkv_gsm8k.sh
 ```
 
 If micro-batch 2 does not fit, record the OOM and retry with `MICRO_BATCH_SIZE=1`; do not change the global train or policy mini-batch sizes. Successful acceptance requires all 50 optimizer steps, every trainer-to-inference weight update, aligned rollout token/logprob/loss-mask lengths, finite logprob-difference metrics without abnormal jumps, step-50 checkpoint/export/eval artifacts, and an online W&B run containing training, reward, evaluation, system-resource, and logprob-alignment curves.
+
+## FlashREINFORCE and algorithm ablations
+
+FlashREINFORCE is available through the native policy-loss registry. It uses one rollout per
+prompt, batch-centered signed rewards, the actual sampler logprob, a sequence-level Bernoulli-KL
+admission gate, and `sequence_mean` trajectory normalization. Its reference-free base objective
+therefore disables the KL/reference-model terms:
+
+Use the dedicated FlashREINFORCE entry point; do not pass FlashREINFORCE overrides to the GRPO GSM8K entry point:
+
+```bash
+MODEL_DIR="$MODEL_DIR" bash examples/train/rwkv/run_rwkv_flashreinforce.sh
+```
+
+The synchronous entry point above keeps `trainer.train_batch_size == trainer.policy_mini_batch_size`; each
+fresh batch is consumed by exactly one optimizer step. For the asynchronous pipeline, use the existing
+`examples.train.fully_async.main_fully_async` entrypoint, set `trainer.fully_async.enabled=true` and
+`generator.batched=false`. The default gate is `3e-3`; monitor
+`policy/loss_metrics/flashreinforce/acceptance_rate` and the rollout/trainer logprob-difference
+metrics before tuning it.
+
+BPO is implemented as a separate `policy_loss_type=bpo` / `advantage_estimator=bpo` ablation. For
+example, on the synchronous RWKV script use `trainer.algorithm.use_kl_loss=false`,
+`trainer.algorithm.use_kl_in_reward=false`, and `generator.n_samples_per_prompt=4` in addition to
+those two loss/estimator overrides. BPO requires at least two sibling rollouts because its prompt-value
+estimate is a group mean, so it is not mathematically interchangeable with one-rollout
+FlashREINFORCE. Score Centering's exact top-k formula is implemented as a tested utility, but is not
+enabled by default: the current worker loss API only exposes chosen-token logprobs to the registry,
+while exact Score Centering also needs the trainer full-vocabulary logits aligned with the sampler
+top-k support. Using chosen-token logprobs alone would not be Score Centering and could worsen training.

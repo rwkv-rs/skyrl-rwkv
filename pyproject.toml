@@ -133,11 +133,11 @@ fsdp = [
 
 rwkv = [
     "skyrl[skyrl-train]",
-    "torch==2.13.0; sys_platform == 'linux'",
-    "transformers==5.16.0.dev0; sys_platform == 'linux'",
-    "vllm; sys_platform == 'linux'",
-    "FlashRWKV2==0.1.0a13; sys_platform == 'linux'",
-    "tokenizers; sys_platform == 'linux'",
+    "torch==2.13.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "transformers==5.16.0.dev0; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "vllm; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "FlashRWKV2==0.1.0a13; sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "tokenizers; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
 
 megatron = [
@@ -218,7 +218,7 @@ version = {attr = "skyrl.__version__"}
 [tool.uv]
 # Resolve for both Linux (production) and macOS (dev)
 required-environments = [
-    "sys_platform == 'linux'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
     "sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
@@ -291,13 +291,14 @@ override-dependencies = [
 # Transformers and tokenizer revisions through the sources below.
 [[tool.uv.dependency-metadata]]
 name = "vllm"
-version = "0.23.1rc1.dev3064+g442286555.rwkv"
+version = "0.23.1rc1.dev4519+g00c6097d66.rwkv"
 requires-python = ">=3.10,<3.15"
 requires-dist = [
     "torch==2.13.0",
     "transformers==5.16.0.dev0",
     "tokenizers==0.23.2.dev0",
     "FlashRWKV2==0.1.0a13",
+    "compressed-tensors==0.17.0",
     "ninja",
     "setuptools>=77.0.3,<81.0.0",
     "regex",
@@ -379,8 +380,8 @@ explicit = true
 
 [tool.uv.sources]
 skyrl-gym = { path = "./skyrl-gym", editable = true }
-transformers = { git = "https://github.com/rwkv-rs/transformers-rwkv", rev = "55a890b5d5f7d46e49232757748a36044956d1fe", extra = "rwkv" }
-vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "4422865552606b6546632dfba9881233cc9ef3ad", extra = "rwkv" }
+transformers = { git = "https://github.com/rwkv-rs/transformers-rwkv", rev = "f708325e46025404c807c5d4b0cb5803bb63d11d", extra = "rwkv" }
+vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "00c6097d661192ead2b7d0ebfa868dad52a15427", extra = "rwkv" }
 tokenizers = { git = "https://github.com/rwkv-rs/tokenizers-rwkv", rev = "c5d8dde5ff49c70e4656199d5033a84e03c21b2b", subdirectory = "bindings/python", extra = "rwkv" }
 # Match torch's CUDA variant (cu130).
 flashinfer-jit-cache = { index = "flashinfer-cu130", marker = "sys_platform == 'linux'" }

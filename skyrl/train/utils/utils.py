@@ -20,6 +20,9 @@ from ray.util.placement_group import (
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+from skyrl.backends.skyrl_train.utils.off_policy_correction_utils import (
+    off_policy_correction_enabled,
+)
 from skyrl.env_vars import (
     SKYRL_DUMP_INFRA_LOG_TO_STDOUT,
     SKYRL_LD_LIBRARY_PATH_EXPORT,
@@ -350,6 +353,102 @@ def validate_cfg(cfg: SkyRLTrainConfig):
         f"invalid advantage_estimator: {cfg.trainer.algorithm.advantage_estimator}. "
         f"Must be one of {available_advantage_estimators}"
     )
+
+    algorithm = cfg.trainer.algorithm
+    flash_loss_names = {"flashreinforce", "flash_reinforce"}
+    flash_advantage_names = {"flashreinforce", "flash_reinforce"}
+    flash_enabled = (
+        algorithm.policy_loss_type in flash_loss_names or algorithm.advantage_estimator in flash_advantage_names
+    )
+    if flash_enabled:
+        if (
+            algorithm.policy_loss_type not in flash_loss_names
+            or algorithm.advantage_estimator not in flash_advantage_names
+        ):
+            raise ValueError(
+                "FlashREINFORCE requires trainer.algorithm.policy_loss_type and "
+                "trainer.algorithm.advantage_estimator to both use 'flashreinforce'."
+            )
+        if cfg.generator.n_samples_per_prompt != 1:
+            raise ValueError(
+                "FlashREINFORCE requires generator.n_samples_per_prompt=1; its batch baseline is across "
+                "independent prompts, not sibling rollouts."
+            )
+        if cfg.trainer.train_batch_size != cfg.trainer.policy_mini_batch_size:
+            raise ValueError(
+                "FlashREINFORCE requires trainer.train_batch_size == trainer.policy_mini_batch_size so a "
+                "fresh batch receives exactly one optimizer update."
+            )
+        if cfg.trainer.update_epochs_per_batch != 1:
+            raise ValueError("FlashREINFORCE requires trainer.update_epochs_per_batch=1")
+        if algorithm.loss_reduction != "sequence_mean":
+            raise ValueError(
+                "FlashREINFORCE requires trainer.algorithm.loss_reduction='sequence_mean' for sample-mean "
+                "trajectory normalization."
+            )
+        if algorithm.advantage_batch_normalize:
+            raise ValueError("FlashREINFORCE does not support advantage_batch_normalize; its reward baseline is fixed")
+        if algorithm.dynamic_sampling.type is not None:
+            raise ValueError("FlashREINFORCE requires one fresh batch and cannot use dynamic_sampling")
+        if algorithm.zero_variance_filter:
+            raise ValueError("FlashREINFORCE requires signed feedback and cannot use zero_variance_filter")
+        if cfg.generator.apply_overlong_filtering:
+            raise ValueError(
+                "FlashREINFORCE cannot silently mask an overlong trajectory; disable apply_overlong_filtering"
+            )
+        if cfg.trainer.critic.model.path is not None:
+            raise ValueError("FlashREINFORCE is critic-free; remove trainer.critic.model.path")
+        if algorithm.use_entropy_loss:
+            raise ValueError("FlashREINFORCE's base objective does not support use_entropy_loss")
+        if algorithm.use_kl_loss or algorithm.use_kl_in_reward:
+            raise ValueError(
+                "FlashREINFORCE's reference-free base objective does not support use_kl_loss or use_kl_in_reward; "
+                "set both to false."
+            )
+        if algorithm.use_tis or off_policy_correction_enabled(algorithm.off_policy_correction):
+            raise ValueError(
+                "FlashREINFORCE already applies rollout importance sampling and cannot be combined with "
+                "off_policy_correction or deprecated use_tis."
+            )
+        if cfg.generator.sampling_params.logprobs is None:
+            logger.warning("FlashREINFORCE needs behavior logprobs; setting generator.sampling_params.logprobs=1.")
+            cfg.generator.sampling_params.logprobs = 1
+        if cfg.trainer.policy_mini_batch_size < 2:
+            raise ValueError("FlashREINFORCE requires at least two trajectories per fresh batch")
+        if cfg.generator.step_wise_trajectories and not cfg.generator.merge_stepwise_output:
+            raise ValueError(
+                "FlashREINFORCE requires complete trajectories; set generator.merge_stepwise_output=true "
+                "when using step_wise_trajectories."
+            )
+
+    bpo_enabled = algorithm.policy_loss_type == "bpo" or algorithm.advantage_estimator == "bpo"
+    if bpo_enabled:
+        if algorithm.policy_loss_type != "bpo" or algorithm.advantage_estimator != "bpo":
+            raise ValueError(
+                "BPO requires trainer.algorithm.policy_loss_type='bpo' and "
+                "trainer.algorithm.advantage_estimator='bpo'."
+            )
+        if cfg.generator.n_samples_per_prompt < 2:
+            raise ValueError(
+                "BPO needs at least two sibling rollouts per prompt to estimate the prompt-level value; "
+                "use FlashREINFORCE for one rollout per prompt."
+            )
+        if cfg.generator.step_wise_trajectories and not cfg.generator.merge_stepwise_output:
+            raise ValueError(
+                "BPO requires complete trajectories; set generator.merge_stepwise_output=true "
+                "when using step_wise_trajectories."
+            )
+        if cfg.trainer.critic.model.path is not None:
+            raise ValueError("BPO is critic-free; remove trainer.critic.model.path")
+        if algorithm.use_entropy_loss or algorithm.use_kl_loss or algorithm.use_kl_in_reward:
+            raise ValueError("BPO's standalone ablation does not support entropy or reference-model KL terms")
+        if algorithm.use_tis or off_policy_correction_enabled(algorithm.off_policy_correction):
+            raise ValueError(
+                "BPO already applies its rollout mismatch weight and cannot use off_policy_correction or use_tis"
+            )
+        if cfg.generator.sampling_params.logprobs is None:
+            logger.warning("BPO needs behavior logprobs; setting generator.sampling_params.logprobs=1.")
+            cfg.generator.sampling_params.logprobs = 1
 
     # Step-wise training collapses each trajectory to a single scalar advantage that is broadcast
     # uniformly to every step's response tokens. This only makes sense for outcome-based estimators.

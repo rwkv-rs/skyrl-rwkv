@@ -13,16 +13,20 @@ fi
 : "${NUM_GPUS:=8}"
 : "${MICRO_BATCH_SIZE:=2}"
 : "${LOGGER:=wandb}"
-: "${RUN_NAME:=rwkv7-g1j-1.5b-gsm8k-grpo-50step}"
+: "${RUN_NAME:=rwkv7-g1j-gsm8k-flashreinforce-50step}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
 : "${UV_PROJECT_ENVIRONMENT:=$PWD/.venv}"
 export UV_PROJECT_ENVIRONMENT
 
+# FlashREINFORCE uses one fresh rollout per prompt and one optimizer update per batch.
 uv run --isolated --no-sync --extra rwkv -m skyrl.train.entrypoints.main_base \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
-  trainer.algorithm.advantage_estimator=grpo \
-  trainer.algorithm.use_kl_loss=true \
+  trainer.algorithm.policy_loss_type=flashreinforce \
+  trainer.algorithm.advantage_estimator=flashreinforce \
+  trainer.algorithm.loss_reduction=sequence_mean \
+  trainer.algorithm.use_kl_loss=false \
+  trainer.algorithm.use_kl_in_reward=false \
   trainer.policy.model.path="$MODEL_DIR" \
   trainer.policy.model_config_kwargs.wkv_mode=fp32io16 \
   trainer.strategy=fsdp \
@@ -62,9 +66,10 @@ uv run --isolated --no-sync --extra rwkv -m skyrl.train.entrypoints.main_base \
   generator.inference_engine.weight_sync_backend=nccl \
   generator.inference_engine.gpu_memory_utilization=0.8 \
   generator.batched=false \
-  generator.n_samples_per_prompt=4 \
+  generator.n_samples_per_prompt=1 \
   generator.eval_n_samples_per_prompt=1 \
   generator.chat_template_kwargs="{rwkv_prompt_template: bot, rwkv_generation_prompt: open_think}" \
+  generator.sampling_params.logprobs=1 \
   generator.sampling_params.max_generate_length=1024 \
   generator.sampling_params.temperature=1.0 \
   generator.sampling_params.top_p=0.95 \
@@ -75,5 +80,6 @@ uv run --isolated --no-sync --extra rwkv -m skyrl.train.entrypoints.main_base \
   generator.eval_sampling_params.top_p=0.76 \
   generator.eval_sampling_params.top_k=32 \
   generator.eval_sampling_params.additional_kwargs="{presence_penalty: 1.0, frequency_penalty: 0.1, penalty_decay: 0.988}" \
+  generator.inference_engine.engine_init_kwargs.mamba_ssm_cache_dtype=float32 \
   environment.env_class=gsm8k \
   "$@"

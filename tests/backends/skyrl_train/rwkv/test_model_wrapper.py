@@ -351,9 +351,7 @@ def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):
 )
 def test_rwkv_sampling_parameters_are_forwarded_to_vllm(sampling_params, expected):
     passthrough_keys = {"presence_penalty", "frequency_penalty", "penalty_decay"}
-    additional_kwargs = {
-        key: value for key, value in sampling_params.items() if key in passthrough_keys
-    }
+    additional_kwargs = {key: value for key, value in sampling_params.items() if key in passthrough_keys}
     config = SamplingParams(
         max_generate_length=128,
         **{key: value for key, value in sampling_params.items() if key not in passthrough_keys},

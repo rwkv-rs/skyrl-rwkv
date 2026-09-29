@@ -1,5 +1,5 @@
-from pathlib import Path
 import importlib.util
+from pathlib import Path
 
 SCRIPT = Path(__file__).parents[4] / "examples/train/rwkv/rollout_gsm8k.py"
 spec = importlib.util.spec_from_file_location("rollout_gsm8k", SCRIPT)
@@ -13,9 +13,7 @@ def test_rwkv_fake_think_answer_extraction():
 
 
 def test_text_match_uses_final_answer_and_option_mapping():
-    assert rollout.text_score(
-        "Earlier I considered 4.\nFinal answer: 5", "5", "question"
-    )
+    assert rollout.text_score("Earlier I considered 4.\nFinal answer: 5", "5", "question")
     assert not rollout.text_score("Earlier answer: 4\nFinal answer: 5", "4", "question")
     query = "Which?\na: wrong\nb: The polynomial hierarchy collapses\nc: other"
     assert rollout.text_score("Final answer: b", "The polynomial hierarchy collapses", query)
@@ -32,7 +30,7 @@ def test_code_python_and_cpp_execution():
 def test_long_context_selection_uses_token_budget(tmp_path: Path):
     class Tokenizer:
         def apply_chat_template(self, messages, **kwargs):
-            return {"input_ids": list(range(len(messages[0]["content"]))) }
+            return {"input_ids": list(range(len(messages[0]["content"])))}
 
     domain = tmp_path / "Long_Context"
     domain.mkdir()
@@ -47,16 +45,21 @@ def test_long_context_selection_uses_token_budget(tmp_path: Path):
 
 def test_write_output_keeps_question_ids_disjoint(tmp_path: Path):
     from collections import Counter
+
     groups = {
         "Math": {
-            "Math_1": {"row": {"uuid": "Math_1", "query": "q", "ground_truth": "1"},
-                       "counts": Counter(correct=1, wrong=0, unanswered=0),
-                       "samples": {"correct": {"response": "1", "sample_index": 0, "reason": "math_verify"}}},
+            "Math_1": {
+                "row": {"uuid": "Math_1", "query": "q", "ground_truth": "1"},
+                "counts": Counter(correct=1, wrong=0, unanswered=0),
+                "samples": {"correct": {"response": "1", "sample_index": 0, "reason": "math_verify"}},
+            },
         },
         "Code": {
-            "Code_1": {"row": {"uuid": "Code_1", "query": "q", "ground_truth": {"inputs": [""], "outputs": [""]}},
-                       "counts": Counter(correct=0, wrong=1, unanswered=0),
-                       "samples": {"wrong": {"response": "", "sample_index": 0, "reason": "wrong_output"}}},
+            "Code_1": {
+                "row": {"uuid": "Code_1", "query": "q", "ground_truth": {"inputs": [""], "outputs": [""]}},
+                "counts": Counter(correct=0, wrong=1, unanswered=0),
+                "samples": {"wrong": {"response": "", "sample_index": 0, "reason": "wrong_output"}},
+            },
         },
     }
     rollout.write_output(tmp_path, groups, 8192, 2)

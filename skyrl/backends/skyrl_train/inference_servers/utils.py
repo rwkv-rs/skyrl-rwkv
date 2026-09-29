@@ -170,6 +170,7 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     """Build CLI args for vLLM server from config."""
     from vllm import AsyncEngineArgs
     from vllm.config import WeightTransferConfig
+
     try:
         from vllm.entrypoints.openai.cli_args import FrontendArgs
     except ModuleNotFoundError:

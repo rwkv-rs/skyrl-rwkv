@@ -20,17 +20,9 @@ from ray.util.placement_group import (
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from skyrl.backends.skyrl_train.distributed.megatron.quantization_utils import (
-    has_visible_cuda_device,
-    is_blackwell_or_newer,
-    is_fp8_enabled,
-    resolve_auto_fp8_recipe,
-    validate_concrete_fp8_recipe,
-)
 from skyrl.backends.skyrl_train.utils.off_policy_correction_utils import (
     off_policy_correction_enabled,
 )
-from skyrl.backends.skyrl_train.weight_sync.fp8 import BLOCKWISE_FP8
 from skyrl.env_vars import (
     SKYRL_DUMP_INFRA_LOG_TO_STDOUT,
     SKYRL_LD_LIBRARY_PATH_EXPORT,

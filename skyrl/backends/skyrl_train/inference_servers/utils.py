@@ -212,6 +212,7 @@ def _base_vllm_cli_args(model_path: str, ie_cfg: InferenceEngineConfig, seed: in
     role builders below add their own settings on top and apply ``engine_init_kwargs`` last.
     """
     from vllm import AsyncEngineArgs
+
     try:
         from vllm.entrypoints.common.cli_args import FrontendArgs
     except ModuleNotFoundError:

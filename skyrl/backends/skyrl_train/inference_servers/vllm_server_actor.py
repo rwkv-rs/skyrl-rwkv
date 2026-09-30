@@ -702,6 +702,9 @@ async def _build_and_serve_vllm_server(
     standalone ``python -m`` entrypoint below.
     """
     sock_addr = (cli_args.host, cli_args.port)
+    # SkyRL's token-in/token-out client uses vLLM's scale-out endpoint.
+    # Enable it explicitly because vLLM defaults this feature off.
+    cli_args.enable_scale_out = True
     # One uvicorn per port (no api_server_count fan-out), matching vLLM's own
     # single-server path, so SO_REUSEPORT stays off.
     sock = create_server_socket(sock_addr, reuse_port=False)

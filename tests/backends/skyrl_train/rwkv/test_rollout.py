@@ -1,8 +1,8 @@
 import importlib.util
 from pathlib import Path
 
-SCRIPT = Path(__file__).parents[4] / "examples/train/rwkv/rollout_gsm8k.py"
-spec = importlib.util.spec_from_file_location("rollout_gsm8k", SCRIPT)
+SCRIPT = Path(__file__).parents[4] / "examples/train/rwkv/rollout.py"
+spec = importlib.util.spec_from_file_location("rollout", SCRIPT)
 rollout = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(rollout)
 

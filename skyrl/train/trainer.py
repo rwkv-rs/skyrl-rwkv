@@ -368,6 +368,16 @@ class RayPPOTrainer:
                             # this is because in step-wise training, len(uids) != len(generator_output["response_ids"])
                             uids = [trajectory_id.instance_id for trajectory_id in generator_output["trajectory_ids"]]
 
+                        if self.cfg.trainer.dump_train_results:
+                            with Timer("dump_train_results", self.all_timings):
+                                trainer_utils.dump_train_results(
+                                    Path(self.cfg.trainer.export_path) / "dumped_rollouts",
+                                    self.tokenizer,
+                                    generator_input,
+                                    generator_output,
+                                    self.global_step,
+                                )
+
                         # dynamic sampling
                         if self.cfg.trainer.algorithm.dynamic_sampling.type is not None:
                             generator_output, uids, keep_sampling = self.handle_dynamic_sampling(generator_output, uids)

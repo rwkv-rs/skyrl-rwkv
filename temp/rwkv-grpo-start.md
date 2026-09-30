@@ -25,7 +25,7 @@ recipe 固定使用下面的模型 revision：
 MODEL_REPO=rwkv-rs/rwkv7-g1-st
 MODEL_REVISION=e1a670a5523742b5cfe8cb6759c1eb8f1d88b637
 MODEL_SUBFOLDER=rwkv7-g1j-1.5b-20260831-ctx16384
-MODEL_ROOT="$HOME/models/rwkv7-g1-st-$MODEL_REVISION"
+MODEL_ROOT="$HOME/Weights/RWKV/hf"
 
 hf download "$MODEL_REPO" \
   --revision "$MODEL_REVISION" \
@@ -34,6 +34,14 @@ hf download "$MODEL_REPO" \
 
 export MODEL_DIR="$MODEL_ROOT/$MODEL_SUBFOLDER"
 ```
+
+训练前在同一个 `.venv` 和持久化扩展缓存中完成 FlashRWKV2 的单进程预编译：
+
+```bash
+MAX_JOBS=2 bash examples/train/rwkv/run_rwkv_grpo.sh --prepare-flashrwkv2
+```
+
+该步骤调用 vLLM-RWKV 的实际 loader，并验证 `.so` 产物；训练入口只接受已就绪的缓存，不会让 Ray/vLLM worker 现场编译。
 
 检查配置和 Safetensors：
 
@@ -44,7 +52,7 @@ MODEL_DIR="$MODEL_DIR" uv run --no-sync --extra rwkv python -c \
 sha256sum "$MODEL_DIR"/*.safetensors
 ```
 
-把 revision、配置和 Safetensors 哈希保存在实验记录中。Trainer 和 vLLM 必须使用同一个 `MODEL_DIR`。
+本地模型目录为 `$HOME/Weights/RWKV/hf/$MODEL_SUBFOLDER`；把 revision、配置和 Safetensors 哈希保存在实验记录中。Trainer 和 vLLM 必须使用同一个 `MODEL_DIR`。
 
 ## 3. 准备 GSM8K
 
@@ -96,7 +104,7 @@ nvidia-smi
 MODEL_DIR="$MODEL_DIR" \
 NUM_GPUS=8 \
 MICRO_BATCH_SIZE=2 \
-bash examples/train/rwkv/run_rwkv_gsm8k.sh
+bash examples/train/rwkv/run_rwkv_grpo.sh
 ```
 
 脚本默认配置如下：
@@ -121,7 +129,7 @@ rwkv7-g1j-1.5b-gsm8k-grpo-50step
 如果显存不足，只把每卡 micro-batch 调为 `1`：
 
 ```bash
-MICRO_BATCH_SIZE=1 bash examples/train/rwkv/run_rwkv_gsm8k.sh
+MICRO_BATCH_SIZE=1 bash examples/train/rwkv/run_rwkv_grpo.sh
 ```
 
 不要因此修改全局 `train_batch_size` 或 `policy_mini_batch_size`。

@@ -7,6 +7,7 @@ For details, see https://docs.skyrl.ai/docs/tutorials/skyrl_gym_generator
 
 import asyncio
 import copy
+import hashlib
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
@@ -274,8 +275,8 @@ class SkyRLGymGenerator(GeneratorInterface):
         weight_version = getattr(self.inference_engine_client, "weight_version", None)
         if weight_version is None:
             return None
-        version = f"{self.policy_model_name}@" if self.policy_model_name is not None else ""
-        return f"{version}{weight_version}"
+        model_key = hashlib.sha256((self.policy_model_name or "").encode()).hexdigest()[:16]
+        return f"{model_key}-{weight_version}"
 
     async def agent_loop(
         self,

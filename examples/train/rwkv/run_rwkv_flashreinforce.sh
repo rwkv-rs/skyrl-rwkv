@@ -63,6 +63,8 @@ uv run --isolated --no-sync --extra rwkv -m skyrl.train.entrypoints.main_base \
   trainer.micro_forward_batch_size_per_gpu="$MICRO_BATCH_SIZE" \
   trainer.eval_batch_size=64 \
   trainer.eval_before_train=false \
+  trainer.dump_train_results=true \
+  trainer.num_logger_train_samples=20 \
   trainer.eval_interval=50 \
   trainer.ckpt_interval=50 \
   trainer.hf_save_interval=50 \

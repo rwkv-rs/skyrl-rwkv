@@ -23,6 +23,7 @@ from skyrl.train.utils.trainer_utils import (
     calculate_per_dataset_metrics,
     cleanup_old_checkpoints,
     dump_per_dataset_eval_results,
+    dump_train_results,
     filter_generator_output,
     handle_dynamic_sampling,
     handle_filter_sampling,
@@ -279,6 +280,46 @@ def test_calculate_per_dataset_metrics_multiple_sources():
     assert result["eval/dataset1/pass_at_2"] == 1.0
     assert result["eval/unknown/avg_score"] == pytest.approx(0.55)
     assert result["eval/unknown/pass_at_2"] == 1.0
+
+
+@pytest.mark.parametrize("output_ids", [None, "reordered"])
+def test_dump_train_results_preserves_inputs_and_appends(tmp_path, output_ids):
+    """Single-turn IDs come from input; step-wise output IDs determine metadata alignment."""
+    ids = [TrajectoryID("first", 0), TrajectoryID("second", 0)]
+    prompts = [[{"role": "user", "content": f"question {index}"}] for index in range(2)]
+    generator_input = {
+        "trajectory_ids": ids,
+        "prompts": prompts,
+        "env_classes": ["gsm8k", "gsm8k"],
+        "env_extras": [{"reward_spec": {"ground_truth": str(index)}} for index in range(2)],
+    }
+    generator_output = {
+        "trajectory_ids": None if output_ids is None else ids[::-1],
+        "prompt_token_ids": [[10], [11]],
+        "response_ids": [[20], [21]],
+        "rewards": [1.0, 0.0],
+        "stop_reasons": ["stop", "length"],
+    }
+    tokenizer = Mock()
+    tokenizer.decode.side_effect = lambda tokens: {
+        10: "User✿q✿\nBot✿<think",
+        11: "prompt",
+        20: "#### 0",
+        21: "thinking",
+    }[tokens[0]]
+    original = copy.deepcopy(generator_output)
+    for _ in range(2):
+        dump_train_results(tmp_path, tokenizer, generator_input, generator_output, 1)
+    rows = [json.loads(line) for line in (tmp_path / "global_step_1.jsonl").read_text().splitlines()]
+    assert len(rows) == 4
+    assert rows[0]["input_prompt"] == prompts[0 if output_ids is None else 1]
+    assert rows[0]["env_extras"]["reward_spec"]["ground_truth"] == ("0" if output_ids is None else "1")
+    assert rows[0]["rendered_input_prompt"] == "User✿q✿\nBot✿<think"
+    assert rows[0]["extracted_answer"] == "0"
+    assert rows[1]["extracted_answer"] is None
+    assert rows[1]["stop_reason"] == "length"
+    assert generator_output == original
+    assert SkyRLTrainConfig().trainer.dump_train_results is False
 
 
 @patch("builtins.open", new_callable=mock_open)

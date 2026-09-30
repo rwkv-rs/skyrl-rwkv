@@ -9,7 +9,12 @@ for name in MODEL_DIR DATA_DIR NUM_GPUS MICRO_BATCH_SIZE LOGGER RUN_NAME OUTPUT_
     remote+="$name=$value "
   fi
 done
-remote+='exec bash examples/train/rwkv/run_rwkv_grpo.sh'
+if [[ ${1:-} == show ]]; then
+  shift
+  remote+='exec uv run --isolated --no-sync --extra rwkv python temp/show_details.py'
+else
+  remote+='exec bash examples/train/rwkv/run_rwkv_flashreinforce.sh'
+fi
 for arg in "$@"; do
   printf -v quoted '%q' "$arg"
   remote+=" $quoted"

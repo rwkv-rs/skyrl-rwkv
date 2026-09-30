@@ -1648,6 +1648,11 @@ class TrainerConfig(BaseConfig):
     """Dump each training data batch to a file for debugging.
     The batch at global step N is written to
     ``{export_path}/dumped_data/global_step_{N}_training_input.pkl``."""
+    dump_train_results: bool = False
+    """Dump raw training rollouts to JSONL before reward and loss-mask postprocessing.
+    The synchronous trainer appends each generation batch at global step N to
+    ``{export_path}/dumped_rollouts/global_step_{N}.jsonl``, including decoded inputs,
+    responses, environment rewards, stop reasons, and environment extras."""
     dump_eval_results: bool = True
     """Dump full evaluation results to a file.
     Results at global step N are written to ``{export_path}/dumped_evals/global_step_{N}_evals``, with both per-dataset

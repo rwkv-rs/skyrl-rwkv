@@ -18,13 +18,15 @@ The `[rwkv]` extra pins the matching Transformers, tokenizer, vLLM-RWKV, FlashRW
 uv sync --extra rwkv
 ```
 
+The launcher uses the persistent `$HOME/.cache/skyrl-rwkv/torch_extensions` cache and refuses to start if the FlashRWKV2 artifact is absent or stale. Set `MAX_JOBS=2` (or another low value) for the one-time build to limit Ninja memory use. Training workers only load the verified cached artifact.
+
 ## Download and verify the model
 
 ```bash
 MODEL_REPO=rwkv-rs/rwkv7-g1-st
 MODEL_REVISION=e1a670a5523742b5cfe8cb6759c1eb8f1d88b637
 MODEL_SUBFOLDER=rwkv7-g1j-1.5b-20260831-ctx16384
-MODEL_ROOT="$HOME/models/rwkv7-g1-st-$MODEL_REVISION"
+MODEL_ROOT="$HOME/Weights/RWKV/hf"
 
 hf download "$MODEL_REPO" \
   --revision "$MODEL_REVISION" \
@@ -37,7 +39,13 @@ MODEL_DIR="$MODEL_DIR" uv run --no-sync --extra rwkv python -c \
 sha256sum "$MODEL_DIR"/*.safetensors
 ```
 
-Keep the revision and the resulting Safetensors checksums with the run report. The Trainer and every vLLM engine must receive the same `MODEL_DIR`.
+Prepare the native FlashRWKV2 extension once, in the same project environment and cache used by training. This invokes the vLLM-RWKV loader and the actual native build; importing `FlashRWKV2` alone is not sufficient:
+
+```bash
+MAX_JOBS=2 bash examples/train/rwkv/run_rwkv_grpo.sh --prepare-flashrwkv2
+```
+
+The local model directory is `$HOME/Weights/RWKV/hf/$MODEL_SUBFOLDER`; keep the pinned revision and resulting Safetensors checksums with the run report. The Trainer and every vLLM engine must receive the same `MODEL_DIR`.
 
 ## Verify the three prompt styles
 
@@ -93,7 +101,7 @@ The launch script loads this project-root `.env` without printing its contents.
 The defaults use a BF16 Trainer, FP16 vLLM-RWKV inference, 8 GPUs, eight TP1 colocated inference engines, GRPO, `train_batch_size=64`, four samples per prompt, global policy mini-batch 64, per-GPU micro-batch 2, gradient checkpointing, and one optimizer step per training step. Step 50 runs evaluation and writes both a resumable checkpoint and an HF export.
 
 ```bash
-MODEL_DIR="$MODEL_DIR" bash examples/train/rwkv/run_rwkv_gsm8k.sh
+MODEL_DIR="$MODEL_DIR" bash examples/train/rwkv/run_rwkv_grpo.sh
 ```
 
 If micro-batch 2 does not fit, record the OOM and retry with `MICRO_BATCH_SIZE=1`; do not change the global train or policy mini-batch sizes. Successful acceptance requires all 50 optimizer steps, every trainer-to-inference weight update, aligned rollout token/logprob/loss-mask lengths, finite logprob-difference metrics without abnormal jumps, step-50 checkpoint/export/eval artifacts, and an online W&B run containing training, reward, evaluation, system-resource, and logprob-alignment curves.

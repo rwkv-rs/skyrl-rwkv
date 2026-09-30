@@ -24,7 +24,7 @@ from skyrl.backends.skyrl_train.workers.worker_utils import (
 )
 from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.dataset import PromptDataset
-from skyrl.train.generators.base import GeneratorOutput
+from skyrl.train.generators.base import GeneratorInput, GeneratorOutput
 from skyrl.train.generators.utils import (
     concatenate_generator_outputs,
     get_metrics_from_generator_output,
@@ -327,6 +327,49 @@ def get_group_completion_metrics(
     if intra_group_cvs:
         metrics.update({"generate/intra_group_completion_time_cv_mean": float(np.mean(intra_group_cvs))})
     return metrics
+
+
+def dump_train_results(
+    dump_dir_path: Path,
+    tokenizer: AutoTokenizer,
+    generator_input: GeneratorInput,
+    generator_output: GeneratorOutput,
+    global_step: int,
+):
+    """Write raw training rollouts with the corresponding environment metadata."""
+    dump_dir_path.mkdir(parents=True, exist_ok=True)
+    inputs_by_id = {
+        trajectory_id.to_string(): (prompt, env_class, env_extra)
+        for trajectory_id, prompt, env_class, env_extra in zip(
+            generator_input["trajectory_ids"],
+            generator_input["prompts"],
+            generator_input["env_classes"],
+            generator_input["env_extras"],
+            strict=True,
+        )
+    }
+    stop_reasons = generator_output.get("stop_reasons") or [None] * len(generator_output["response_ids"])
+    trajectory_ids = generator_output.get("trajectory_ids") or generator_input["trajectory_ids"]
+    with (dump_dir_path / f"global_step_{global_step}.jsonl").open("a", encoding="utf-8") as stream:
+        for index, trajectory_id in enumerate(trajectory_ids):
+            prompt, env_class, env_extra = inputs_by_id[trajectory_id.to_string()]
+            response = tokenizer.decode(generator_output["response_ids"][index])
+            entry = {
+                "step": global_step,
+                "trajectory_id": trajectory_id.to_string(),
+                "input_prompt": prompt,
+                "rendered_input_prompt": tokenizer.decode(generator_output["prompt_token_ids"][index]),
+                "output_response": response,
+                "score": generator_output["rewards"][index],
+                "stop_reason": stop_reasons[index],
+                "env_class": env_class,
+                "env_extras": env_extra,
+            }
+            if env_class == "gsm8k":
+                from skyrl_gym.envs.gsm8k.utils import extract_solution
+
+                entry["extracted_answer"] = extract_solution(response)
+            stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 def dump_per_dataset_eval_results(

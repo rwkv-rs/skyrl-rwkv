@@ -8,17 +8,33 @@ if [[ -f .env ]]; then
   set +a
 fi
 
-: "${MODEL_DIR:=$HOME/models/rwkv7-g1-st-e1a670a5523742b5cfe8cb6759c1eb8f1d88b637/rwkv7-g1j-1.5b-20260831-ctx16384}"
+: "${MODEL_DIR:=$HOME/Weights/RWKV/hf/rwkv7-g1j-1.5b-20260831-ctx16384}"
 : "${DATA_DIR:=$HOME/data/gsm8k}"
 : "${NUM_GPUS:=8}"
 : "${MICRO_BATCH_SIZE:=2}"
 : "${LOGGER:=wandb}"
 : "${RUN_NAME:=rwkv7-g1j-gsm8k-flashreinforce-50step}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
-: "${UV_PROJECT_ENVIRONMENT:=$PWD/.venv}"
-export UV_PROJECT_ENVIRONMENT
+export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+# FlashRWKV2 uses get_default_build_root() (XDG_CACHE_HOME), not TORCH_EXTENSIONS_DIR.
+export XDG_CACHE_HOME="$HOME/.cache/skyrl-rwkv"
+export TORCH_EXTENSIONS_DIR="$XDG_CACHE_HOME/torch_extensions"
 
-# FlashREINFORCE uses one fresh rollout per prompt and one optimizer update per batch.
+if [[ "${1:-}" == --prepare-flashrwkv2 ]]; then
+  shift
+  if (( $# )); then
+    printf 'Unexpected arguments to --prepare-flashrwkv2\n' >&2
+    exit 2
+  fi
+  export MAX_JOBS="${MAX_JOBS:-2}"
+  uv sync --extra rwkv
+  uv run --isolated --no-sync --extra rwkv python examples/train/rwkv/prepare_flashrwkv2.py
+  exit 0
+fi
+
+# Check the exact native cache key before loading.
+uv run --isolated --no-sync --extra rwkv python examples/train/rwkv/prepare_flashrwkv2.py --check
+
 uv run --isolated --no-sync --extra rwkv -m skyrl.train.entrypoints.main_base \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
@@ -68,8 +84,8 @@ uv run --isolated --no-sync --extra rwkv -m skyrl.train.entrypoints.main_base \
   generator.batched=false \
   generator.n_samples_per_prompt=1 \
   generator.eval_n_samples_per_prompt=1 \
-  generator.chat_template_kwargs="{rwkv_prompt_template: bot, rwkv_generation_prompt: open_think}" \
   generator.sampling_params.logprobs=1 \
+  generator.chat_template_kwargs="{rwkv_prompt_template: bot, rwkv_generation_prompt: open_think}" \
   generator.sampling_params.max_generate_length=1024 \
   generator.sampling_params.temperature=1.0 \
   generator.sampling_params.top_p=0.95 \

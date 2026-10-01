@@ -444,12 +444,21 @@ class SkyRLGymGenerator(GeneratorInterface):
                         added_eos = True
 
                 # 2. Environment step
-                env_step_start_time = time.monotonic()
-                env_step_output: BaseTextEnvStepOutput = await self._run_in_executor_if_available(env.step, output)
-                time_splits["env"] += time.monotonic() - env_step_start_time
-                new_obs = env_step_output["observations"]
-                step_reward: float = env_step_output["reward"]
-                agent_loop_state.done = env_step_output["done"]
+                if stop_reason in {"length", "max_tokens"}:
+                    # A generation cut off at the token budget is an
+                    # unanswered trajectory, even if it contains a matching
+                    # answer marker somewhere before the cutoff.
+                    env_step_output = {"observations": [], "reward": 0.0, "done": True}
+                    new_obs = []
+                    step_reward = 0.0
+                    agent_loop_state.done = True
+                else:
+                    env_step_start_time = time.monotonic()
+                    env_step_output: BaseTextEnvStepOutput = await self._run_in_executor_if_available(env.step, output)
+                    time_splits["env"] += time.monotonic() - env_step_start_time
+                    new_obs = env_step_output["observations"]
+                    step_reward = env_step_output["reward"]
+                    agent_loop_state.done = env_step_output["done"]
 
                 if env_step_output.get("postprocessed_action", None) is not None:
                     # TODO(Charlie): come back to this, we should deprecate postprocessed action
@@ -768,9 +777,13 @@ class SkyRLGymGenerator(GeneratorInterface):
         truncated_indices: Optional[List[RoutedExpertIndices]] = [] if raw_rollout_expert_indices is not None else None
 
         for i, (output, response, env, env_class) in enumerate(zip(outputs, responses, envs, env_classes)):
-            # step on environment and compute reward
-            env_step_output: BaseTextEnvStepOutput = await self._run_in_executor_if_available(env.step, output)
-            reward = env_step_output["reward"]
+            # A response cut off at the generation limit is unanswered and
+            # must not receive an environment reward or training advantage.
+            if stop_reasons[i] in {"length", "max_tokens"}:
+                reward = 0.0
+            else:
+                env_step_output: BaseTextEnvStepOutput = await self._run_in_executor_if_available(env.step, output)
+                reward = env_step_output["reward"]
             rewards.append(reward)
 
             if len(response) > max_tokens:

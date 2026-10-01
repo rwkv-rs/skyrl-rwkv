@@ -265,9 +265,9 @@ def validate_generator_output(output: GeneratorOutput) -> bool:
     "use_cache_salt,weight_version,policy_model_name,expected_salt",
     [
         (False, 3, None, None),  # disabled -> no salt
-        (True, 3, None, "3"),  # enabled, no model name -> bare version
-        (True, 5, "my-model", "my-model@5"),  # enabled with model name
-        (True, 0, "my-model", "my-model@0"),  # pre-first-sync version (0) still salts
+        (True, 3, None, "e3b0c44298fc1c14-3"),  # enabled, no model name
+        (True, 5, "my-model", "98ad223a32fd2352-5"),  # enabled with model name
+        (True, 0, "my-model", "98ad223a32fd2352-0"),  # pre-first-sync version (0) still salts
     ],
 )
 async def test_cache_salt_threaded_to_engine_input(
@@ -894,6 +894,7 @@ async def test_apply_overlong_filtering_non_batched(
         0,
         0,
     ], "Loss mask should be all zeros for response not ending with eos token"
+    assert mock_env.step.call_count == 0, "truncated responses must not receive an environment reward"
 
     # Note: The long response gets truncated by max_response_tokens, so it doesn't end with eos token
     # Second test: response that ends with eos token (should not be filtered)
@@ -1000,6 +1001,7 @@ async def test_apply_overlong_filtering_batched(
         0,
         0,
     ], "Loss mask should be all zeros for response not ending with eos token"
+    assert mock_env.step.call_count == 0, "truncated responses must not receive an environment reward"
 
 
 @pytest.mark.asyncio

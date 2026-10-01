@@ -596,6 +596,8 @@ class SkyRLGymGenerator(GeneratorInterface):
 
                     # agent loop only tracks loss mask and rollout logprobs for this turn with step_wise training
                     turn_loss_mask = turn_output.get_turn_loss_mask()
+                    if stop_reason in {"length", "max_tokens"}:
+                        turn_loss_mask = [0] * len(turn_loss_mask)
                     turn_response_logprobs: Optional[List[float]] = turn_output.get_turn_rollout_logprobs()
                     turn_sample_support = turn_output.get_turn_rollout_sample_support()
 
@@ -691,9 +693,15 @@ class SkyRLGymGenerator(GeneratorInterface):
                 ), f"loss_mask and response_ids should have the same length, got {len(loss_mask)} and {len(response_ids)}"
 
             appended_eos_token = False
+            if stop_reason in {"length", "max_tokens"} and loss_mask is not None:
+                loss_mask = [0] * len(loss_mask)
             if not self.use_conversation_multi_turn:
                 assert response_ids is not None and loss_mask is not None
-                if stop_reason != "length" and response_ids and response_ids[-1] != self.tokenizer.eos_token_id:
+                if (
+                    stop_reason not in {"length", "max_tokens"}
+                    and response_ids
+                    and response_ids[-1] != self.tokenizer.eos_token_id
+                ):
                     response_ids.append(self.tokenizer.eos_token_id)
                     loss_mask.append(1)
                     if rollout_logprobs is not None:
@@ -940,7 +948,8 @@ class SkyRLGymGenerator(GeneratorInterface):
 
             if len(response) > max_tokens:
                 response = response[:max_tokens]
-            loss_masks.append([1] * len(response))
+            is_truncated = stop_reasons[i] in {"length", "max_tokens"}
+            loss_masks.append([0 if is_truncated else 1] * len(response))
             truncated_responses.append(response)
             if logprobs is not None:
                 sample_logprobs = logprobs[i][: len(response)]

@@ -1324,6 +1324,7 @@ async def test_apply_overlong_filtering_non_batched(
         0,
         0,
     ], "Loss mask should be all zeros for response not ending with eos token"
+    assert mock_env.step.call_count == 0, "truncated responses must not receive an environment reward"
 
     # Note: The long response gets truncated by max_response_tokens, so it doesn't end with eos token
     # Second test: response that ends with eos token (should not be filtered)
@@ -1430,6 +1431,7 @@ async def test_apply_overlong_filtering_batched(
         0,
         0,
     ], "Loss mask should be all zeros for response not ending with eos token"
+    assert mock_env.step.call_count == 0, "truncated responses must not receive an environment reward"
 
 
 @pytest.mark.asyncio

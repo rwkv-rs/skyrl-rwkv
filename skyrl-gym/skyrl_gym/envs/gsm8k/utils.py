@@ -15,17 +15,25 @@
 import re
 
 
+_BOXED_RE = re.compile(r"\\boxed\s*\{([^{}]*)\}")
+
+
 def extract_solution(solution_str, method="strict"):
     assert method in ["strict", "flexible"]
 
     if method == "strict":
-        # this also tests the formatting of the model
-        solution = re.search("#### (\\-?[0-9\\.\\,]+)", solution_str)
-        if solution is None:
-            final_answer = None
+        # Prefer the final boxed answer used by math-capable models, while
+        # retaining the original GSM8K ``####`` format as a fallback.
+        boxed = list(_BOXED_RE.finditer(solution_str))
+        if boxed:
+            final_answer = boxed[-1].group(1).strip().replace(",", "").replace("$", "")
         else:
-            final_answer = solution.group(0)
-            final_answer = final_answer.split("#### ")[1].replace(",", "").replace("$", "")
+            solution = re.search("#### (\\-?[0-9\\.\\,]+)", solution_str)
+            if solution is None:
+                final_answer = None
+            else:
+                final_answer = solution.group(0)
+                final_answer = final_answer.split("#### ")[1].replace(",", "").replace("$", "")
     elif method == "flexible":
         answer = re.findall("(\\-?[0-9\\.\\,]+)", solution_str)
         final_answer = None

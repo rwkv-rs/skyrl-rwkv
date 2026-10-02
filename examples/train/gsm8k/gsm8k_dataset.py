@@ -16,8 +16,8 @@ Preprocess the GSM8k dataset to parquet format
 """
 
 import argparse
-import re
 import os
+import re
 
 import datasets
 
@@ -40,6 +40,13 @@ if __name__ == "__main__":
         help="If set, truncate the training split to this many examples.",
     )
 
+    parser.add_argument(
+        "--answer_format",
+        choices=["hash", "boxed"],
+        default="boxed",
+        help="Final-answer format requested in the prompt.",
+    )
+
     args = parser.parse_args()
 
     args.output_dir = os.path.expanduser(args.output_dir)
@@ -55,7 +62,10 @@ if __name__ == "__main__":
         max_len = min(args.max_train_dataset_length, len(train_dataset))
         train_dataset = train_dataset.select(range(max_len))
 
-    instruction_following = 'Let\'s think step by step and output the final answer after "####".'
+    if args.answer_format == "boxed":
+        instruction_following = r"Let's think step by step and put the final answer in \boxed{...}."
+    else:
+        instruction_following = 'Let\'s think step by step and output the final answer after "####".'
 
     # add a row to each data item that represents a unique id
     def make_map_fn(split):

@@ -58,6 +58,8 @@ class FSDPWeightExtractor(WeightExtractor):
         weight_prefix: Prefix to prepend to all weight names (e.g., ``"language_model."``
             when syncing a CausalLM backbone to a vLLM instance which always uses the namespace of the
             multimodal model, even if vision encoder weights are not initialized).
+        rwkv_effective_bf16: Quantize RWKV weights to the FSDP forward dtype before
+            converting to the inference transport dtype.
     """
 
     def __init__(
@@ -66,11 +68,13 @@ class FSDPWeightExtractor(WeightExtractor):
         enable_bucketing: bool = False,
         batch_size_threshold_gb: float = 0.0,
         weight_prefix: str = "",
+        rwkv_effective_bf16: bool = False,
     ):
         self.model = model
         self.enable_bucketing = enable_bucketing
         self.batch_size_threshold_gb = batch_size_threshold_gb
         self.weight_prefix = weight_prefix
+        self.rwkv_effective_bf16 = rwkv_effective_bf16
 
     def extract_weights(self, dtype: torch.dtype):
         """Extract weights from FSDP model.
@@ -90,7 +94,7 @@ class FSDPWeightExtractor(WeightExtractor):
         if not self.enable_bucketing:
             # Simple path: yield one chunk per parameter
             for name, param in params.items():
-                tensor = self._gather_tensor(param).to(dtype).detach().contiguous()
+                tensor = self._gather_for_dtype(param, dtype).detach().contiguous()
                 yield WeightChunk(
                     names=[name],
                     dtypes=[str(dtype)],
@@ -107,7 +111,7 @@ class FSDPWeightExtractor(WeightExtractor):
             for chunk in yield_module_grouped_chunks(
                 params=params,
                 dtype=dtype,
-                gather_tensor_fn=self._gather_tensor,
+                gather_tensor_fn=lambda param: self._gather_for_dtype(param, dtype),
                 get_shape_fn=lambda name, param, tensor: list(tensor.shape),
                 batch_size_threshold_gb=self.batch_size_threshold_gb,
             ):
@@ -132,6 +136,17 @@ class FSDPWeightExtractor(WeightExtractor):
         """Gather sharded tensor into full tensor."""
         device = torch.cuda.current_device()
         return param.to(device, non_blocking=True).full_tensor() if isinstance(param, DTensor) else param
+
+    def _gather_for_dtype(self, param: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+        tensor = self._gather_tensor(param)
+        # FSDP keeps the trainable master parameters in fp32 while the RWKV
+        # forward runs under the bf16 mixed-precision policy.  Quantize to the
+        # forward dtype before converting to vLLM's required fp16 transport
+        # dtype; fp32 -> fp16 would otherwise export values the trainer never
+        # used in its forward pass.
+        if self.rwkv_effective_bf16 and dtype == torch.float16:
+            tensor = tensor.to(torch.bfloat16)
+        return tensor.to(dtype)
 
 
 class FSDPPolicyWorkerBase(PolicyWorkerBase):
@@ -235,6 +250,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
                 inference_engine_cfg.weight_transfer_threshold_cuda_ipc_GB if enable_bucketing else 0.0
             ),
             weight_prefix=weight_prefix,
+            rwkv_effective_bf16=self.model.is_rwkv,
         )
 
         # super picks the strategy and creates the sender (for sharded_rdt that

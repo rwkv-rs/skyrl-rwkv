@@ -877,6 +877,11 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         logger.info("Exporting wandb api key to ray runtime env")
         env_vars["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
 
+    for var_name in ("WANDB_INIT_TIMEOUT", "WANDB_HTTP_TIMEOUT", "WANDB_HTTP_PROXY", "WANDB_HTTPS_PROXY"):
+        if value := os.environ.get(var_name):
+            logger.info(f"Exporting {var_name} to ray runtime env")
+            env_vars[var_name] = value
+
     if os.environ.get("MLFLOW_TRACKING_URI"):
         logger.info("Exporting mlflow tracking uri to ray runtime env")
         env_vars["MLFLOW_TRACKING_URI"] = os.environ["MLFLOW_TRACKING_URI"]

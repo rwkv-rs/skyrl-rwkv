@@ -13,7 +13,10 @@ from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
 from skyrl.backends.skyrl_train.utils import torch_utils as torch_utils_module
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
 from skyrl.backends.skyrl_train.workers import model_wrapper as model_wrapper_module
-from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase
+from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
+    FSDPPolicyWorkerBase,
+    FSDPWeightExtractor,
+)
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
 from skyrl.train.config import SamplingParams, SkyRLTrainConfig
 
@@ -181,6 +184,17 @@ def test_rwkv_recurrent_forward_preserves_gradients():
     assert model.lm_head.weight.grad is not None
     assert torch.isfinite(model.embed_tokens.weight.grad).all()
     assert torch.isfinite(model.lm_head.weight.grad).all()
+
+
+def test_rwkv_weight_extractor_matches_fsdp_bf16_forward_dtype(monkeypatch):
+    source = torch.tensor([1.003, -2.007], dtype=torch.float32)
+    extractor = FSDPWeightExtractor(torch.nn.Module(), rwkv_effective_bf16=True)
+    monkeypatch.setattr(extractor, "_gather_tensor", lambda param: param)
+
+    actual = extractor._gather_for_dtype(source, torch.float16)
+
+    assert torch.equal(actual, source.to(torch.bfloat16).to(torch.float16))
+    assert not torch.equal(actual, source.to(torch.float16))
 
 
 def test_rwkv_weight_reload_preserves_runtime_layout_and_derived_storage():

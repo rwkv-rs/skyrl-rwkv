@@ -95,3 +95,21 @@ def finalize_rwkv_runtime_weights(model: torch.nn.Module) -> None:
     )
 
 
+def clear_rwkv_cudagraphs() -> None:
+    """Drop graphs captured against the previous RWKV runtime weights.
+
+    RWKV has non-parameter tensors (folded embeddings and canonical low-rank
+    projections) which participate in the captured forward.  The weight sync
+    refreshes those tensors in place, but a graph captured before the refresh
+    can also retain graph-local/static intermediates derived from the old
+    values.  Re-capture after every complete update so replay observes the
+    newly synchronized runtime state.
+    """
+    from vllm.compilation.breakable_cudagraph import BreakableCUDAGraphWrapper
+    from vllm.compilation.cuda_graph import CUDAGraphWrapper
+
+    torch.accelerator.synchronize()
+    CUDAGraphWrapper.clear_all_graphs()
+    BreakableCUDAGraphWrapper.clear_all_graphs()
+
+

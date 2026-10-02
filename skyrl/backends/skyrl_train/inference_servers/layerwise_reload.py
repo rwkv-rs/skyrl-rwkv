@@ -2,7 +2,7 @@
 
 import logging
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 
 import torch
 
@@ -54,7 +54,7 @@ def _log_rwkv_debug_weight(model: torch.nn.Module, name: str, source: torch.Tens
 @torch.no_grad()
 def load_rwkv_checkpoint_weights(
     model: torch.nn.Module,
-    weights: list[tuple[str, torch.Tensor]],
+    weights: Iterable[tuple[str, torch.Tensor]],
 ) -> set[str]:
     """Load RWKV checkpoint tensors into its already-processed vLLM model.
 
@@ -65,20 +65,19 @@ def load_rwkv_checkpoint_weights(
     CUDA-graph references) and apply that one runtime-layout transform here;
     all shape-preserving tensors continue through RWKV's native loader.
     """
-    regular_weights = []
     loaded = set()
-    for name, weight in weights:
-        if name.endswith(".mlp.value.weight"):
-            model.get_parameter(name).copy_(weight.T)
-            _log_rwkv_debug_weight(model, name, weight)
-            loaded.add(name)
-        else:
-            regular_weights.append((name, weight))
 
-    if regular_weights:
-        loaded.update(model.load_weights(weights=regular_weights))
-        for name, weight in regular_weights:
-            _log_rwkv_debug_weight(model, name, weight)
+    def iter_regular_weights():
+        for name, weight in weights:
+            if name.endswith(".mlp.value.weight"):
+                model.get_parameter(name).copy_(weight.T)
+                _log_rwkv_debug_weight(model, name, weight)
+                loaded.add(name)
+            else:
+                yield name, weight
+                _log_rwkv_debug_weight(model, name, weight)
+
+    loaded.update(model.load_weights(weights=iter_regular_weights()))
     return loaded
 
 

@@ -72,6 +72,8 @@ class DeltaWeightTransferEngine(WeightTransferEngine[DeltaTransferInitInfo, Delt
         """Initialize layerwise reloading for the incoming checkpoint weights."""
         from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
 
+        if getattr(getattr(self.model, "config", None), "model_type", None) == "rwkv":
+            return
         with torch.device(self.device):
             initialize_layerwise_reload(self.model)
 
@@ -79,6 +81,16 @@ class DeltaWeightTransferEngine(WeightTransferEngine[DeltaTransferInitInfo, Delt
         """Finalize layerwise reloading after the checkpoint has been loaded."""
         from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
 
+        if getattr(getattr(self.model, "config", None), "model_type", None) == "rwkv":
+            from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
+                clear_rwkv_cudagraphs,
+                finalize_rwkv_runtime_weights,
+            )
+
+            with torch.device(self.device):
+                finalize_rwkv_runtime_weights(self.model)
+                clear_rwkv_cudagraphs()
+            return
         with torch.device(self.device):
             finalize_layerwise_reload(self.model, self.model_config)
         empty_cuda_cache_rocm()
@@ -156,7 +168,12 @@ class DeltaWeightTransferEngine(WeightTransferEngine[DeltaTransferInitInfo, Delt
         )
 
         with torch.device(self.device), disable_mtp_completeness_check():
-            self.model.load_weights(tensors)
+            if getattr(getattr(self.model, "config", None), "model_type", None) == "rwkv":
+                from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import load_rwkv_checkpoint_weights
+
+                load_rwkv_checkpoint_weights(self.model, tensors)
+            else:
+                self.model.load_weights(tensors)
 
         load_s = time.perf_counter() - t1
         total_s = time.perf_counter() - t0

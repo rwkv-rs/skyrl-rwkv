@@ -1,8 +1,54 @@
 """RWKV checkpoint-to-runtime weight loading for vLLM receive engines."""
 
+import logging
+import os
 from collections.abc import Callable
 
 import torch
+
+logger = logging.getLogger(__name__)
+_RWKV_DEBUG_CHECKSUM_NAMES = frozenset(
+    {
+        "model.embed_tokens.weight",
+        "model.embedding_norm.weight",
+        "model.embedding_norm.bias",
+        "model.layers.0.linear_attn.w1",
+        "model.layers.0.linear_attn.w2",
+        "model.layers.1.linear_attn.v1",
+        "model.layers.0.mlp.value.weight",
+        "model.layers.23.mlp.key.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+    }
+)
+
+
+def _rwkv_debug_checksum(tensor: torch.Tensor) -> str:
+    sample = tensor.detach().reshape(-1)[:4096].float()
+    return (
+        f"sum={sample.sum().item():.9g},"
+        f"absmax={sample.abs().max().item():.9g},"
+        f"ptr={tensor.data_ptr()}"
+    )
+
+
+def _log_rwkv_debug_weight(model: torch.nn.Module, name: str, source: torch.Tensor) -> None:
+    if (
+        os.environ.get("SKYRL_RWKV_DEBUG_WEIGHT_CHECKSUMS") != "1"
+        or name not in _RWKV_DEBUG_CHECKSUM_NAMES
+    ):
+        return
+    target = model.get_parameter(name)
+    expected = source.T if name.endswith(".mlp.value.weight") else source
+    delta = (target.detach().float() - expected.detach().float()).reshape(-1)[:4096]
+    logger.info(
+        "RWKV weight checksum name=%s source=(%s) target=(%s) first4096_max_abs_delta=%.9g",
+        name,
+        _rwkv_debug_checksum(source),
+        _rwkv_debug_checksum(target),
+        delta.abs().max().item(),
+    )
+
 
 
 @torch.no_grad()
@@ -24,12 +70,15 @@ def load_rwkv_checkpoint_weights(
     for name, weight in weights:
         if name.endswith(".mlp.value.weight"):
             model.get_parameter(name).copy_(weight.T)
+            _log_rwkv_debug_weight(model, name, weight)
             loaded.add(name)
         else:
             regular_weights.append((name, weight))
 
     if regular_weights:
         loaded.update(model.load_weights(weights=regular_weights))
+        for name, weight in regular_weights:
+            _log_rwkv_debug_weight(model, name, weight)
     return loaded
 
 
@@ -82,6 +131,24 @@ def refresh_rwkv_runtime_weights(model: torch.nn.Module, fold_embedding: Callabl
         else:
             attention.v1_canonical.copy_(attention.v1.T)
             attention.v2_canonical.copy_(attention.v2.T)
+
+    if os.environ.get("SKYRL_RWKV_DEBUG_WEIGHT_CHECKSUMS") == "1":
+        for name in (
+            "model.embed_tokens.weight",
+            "model.layers.0.linear_attn.w1_canonical",
+            "model.layers.0.linear_attn.w2_canonical",
+            "model.layers.1.linear_attn.v1_canonical",
+        ):
+            tensor = (
+                model.get_parameter(name)
+                if name == "model.embed_tokens.weight"
+                else model.get_buffer(name)
+            )
+            logger.info(
+                "RWKV runtime checksum name=%s (%s)",
+                name,
+                _rwkv_debug_checksum(tensor),
+            )
 
 
 def finalize_rwkv_runtime_weights(model: torch.nn.Module) -> None:

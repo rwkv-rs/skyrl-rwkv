@@ -292,12 +292,14 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
                 self.skyrl_release_receive_buffers()
             return
         from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
+            clear_rwkv_cudagraphs,
             finalize_rwkv_runtime_weights,
         )
 
         if self.model.config.model_type == "rwkv":
             with torch.device(self.device):
                 finalize_rwkv_runtime_weights(self.model)
+                clear_rwkv_cudagraphs()
             return
         with torch.device(self.device):
             super().finish_weight_update()

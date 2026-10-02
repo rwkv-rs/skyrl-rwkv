@@ -176,12 +176,18 @@ class DeltaWeightTransferEngine:
         prepare_s = time.perf_counter() - t0
         load_s = 0.0
         t1 = time.perf_counter()
-        self.model.load_weights(
-            self._store.iter_tensors(
-                load_format=self._checkpoint_load_format,
-                multi_thread_safetensors_max_workers=self._multi_thread_safetensors_max_workers,
-            )
+        weights = self._store.iter_tensors(
+            load_format=self._checkpoint_load_format,
+            multi_thread_safetensors_max_workers=self._multi_thread_safetensors_max_workers,
         )
+        if getattr(getattr(self.model, "config", None), "model_type", None) == "rwkv":
+            from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
+                load_rwkv_checkpoint_weights,
+            )
+
+            load_rwkv_checkpoint_weights(self.model, weights)
+        else:
+            self.model.load_weights(weights)
         load_s = time.perf_counter() - t1
         total_s = time.perf_counter() - t0
         message = (

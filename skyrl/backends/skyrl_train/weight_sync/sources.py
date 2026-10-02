@@ -78,10 +78,17 @@ class FsdpWeightSource(WeightSource):
             syncing a CausalLM backbone into a vLLM multimodal namespace).
     """
 
-    def __init__(self, model: torch.nn.Module, dtype: torch.dtype, weight_prefix: str = "") -> None:
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        dtype: torch.dtype,
+        weight_prefix: str = "",
+        rwkv_effective_bf16: bool = False,
+    ) -> None:
         self._model = model
         self._dtype = dtype
         self._prefix = weight_prefix or ""
+        self._rwkv_effective_bf16 = rwkv_effective_bf16
 
     @property
     def model(self) -> torch.nn.Module:
@@ -102,7 +109,10 @@ class FsdpWeightSource(WeightSource):
         for key, param in self._model.state_dict().items():
             if device is not None:
                 param = param.to(device, non_blocking=True)
-            full = materialize_full_tensor(param).to(self._dtype).detach().contiguous()
+            full = materialize_full_tensor(param)
+            if self._rwkv_effective_bf16 and self._dtype == torch.float16:
+                full = full.to(torch.bfloat16)
+            full = full.to(self._dtype).detach().contiguous()
             yield f"{self._prefix}{key}", full
 
 

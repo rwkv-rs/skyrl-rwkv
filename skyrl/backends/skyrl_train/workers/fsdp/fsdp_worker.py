@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from skyrl.train.config import InferenceEngineConfig
 
 
+
 class FSDPPolicyWorkerBase(PolicyWorkerBase):
     async def init_weight_sync_state(self, inference_engine_client, inference_engine_cfg: "InferenceEngineConfig"):
         if inference_engine_cfg.fp8_weight_sync_mode is not None:
@@ -132,7 +133,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
         from skyrl.backends.skyrl_train.weight_sync.sources import FsdpWeightSource
 
-        return FsdpWeightSource(self.model.model, dtype, weight_prefix)
+        return FsdpWeightSource(self.model.model, dtype, weight_prefix, rwkv_effective_bf16=self.model.is_rwkv)
 
     async def _save_lora_adapters_and_sync(
         self,

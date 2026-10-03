@@ -493,7 +493,7 @@ class VLLMServerActor(ServerActorProtocol):
                     reset_succeeded = await engine.reset_prefix_cache(
                         reset_running_requests=reset_running_requests
                     )
-                except RuntimeError as exc:
+                except (RuntimeError, ValueError) as exc:
                     # Some vLLM revisions raise instead of returning False when
                     # preempted requests still own blocks. Treat that transient
                     # state exactly like an unsuccessful reset.

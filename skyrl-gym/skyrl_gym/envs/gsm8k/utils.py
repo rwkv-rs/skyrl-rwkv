@@ -12,10 +12,55 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+\
+
 import re
+from typing import Any, Dict, Optional, Tuple
 
 
-_BOXED_RE = re.compile(r"\\boxed\s*\{([^{}]*)\}")
+_BOXED_START_RE = re.compile(r"\\boxed\s*\{")
+
+
+def _find_balanced_brace(text: str, brace_start: int) -> Optional[Tuple[str, int]]:
+    if brace_start < 0 or brace_start >= len(text) or text[brace_start] != "{":
+        return None
+
+    depth = 0
+    for index in range(brace_start, len(text)):
+        if text[index] == "{":
+            depth += 1
+        elif text[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return text[brace_start + 1 : index], index
+    return None
+
+
+def _iter_boxed(text: str):
+    for match in _BOXED_START_RE.finditer(text):
+        parsed = _find_balanced_brace(text, match.end() - 1)
+        if parsed is not None:
+            yield parsed[0], match.start()
+
+
+def _normalize_answer(answer: Any) -> Optional[str]:
+    if answer is None:
+        return None
+    normalized = str(answer).strip().replace(",", "").replace("$", "")
+    return normalized or None
 
 
 def extract_solution(solution_str, method="strict"):
@@ -24,18 +69,14 @@ def extract_solution(solution_str, method="strict"):
     if method == "strict":
         # Prefer the final boxed answer used by math-capable models, while
         # retaining the original GSM8K ``####`` format as a fallback.
-        boxed = list(_BOXED_RE.finditer(solution_str))
+        boxed = list(_iter_boxed(solution_str))
         if boxed:
-            final_answer = boxed[-1].group(1).strip().replace(",", "").replace("$", "")
+            final_answer = _normalize_answer(boxed[-1][0])
         else:
-            solution = re.search("#### (\\-?[0-9\\.\\,]+)", solution_str)
-            if solution is None:
-                final_answer = None
-            else:
-                final_answer = solution.group(0)
-                final_answer = final_answer.split("#### ")[1].replace(",", "").replace("$", "")
+            solution = re.search(r"####\s+(-?[0-9][0-9.,]*)", solution_str)
+            final_answer = _normalize_answer(solution.group(1)) if solution is not None else None
     elif method == "flexible":
-        answer = re.findall("(\\-?[0-9\\.\\,]+)", solution_str)
+        answer = re.findall(r"(-?[0-9.,]+)", solution_str)
         final_answer = None
         if len(answer) == 0:
             # no reward is there is no answer
@@ -47,6 +88,54 @@ def extract_solution(solution_str, method="strict"):
                 if final_answer not in invalid_str:
                     break
     return final_answer
+
+
+def _extract_after_think(solution_str: str) -> Optional[Tuple[str, str]]:
+    """Extract the thought and answer regions from a strict-CoT response."""
+    if not isinstance(solution_str, str) or solution_str.count("</think>") != 1:
+        return None
+
+    thought, answer_region = solution_str.split("</think>", 1)
+    if not thought.strip():
+        return None
+    return thought, answer_region
+
+
+def compute_strict_score(
+    solution_str: str,
+    ground_truth: str,
+    *,
+    ended_eod: bool,
+    truncated: bool,
+) -> Tuple[float, Dict[str, Any]]:
+    """Score a complete strict-CoT GSM8K response.
+
+    The prompt may prefill ``<think>``. Therefore the generated response only
+    needs one non-empty thought region followed by an answer region.
+    """
+    parsed = _extract_after_think(solution_str)
+    thought = parsed[0] if parsed is not None else ""
+    answer_region = parsed[1] if parsed is not None else ""
+    extracted_answer = extract_solution(answer_region, method="strict") if parsed is not None else None
+    normalized_ground_truth = _normalize_answer(ground_truth)
+    is_correct = extracted_answer is not None and extracted_answer == normalized_ground_truth
+    structural_format_valid = bool(parsed is not None and extracted_answer is not None)
+    strict_reward = float(is_correct and structural_format_valid and ended_eod and not truncated)
+
+    details = {
+        "extracted_answer": extracted_answer,
+        "ground_truth_answer": normalized_ground_truth,
+        "has_think_close": parsed is not None,
+        "think_close_count": solution_str.count("</think>"),
+        "thought_nonempty": bool(thought.strip()),
+        "answer_after_think": extracted_answer is not None,
+        "structural_format_valid": structural_format_valid,
+        "ended_eod": bool(ended_eod),
+        "truncated": bool(truncated),
+        "is_correct": bool(is_correct),
+        "strict_reward": strict_reward,
+    }
+    return strict_reward, details
 
 
 def compute_score(solution_str, ground_truth, method="strict", format_score=0.0, score=1.0):

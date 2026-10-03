@@ -487,8 +487,21 @@ class VLLMServerActor(ServerActorProtocol):
             except Exception:
                 data = {}
             reset_running_requests = data.get("reset_running_requests", False)
-            await engine.reset_prefix_cache(reset_running_requests=reset_running_requests)
-            return {"status": "ok"}
+            reset_attempts = 0
+            while True:
+                reset_succeeded = await engine.reset_prefix_cache(
+                    reset_running_requests=reset_running_requests
+                )
+                if reset_succeeded or not reset_running_requests:
+                    break
+                # In-flight output processing may still be releasing a block after
+                # reset_running_requests preempts the scheduler. Do not start a
+                # weight reload until the cache and RWKV state slots are quiescent.
+                reset_attempts += 1
+                await asyncio.sleep(0.01)
+            if reset_attempts:
+                logger.info("Reset prefix cache after %d retry attempt(s)", reset_attempts)
+            return {"status": "ok", "reset_attempts": reset_attempts}
 
         @app.post("/fetch_weights")
         async def _fetch_weights(request: Request):

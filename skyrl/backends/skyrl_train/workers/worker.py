@@ -600,7 +600,8 @@ class Worker(DistributedTorchRayActor):
         ``clear_kv_cache_on_weight_sync`` is set (otherwise in-flight requests
         keep generating against their cached prefixes across the sync).
         """
-        return inference_engine_cfg.enable_prefix_caching and (
+        is_rwkv = getattr(self.model, "is_rwkv", False)
+        return (inference_engine_cfg.enable_prefix_caching or is_rwkv) and (
             not self.cfg.fully_async.enabled or self.cfg.fully_async.clear_kv_cache_on_weight_sync
         )
 

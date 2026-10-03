@@ -49,6 +49,22 @@ def test_strict_reward_requires_complete_thinking_response():
     assert step_output["metadata"]["ended_eod"] is True
 
 
+def test_strict_reward_does_not_count_open_think_completion_as_reasoning():
+    env = _make_strict_env()
+    response = "></think> \\boxed{42}"
+    env.set_generation_metadata(
+        action=response,
+        ended_eod=True,
+        truncated=False,
+        stop_reason="stop",
+    )
+
+    step_output = env.step(response)
+
+    assert step_output["reward"] == 0.0
+    assert step_output["metadata"]["thought_nonempty"] is False
+
+
 @pytest.mark.parametrize(
     "response, ended_eod, truncated",
     [

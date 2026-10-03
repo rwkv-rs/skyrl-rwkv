@@ -17,6 +17,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Iterable, List, Optional, Set, Tuple
 
 import torch
@@ -33,7 +34,7 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     LOSSES_WITH_OLD_LOGPROBS,
     PolicyLossType,
 )
-from skyrl.train.generators.base import GeneratorOutput
+from skyrl.train.generators.base import GeneratorInput, GeneratorOutput
 from skyrl.train.generators.utils import (
     concatenate_generator_outputs,
     get_metrics_from_generator_output,
@@ -46,6 +47,7 @@ from skyrl.train.utils.metrics import ScalarGauges, TrainingPhaseGauge
 from skyrl.train.utils.trainer_utils import (
     ResumeMode,
     build_dataloader,
+    dump_train_results,
     get_group_completion_metrics,
     get_intra_group_completion_time_std_cv,
     zero_variance_filter,
@@ -74,6 +76,9 @@ class GeneratedOutputGroup:
             group, one per trajectory (parallel to ``generator_output["response_ids"]``). Retained so
             the trajectory logger can render prompt + response, mirroring the synchronous trainer which
             logs ``generator_input["prompts"]``. None if not captured.
+
+        generator_input (Optional[GeneratorInput]): The complete input retained for raw rollout dumps.
+            None only for callers that construct a group outside the normal generator loop.
     """
 
     generator_output: GeneratorOutput
@@ -81,6 +86,7 @@ class GeneratedOutputGroup:
     global_step_when_scheduled: int
     group_completion_time_s: Optional[float] = None
     prompts: Optional[List[Any]] = None
+    generator_input: Optional[GeneratorInput] = None
 
 
 @dataclass
@@ -976,6 +982,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             global_step_when_scheduled=global_step_at_start,
                             group_completion_time_s=group_completion_time_s,
                             prompts=generator_input["prompts"],
+                            generator_input=generator_input,
                         )
                     )
                 except asyncio.QueueFull:
@@ -1068,6 +1075,18 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     "See https://docs.skyrl.ai/docs/tutorials/fully_async#async-staleness-manager for more details."
                 )
                 staleness_violation_count += 1
+
+        if self.cfg.trainer.dump_train_results:
+            with Timer("dump_train_results", self.all_timings):
+                for group in [*cur_generation_group_mini_batch, *dropped_groups]:
+                    if group.generator_input is not None:
+                        dump_train_results(
+                            Path(self.cfg.trainer.export_path) / "dumped_rollouts",
+                            self.tokenizer,
+                            group.generator_input,
+                            group.generator_output,
+                            self.global_step,
+                        )
 
         generator_output = concatenate_generator_outputs(
             generator_outputs,

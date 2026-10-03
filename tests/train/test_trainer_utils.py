@@ -298,9 +298,11 @@ def test_dump_train_results_preserves_inputs_and_appends(tmp_path, output_ids):
         "prompt_token_ids": [[10], [11]],
         "response_ids": [[20], [21]],
         "rewards": [1.0, 0.0],
+        "loss_masks": [[1], [0]],
         "stop_reasons": ["stop", "length"],
     }
     tokenizer = Mock()
+    tokenizer.eos_token_id = 99
     tokenizer.decode.side_effect = lambda tokens: {
         10: "User✿q✿\nBot✿<think",
         11: "prompt",
@@ -318,6 +320,11 @@ def test_dump_train_results_preserves_inputs_and_appends(tmp_path, output_ids):
     assert rows[0]["extracted_answer"] == "0"
     assert rows[1]["extracted_answer"] is None
     assert rows[1]["stop_reason"] == "length"
+    assert rows[0]["assistant_spans"] == [[0, 1]]
+    assert rows[0]["loss_mask"] == [1]
+    assert rows[0]["ended_with_eos"] is False
+    assert rows[1]["assistant_spans"] == []
+    assert rows[1]["truncated"] is True
     assert generator_output == original
     assert SkyRLTrainConfig().trainer.dump_train_results is False
 

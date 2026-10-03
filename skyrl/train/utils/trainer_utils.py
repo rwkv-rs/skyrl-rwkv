@@ -329,6 +329,40 @@ def get_group_completion_metrics(
     return metrics
 
 
+def _trajectory_debug_fields(
+    tokenizer: AutoTokenizer,
+    response_ids: List[int],
+    loss_mask: List[int],
+    stop_reason: Optional[str],
+) -> Dict[str, Any]:
+    """Return explicit action-span and termination metadata for a trajectory dump."""
+    assistant_spans: List[List[int]] = []
+    span_start: Optional[int] = None
+    for index, mask_value in enumerate(loss_mask):
+        if mask_value == 1 and span_start is None:
+            span_start = index
+        elif mask_value != 1 and span_start is not None:
+            assistant_spans.append([span_start, index])
+            span_start = None
+    if span_start is not None:
+        assistant_spans.append([span_start, len(loss_mask)])
+
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if not isinstance(eos_token_id, int):
+        eos_token_id = None
+    ended_with_eos = bool(response_ids and eos_token_id is not None and response_ids[-1] == eos_token_id)
+    return {
+        "assistant_spans": assistant_spans,
+        "assistant_token_count": sum(end - start for start, end in assistant_spans),
+        "loss_mask": [int(mask_value) for mask_value in loss_mask],
+        "loss_mask_active_tokens": sum(end - start for start, end in assistant_spans),
+        "response_token_count": len(response_ids),
+        "eos_token_id": eos_token_id,
+        "ended_with_eos": ended_with_eos,
+        "truncated": stop_reason in {"length", "max_tokens"},
+    }
+
+
 def dump_train_results(
     dump_dir_path: Path,
     tokenizer: AutoTokenizer,
@@ -354,6 +388,10 @@ def dump_train_results(
         for index, trajectory_id in enumerate(trajectory_ids):
             prompt, env_class, env_extra = inputs_by_id[trajectory_id.to_string()]
             response = tokenizer.decode(generator_output["response_ids"][index])
+            stop_reason = stop_reasons[index]
+            response_ids = generator_output["response_ids"][index]
+            loss_masks = generator_output.get("loss_masks")
+            loss_mask = loss_masks[index] if loss_masks is not None else [1] * len(response_ids)
             entry = {
                 "step": global_step,
                 "trajectory_id": trajectory_id.to_string(),
@@ -361,10 +399,11 @@ def dump_train_results(
                 "rendered_input_prompt": tokenizer.decode(generator_output["prompt_token_ids"][index]),
                 "output_response": response,
                 "score": generator_output["rewards"][index],
-                "stop_reason": stop_reasons[index],
+                "stop_reason": stop_reason,
                 "env_class": env_class,
                 "env_extras": env_extra,
             }
+            entry.update(_trajectory_debug_fields(tokenizer, response_ids, loss_mask, stop_reason))
             if env_class == "gsm8k":
                 from skyrl_gym.envs.gsm8k.utils import extract_solution
 
@@ -385,7 +424,12 @@ def dump_per_dataset_eval_results(
 
     # Prepare common data
     input_prompts = [tokenizer.decode(prompt) for prompt in concat_generator_outputs["prompt_token_ids"]]
-    output_responses = [tokenizer.decode(response) for response in concat_generator_outputs["response_ids"]]
+    response_ids = concat_generator_outputs["response_ids"]
+    output_responses = [tokenizer.decode(response) for response in response_ids]
+    loss_masks = concat_generator_outputs.get("loss_masks")
+    if loss_masks is None:
+        loss_masks = [[1] * len(response) for response in response_ids]
+    stop_reasons = concat_generator_outputs.get("stop_reasons", [None] * len(input_prompts))
 
     # Group indices by data source
     data_source_indices = {}
@@ -407,11 +451,12 @@ def dump_per_dataset_eval_results(
                     "input_prompt": input_prompts[i],
                     "output_response": output_responses[i],
                     "score": concat_generator_outputs["rewards"][i],
-                    "stop_reason": concat_generator_outputs.get("stop_reasons", [None] * len(input_prompts))[i],
+                    "stop_reason": stop_reasons[i],
                     "env_class": concat_all_envs[i],
                     "env_extras": concat_env_extras[i],
                     "data_source": data_source,
                 }
+                entry.update(_trajectory_debug_fields(tokenizer, response_ids[i], loss_masks[i], stop_reasons[i]))
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
         logger.info(f"Dumped eval data for {data_source} to {filename}")

@@ -1461,8 +1461,15 @@ class GSM8kLLMJudgeEnvConfig(BaseConfig):
 
 
 @dataclass
+class GSM8kEnvConfig(BaseConfig):
+    strict_reward: bool = False
+    """Require complete strict-CoT structure and EOS before awarding GSM8K reward."""
+
+
+@dataclass
 class SkyRLGymConfig(BaseConfig):
     max_env_workers: int = 32
+    gsm8k: GSM8kEnvConfig = field(default_factory=GSM8kEnvConfig)
     text2sql: Text2SQLEnvConfig = field(default_factory=Text2SQLEnvConfig)
     llm_as_a_judge: GSM8kLLMJudgeEnvConfig = field(default_factory=GSM8kLLMJudgeEnvConfig)
     search: SearchEnvConfig = field(default_factory=SearchEnvConfig)

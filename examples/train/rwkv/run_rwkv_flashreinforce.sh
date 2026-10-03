@@ -100,4 +100,5 @@ uv run --no-sync --extra rwkv -m skyrl.train.entrypoints.main_base \
   generator.eval_sampling_params.additional_kwargs="{presence_penalty: 1.0, frequency_penalty: 0.1, penalty_decay: 0.988}" \
   generator.inference_engine.engine_init_kwargs.mamba_ssm_cache_dtype=float32 \
   environment.env_class=gsm8k \
+  environment.skyrl_gym.gsm8k.strict_reward=true \
   "$@"

@@ -707,13 +707,20 @@ class MegatronModelWrapper:
             action_log_probs = token_logprobs[:, -num_actions:]
 
             # policy loss should be calculated based on the selected token logprobs
+            policy_loss_kwargs = {
+                "loss_mask": loss_mask,
+                "rollout_logprobs": rollout_action_logprobs,
+            }
+            if resolved_loss_name in ("flashreinforce", "flash_reinforce"):
+                policy_loss_kwargs["real_rows"] = (
+                    loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
+                )
             policy_loss, loss_metrics = current_loss_fn(
                 action_log_probs,
                 old_action_log_probs,
                 advantages,
                 config=loss_config,
-                loss_mask=loss_mask,
-                rollout_logprobs=rollout_action_logprobs,
+                **policy_loss_kwargs,
             )
 
             # Decoupled MTP / draft loss: soft-CE distillation of the detached-input MTP head against

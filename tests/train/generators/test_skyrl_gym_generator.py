@@ -482,6 +482,50 @@ async def test_generate_batched_metrics_use_truncated_responses(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("batched", [True, False])
 @patch("skyrl_gym.make")
+async def test_truncated_action_mask_can_be_preserved(
+    mock_make, mock_tokenizer, mock_llm, mock_env, generator_cfg, mock_env_cfg, batched
+):
+    """FlashREINFORCE keeps sampled action tokens trainable when truncation gives zero reward."""
+    generator_cfg.batched = batched
+    generator_cfg.preserve_truncated_action_mask = True
+    generator_cfg.use_conversation_multi_turn = False
+    mock_make.return_value = mock_env
+    mock_env.init.return_value = ([{"role": "user", "content": "Initial input"}], {})
+    mock_llm.generate = AsyncMock(
+        return_value={
+            "responses": ["truncated response"],
+            "stop_reasons": ["length"],
+            "response_ids": [[10, 11, 12, 13]],
+        }
+    )
+
+    generator = SkyRLGymGenerator(
+        generator_cfg=generator_cfg,
+        skyrl_gym_cfg=mock_env_cfg,
+        inference_engine_client=mock_llm,
+        tokenizer=mock_tokenizer,
+    )
+    generator.base_conversation_token_ids = []
+
+    output = await generator.generate(
+        {
+            "prompts": [[{"role": "user", "content": "What is 3 + 5?"}]],
+            "env_extras": [{"answer": "8"}],
+            "env_classes": ["gsm8k"],
+        }
+    )
+
+    if isinstance(output["rewards"][0], list):
+        assert sum(output["rewards"][0]) == 0.0
+    else:
+        assert output["rewards"] == [0.0]
+    assert output["loss_masks"] == [[1, 1, 1, 1]]
+    assert mock_env.step.call_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("batched", [True, False])
+@patch("skyrl_gym.make")
 async def test_generate_interface_compliance(
     mock_make, mock_tokenizer, mock_llm, mock_env, generator_cfg, mock_env_cfg, batched
 ):

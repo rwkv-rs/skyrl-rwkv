@@ -231,6 +231,34 @@ class SkyRLGymGenerator(GeneratorInterface):
         else:
             return func(*args, **kwargs)
 
+    def _set_generation_metadata(
+        self,
+        env: Any,
+        action: str,
+        response_ids: List[int],
+        stop_reason: str,
+        added_eos: bool = False,
+    ) -> None:
+        """Pass termination metadata to environments that use strict rewards."""
+        setter = getattr(env, "set_generation_metadata", None)
+        if setter is None:
+            return
+
+        eos_token_id = self.tokenizer.eos_token_id
+        ended_eod = bool(
+            not added_eos
+            and stop_reason not in {"length", "max_tokens"}
+            and response_ids
+            and eos_token_id is not None
+            and response_ids[-1] == eos_token_id
+        )
+        setter(
+            action=action,
+            ended_eod=ended_eod,
+            truncated=stop_reason in {"length", "max_tokens"},
+            stop_reason=stop_reason,
+        )
+
     # ------------------------------------------------------------------
     # Subclass hooks. Default implementations are no-ops so generic envs
     # see the upstream behavior; subclasses (e.g. RLMGymGenerator) override.
@@ -442,6 +470,14 @@ class SkyRLGymGenerator(GeneratorInterface):
                         if response_logprobs is not None:
                             response_logprobs.append(0.0)
                         added_eos = True
+
+                self._set_generation_metadata(
+                    env,
+                    output,
+                    output_ids,
+                    stop_reason,
+                    added_eos=added_eos,
+                )
 
                 # 2. Environment step
                 if stop_reason in {"length", "max_tokens"}:
@@ -785,6 +821,12 @@ class SkyRLGymGenerator(GeneratorInterface):
         truncated_indices: Optional[List[RoutedExpertIndices]] = [] if raw_rollout_expert_indices is not None else None
 
         for i, (output, response, env, env_class) in enumerate(zip(outputs, responses, envs, env_classes)):
+            self._set_generation_metadata(
+                env,
+                output,
+                response,
+                stop_reasons[i],
+            )
             # A response cut off at the generation limit is unanswered and
             # must not receive an environment reward or training advantage.
             if stop_reasons[i] in {"length", "max_tokens"}:

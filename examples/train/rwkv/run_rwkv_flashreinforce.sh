@@ -84,6 +84,7 @@ uv run --no-sync --extra rwkv -m skyrl.train.entrypoints.main_base \
   generator.inference_engine.weight_sync_backend=nccl \
   generator.inference_engine.gpu_memory_utilization=0.8 \
   generator.batched=false \
+  generator.preserve_truncated_action_mask=true \
   generator.n_samples_per_prompt=1 \
   generator.eval_n_samples_per_prompt=1 \
   generator.sampling_params.logprobs=1 \

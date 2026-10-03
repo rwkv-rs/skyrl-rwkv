@@ -1169,6 +1169,7 @@ def flashreinforce_policy_loss(
     config: AlgorithmConfig,
     loss_mask: Optional[torch.Tensor] = None,
     rollout_logprobs: Optional[torch.Tensor] = None,
+    real_rows: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, dict[str, float]]:
     """FlashREINFORCE loss using behavior IS and a sequence-level Bernoulli-KL gate.
 
@@ -1188,6 +1189,24 @@ def flashreinforce_policy_loss(
     action_mask = torch.ones_like(log_probs, dtype=torch.bool) if loss_mask is None else loss_mask.bool()
     if action_mask.shape != log_probs.shape:
         raise ValueError("flashreinforce loss_mask must match [batch, response_tokens] log probabilities")
+    lengths = action_mask.sum(dim=-1)
+    if real_rows is None:
+        real_rows = torch.ones(log_probs.shape[0], dtype=torch.bool, device=log_probs.device)
+    else:
+        real_rows = torch.as_tensor(real_rows, device=log_probs.device, dtype=torch.bool)
+        if real_rows.shape != lengths.shape:
+            raise ValueError("flashreinforce real_rows must match the batch dimension")
+    if (real_rows & lengths.eq(0)).any():
+        raise ValueError("FlashREINFORCE requires at least one action token per real trajectory")
+    if not real_rows.any():
+        return log_probs.sum() * 0.0, {
+            "clip_ratio": 0.0,
+            "flashreinforce/sequence_kl": 0.0,
+            "flashreinforce/sequence_kl_max": 0.0,
+            "flashreinforce/acceptance_rate": 0.0,
+            "flashreinforce/ratio_mean": 0.0,
+            "flashreinforce/active_token_rate": 0.0,
+        }
     if math.isnan(config.flashreinforce.sequence_kl_threshold) or config.flashreinforce.sequence_kl_threshold < 0:
         raise ValueError("flashreinforce sequence_kl_threshold must be nonnegative")
 
@@ -1213,7 +1232,6 @@ def flashreinforce_policy_loss(
     if (valid_current > 0).any() or (valid_behavior > 0).any():
         raise ValueError("flashreinforce policy-token log probabilities must be <= 0")
 
-    lengths = action_mask.sum(dim=-1)
     with torch.no_grad():
         p = behavior.exp().clamp(1e-6, 1 - 1e-6)
         q = current.detach().exp().clamp(1e-6, 1 - 1e-6)
@@ -1239,9 +1257,9 @@ def flashreinforce_policy_loss(
     active_count = action_mask.sum().clamp_min(1)
     loss_metrics = {
         "clip_ratio": 0.0,
-        "flashreinforce/sequence_kl": sequence_kl.mean().item(),
-        "flashreinforce/sequence_kl_max": sequence_kl.max().item(),
-        "flashreinforce/acceptance_rate": admitted.float().mean().item(),
+        "flashreinforce/sequence_kl": sequence_kl[real_rows].mean().item(),
+        "flashreinforce/sequence_kl_max": sequence_kl[real_rows].max().item(),
+        "flashreinforce/acceptance_rate": admitted[real_rows].float().mean().item(),
         "flashreinforce/ratio_mean": ratio[action_mask].mean().item(),
         "flashreinforce/active_token_rate": active_mask.sum().float().div(active_count).item(),
     }
@@ -1642,26 +1660,35 @@ def compute_flashreinforce_outcome_advantage(
     token_level_rewards: torch.Tensor,
     response_mask: torch.Tensor,
     loss_mask: Optional[torch.Tensor] = None,
+    real_rows: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Center terminal rewards across one fresh batch of independent trajectories.
+    """Center terminal rewards across the real trajectories in one fresh batch.
 
     FlashREINFORCE deliberately does not use ``index``: with one rollout per prompt, the
     control variate is the mean reward of the complete batch rather than a sibling-prompt
-    group mean. The caller must perform this before mini-batch sharding.
+    group mean. ``real_rows`` identifies synthetic rows added for data-parallel padding;
+    those rows are excluded from the baseline and receive zero advantages.
     """
     del kwargs
     with torch.no_grad():
         scores = (token_level_rewards * response_mask).sum(dim=-1)
-        # `pad_training_input_batch` intentionally copies row 0 for shape-bearing
-        # tensors but zeros loss_mask. Exclude those synthetic rows from the global
-        # baseline, otherwise DP padding changes every trajectory's advantage.
-        valid_rows = (
-            response_mask.sum(dim=-1).gt(0) if loss_mask is None else loss_mask.sum(dim=-1, keepdim=False).gt(0)
-        )
-        baseline = scores[valid_rows].mean() if valid_rows.any() else scores.new_zeros(())
-        advantages = scores - baseline
-        advantages = advantages.unsqueeze(-1) * response_mask
+        action_lengths = response_mask.sum(dim=-1) if loss_mask is None else loss_mask.sum(dim=-1)
+        if real_rows is None:
+            valid_rows = action_lengths.gt(0)
+        else:
+            valid_rows = torch.as_tensor(real_rows, device=scores.device, dtype=torch.bool)
+            if valid_rows.shape != scores.shape:
+                raise ValueError("flashreinforce real_rows must match the batch dimension")
+            if (valid_rows & action_lengths.eq(0)).any():
+                raise ValueError("FlashREINFORCE requires at least one action token per real trajectory")
+
+        if not valid_rows.any():
+            raise ValueError("FlashREINFORCE requires at least one real trajectory")
+
+        baseline = scores[valid_rows].mean()
+        advantages = (scores - baseline).unsqueeze(-1) * response_mask
+        advantages = advantages * valid_rows.unsqueeze(-1)
     return advantages, advantages
 
 
@@ -1707,9 +1734,12 @@ def compute_advantages_and_returns(
     grpo_norm_by_std: bool = True,
     gamma=1.0,
     lambd=1.0,
+    real_rows: Optional[torch.Tensor] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     estimator_func = AdvantageEstimatorRegistry.get(adv_estimator)
+    if real_rows is not None:
+        kwargs["real_rows"] = real_rows
 
     return estimator_func(
         token_level_rewards=token_level_rewards,

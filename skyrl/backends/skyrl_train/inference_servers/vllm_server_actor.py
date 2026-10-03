@@ -489,9 +489,23 @@ class VLLMServerActor(ServerActorProtocol):
             reset_running_requests = data.get("reset_running_requests", False)
             reset_attempts = 0
             while True:
-                reset_succeeded = await engine.reset_prefix_cache(
-                    reset_running_requests=reset_running_requests
-                )
+                try:
+                    reset_succeeded = await engine.reset_prefix_cache(
+                        reset_running_requests=reset_running_requests
+                    )
+                except RuntimeError as exc:
+                    # Some vLLM revisions raise instead of returning False when
+                    # preempted requests still own blocks. Treat that transient
+                    # state exactly like an unsuccessful reset.
+                    if not reset_running_requests or not any(
+                        message in str(exc)
+                        for message in (
+                            "Failed to reset KV cache",
+                            "output is in flight",
+                        )
+                    ):
+                        raise
+                    reset_succeeded = False
                 if reset_succeeded or not reset_running_requests:
                     break
                 # In-flight output processing may still be releasing a block after

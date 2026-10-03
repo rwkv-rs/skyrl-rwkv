@@ -1142,13 +1142,20 @@ class PolicyWorkerBase(Worker):
             )
             # loss function
             # TODO: recompute advantages
+            policy_loss_kwargs = {
+                "loss_mask": loss_mask,
+                "rollout_logprobs": rollout_action_logprobs,
+            }
+            if resolved_loss_name in ("flashreinforce", "flash_reinforce"):
+                policy_loss_kwargs["real_rows"] = (
+                    loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
+                )
             policy_loss, loss_metrics = current_loss_fn(
                 action_log_probs,
                 old_action_log_probs,
                 advantages,
                 config=loss_config,
-                loss_mask=loss_mask,
-                rollout_logprobs=rollout_action_logprobs,
+                **policy_loss_kwargs,
             )
 
         # SFT path: skip KL/entropy terms, return per-token outputs for Tinker API
@@ -1419,13 +1426,20 @@ class PolicyWorkerBase(Worker):
                 loss_mask=loss_mask if sample_support_replay else None,
                 enable_sample_support_replay=sample_support_replay,
             )
+            policy_loss_kwargs = {
+                "loss_mask": loss_mask,
+                "rollout_logprobs": rollout_action_logprobs,
+            }
+            if loss_fn in ("flashreinforce", "flash_reinforce"):
+                policy_loss_kwargs["real_rows"] = (
+                    loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
+                )
             policy_loss, _ = current_loss_fn(
                 action_log_probs,
                 old_action_log_probs,
                 advantages,
                 config=loss_config,
-                loss_mask=loss_mask,
-                rollout_logprobs=rollout_action_logprobs,
+                **policy_loss_kwargs,
             )
 
             # Only build per-token outputs for callers that consume them.

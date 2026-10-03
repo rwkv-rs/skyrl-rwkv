@@ -751,7 +751,25 @@ def test_flashreinforce_centers_independent_batch_and_uses_sample_mean():
         torch.ones(2, 1),
         loss_mask=torch.tensor([[1.0], [0.0]]),
     )
-    assert torch.allclose(padded[:, 0], torch.tensor([0.0, -1.0]))
+    assert torch.allclose(padded[:, 0], torch.tensor([0.0, 0.0]))
+
+    rewards_with_failures = torch.tensor([[1.0], [0.0], [0.0], [99.0]])
+    real_rows = torch.tensor([True, True, True, False])
+    centered, _ = compute_flashreinforce_outcome_advantage(
+        rewards_with_failures,
+        torch.ones_like(rewards_with_failures),
+        loss_mask=torch.tensor([[1.0], [1.0], [1.0], [0.0]]),
+        real_rows=real_rows,
+    )
+    torch.testing.assert_close(centered[:, 0], torch.tensor([2.0 / 3.0, -1.0 / 3.0, -1.0 / 3.0, 0.0]))
+
+    with pytest.raises(ValueError, match="at least one action token"):
+        compute_flashreinforce_outcome_advantage(
+            torch.zeros(2, 1),
+            torch.ones(2, 1),
+            loss_mask=torch.tensor([[1.0], [0.0]]),
+            real_rows=torch.tensor([True, True]),
+        )
 
     current = torch.tensor([[-1.0, -1.0, -1.0], [-2.0, -2.0, -2.0]], requires_grad=True)
     behavior = current.detach() - 0.1
@@ -776,6 +794,25 @@ def test_flashreinforce_centers_independent_batch_and_uses_sample_mean():
     expected = torch.tensor([[0.0, 0.0, -0.25 * ratio], [ratio / 6, ratio / 6, ratio / 6]])
     torch.testing.assert_close(current.grad, expected, rtol=1e-5, atol=1e-6)
     assert metrics["flashreinforce/acceptance_rate"] == pytest.approx(1.0)
+
+
+def test_flashreinforce_policy_loss_rejects_zero_action_real_row():
+    config = AlgorithmConfig(
+        policy_loss_type="flashreinforce",
+        loss_reduction="sequence_mean",
+        flashreinforce=FlashReinforceConfig(sequence_kl_threshold=float("inf")),
+        off_policy_correction=NULL_OFF_POLICY_CORR,
+    )
+    with pytest.raises(ValueError, match="at least one action token"):
+        flashreinforce_policy_loss(
+            torch.full((2, 2), -1.0),
+            None,
+            torch.zeros(2, 2),
+            config,
+            loss_mask=torch.tensor([[1.0, 1.0], [0.0, 0.0]]),
+            real_rows=torch.tensor([True, True]),
+            rollout_logprobs=torch.full((2, 2), -1.0),
+        )
 
 
 def test_flashreinforce_sequence_gate_rejects_a_whole_trajectory():

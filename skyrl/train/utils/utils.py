@@ -526,6 +526,11 @@ def validate_cfg(cfg: SkyRLTrainConfig):
             raise ValueError(
                 "FlashREINFORCE cannot silently mask an overlong trajectory; disable apply_overlong_filtering"
             )
+        if not cfg.generator.preserve_truncated_action_mask:
+            raise ValueError(
+                "FlashREINFORCE requires generator.preserve_truncated_action_mask=true so truncated "
+                "action tokens remain available for signed feedback."
+            )
         if cfg.trainer.critic.model.path is not None:
             raise ValueError("FlashREINFORCE is critic-free; remove trainer.critic.model.path")
         if algorithm.use_entropy_loss:

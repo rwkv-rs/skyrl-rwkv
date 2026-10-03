@@ -1429,6 +1429,8 @@ class GeneratorConfig(BaseConfig):
     apply_overlong_filtering: bool = False
     """Apply DAPO Overlong Filtering: mask out all tokens in the loss mask for trajectories that
     exceed max length (truncated, no EOS token)."""
+    preserve_truncated_action_mask: bool = False
+    """Keep generated action tokens in the loss mask when a rollout is truncated."""
     step_wise_trajectories: bool = False
     """Return outputs step-wise.
     When ``True``, multi-turn generations are returned with each turn's (prompt, response) pair as a separate

@@ -1218,9 +1218,18 @@ class RayPPOTrainer:
             - `["returns"]`: Float[torch.Tensor, "batch_size response_len"]
         """
         token_level_rewards = data["rewards"]
+        flash_advantage = self.cfg.trainer.algorithm.advantage_estimator in ("flashreinforce", "flash_reinforce")
+        pad_size = data.metadata.get("pad_size", 0)
+        real_rows = None
+        if flash_advantage:
+            real_rows = torch.ones(len(token_level_rewards), dtype=torch.bool, device=token_level_rewards.device)
+            if pad_size:
+                real_rows[-pad_size:] = False
 
         if self.cfg.generator.step_wise_trajectories:
-            is_last_step = torch.tensor(data.metadata["is_last_step"], dtype=torch.bool)
+            is_last_step = torch.tensor(
+                data.metadata["is_last_step"], dtype=torch.bool, device=token_level_rewards.device
+            )
             index = np.array(data.metadata["uids"])
             values = data["values"]
             # Step-wise only supports outcome-based estimators (GRPO, RLOO, MAXRL); ensured by `validate_cfg`.
@@ -1243,6 +1252,8 @@ class RayPPOTrainer:
                 if self.cfg.trainer.algorithm.advantage_estimator in ("flashreinforce", "flash_reinforce", "bpo")
                 else {}
             )
+            if flash_advantage:
+                last_step_advantage_kwargs["real_rows"] = real_rows[is_last_step]
             last_step_advantages, last_step_returns = ppo_utils.compute_advantages_and_returns(
                 token_level_rewards=token_level_rewards[is_last_step],
                 response_mask=torch.ones_like(last_step_response_mask, dtype=torch.float),
@@ -1271,6 +1282,8 @@ class RayPPOTrainer:
                 if self.cfg.trainer.algorithm.advantage_estimator in ("flashreinforce", "flash_reinforce", "bpo")
                 else {}
             )
+            if flash_advantage:
+                advantage_kwargs["real_rows"] = real_rows
             advantages, returns = ppo_utils.compute_advantages_and_returns(
                 token_level_rewards=token_level_rewards,
                 response_mask=data["response_mask"],

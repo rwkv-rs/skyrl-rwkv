@@ -632,7 +632,10 @@ class SkyRLGymGenerator(GeneratorInterface):
 
                     # agent loop only tracks loss mask and rollout logprobs for this turn with step_wise training
                     turn_loss_mask = turn_output.get_turn_loss_mask()
-                    if stop_reason in {"length", "max_tokens"}:
+                    if (
+                        stop_reason in {"length", "max_tokens"}
+                        and not self.generator_cfg.preserve_truncated_action_mask
+                    ):
                         turn_loss_mask = [0] * len(turn_loss_mask)
                     turn_response_logprobs: Optional[List[float]] = turn_output.get_turn_rollout_logprobs()
                     turn_sample_support = turn_output.get_turn_rollout_sample_support()
@@ -729,7 +732,11 @@ class SkyRLGymGenerator(GeneratorInterface):
                 ), f"loss_mask and response_ids should have the same length, got {len(loss_mask)} and {len(response_ids)}"
 
             appended_eos_token = False
-            if stop_reason in {"length", "max_tokens"} and loss_mask is not None:
+            if (
+                stop_reason in {"length", "max_tokens"}
+                and loss_mask is not None
+                and not self.generator_cfg.preserve_truncated_action_mask
+            ):
                 loss_mask = [0] * len(loss_mask)
             if not self.use_conversation_multi_turn:
                 assert response_ids is not None and loss_mask is not None
@@ -991,7 +998,10 @@ class SkyRLGymGenerator(GeneratorInterface):
             if len(response) > max_tokens:
                 response = response[:max_tokens]
             is_truncated = stop_reasons[i] in {"length", "max_tokens"}
-            loss_masks.append([0 if is_truncated else 1] * len(response))
+            if is_truncated and not self.generator_cfg.preserve_truncated_action_mask:
+                loss_masks.append([0] * len(response))
+            else:
+                loss_masks.append([1] * len(response))
             truncated_responses.append(response)
             if logprobs is not None:
                 sample_logprobs = logprobs[i][: len(response)]

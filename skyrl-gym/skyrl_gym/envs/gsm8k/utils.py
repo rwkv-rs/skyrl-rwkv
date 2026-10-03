@@ -96,6 +96,10 @@ def _extract_after_think(solution_str: str) -> Optional[Tuple[str, str]]:
         return None
 
     thought, answer_region = solution_str.split("</think>", 1)
+    # ``open_think`` pre-fills ``<think`` in the prompt, so the generated
+    # response commonly starts with ``>`` to complete that opening tag.
+    if thought.startswith(">"):
+        thought = thought[1:]
     if not thought.strip():
         return None
     return thought, answer_region

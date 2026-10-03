@@ -120,9 +120,11 @@ MODEL_DIR="$MODEL_DIR" bash examples/train/rwkv/run_rwkv_flashreinforce.sh
 ```
 
 The synchronous entry point above keeps `trainer.train_batch_size == trainer.policy_mini_batch_size`; each
-fresh batch is consumed by exactly one optimizer step. The FlashREINFORCE launcher enables the opt-in
-strict GSM8K reward: the response must contain one non-empty thought, an answer after `</think>`, a
-real EOS token, and no truncation. For the asynchronous pipeline, use the existing
+fresh batch is consumed by exactly one optimizer step. The launcher keeps generated action tokens
+in the loss mask for truncated rollouts; those rollouts retain zero reward and contribute signed
+failure feedback. The FlashREINFORCE launcher enables the opt-in strict GSM8K reward: the response
+must contain one non-empty thought, an answer after `</think>`, a real EOS token, and no truncation.
+For the asynchronous pipeline, use the existing
 `examples.train.fully_async.main_fully_async` entrypoint, set `trainer.fully_async.enabled=true` and
 `generator.batched=false`; also pass `environment.skyrl_gym.gsm8k.strict_reward=true`. The default gate is `3e-3`; monitor
 `policy/loss_metrics/flashreinforce/acceptance_rate` and the rollout/trainer logprob-difference

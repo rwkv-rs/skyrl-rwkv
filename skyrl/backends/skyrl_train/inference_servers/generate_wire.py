@@ -28,7 +28,9 @@ from skyrl.backends.skyrl_train.utils.routed_experts import (
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_DTYPE,
     SAMPLE_SUPPORT_DTYPES,
+    SAMPLE_SUPPORT_LOGPROBS_DTYPES,
     CompactSampleSupport,
+    SampleSupportLogprobs,
 )
 
 # Matches the floor vLLM applies at its own serving boundaries.
@@ -48,6 +50,7 @@ class PackedField(StrEnum):
 
     ROUTED_EXPERTS = "routed_experts"
     ROLLOUT_SAMPLE_SUPPORT = "rollout_sample_support"
+    ROLLOUT_SAMPLE_SUPPORT_LOGPROBS = "rollout_sample_support_logprobs"
 
 
 class SampleSupportWireKey(StrEnum):
@@ -66,6 +69,7 @@ _ENVELOPE_KEYS = frozenset(PackedArrayKey)
 
 _ROUTED_EXPERTS_NDIM = 3
 _SAMPLE_SUPPORT_NDIM = 1
+_SAMPLE_SUPPORT_LOGPROBS_NDIM = 1
 
 _QUOTE = b'"'
 
@@ -227,6 +231,27 @@ def decode_packed_sample_support(payload: dict[str, Any]) -> CompactSampleSuppor
         raise ValueError(f"packed rollout_sample_support has invalid {SampleSupportWireKey.TOP_K} {top_k!r}")
     # CompactSampleSupport validates the offsets against the member count and top_k.
     return CompactSampleSupport.from_token_ids(decoded[num_rows:], decoded[:num_rows], top_k=top_k)
+
+
+def pack_sample_support_logprobs(sample_support: CompactSampleSupport) -> Optional[dict[str, Any]]:
+    """Encode the sampler logprob member column, or None when the rows carry none.
+
+    The column holds one float32 score per support member and shares the support's rows, so
+    it needs no offsets of its own.
+    """
+    logprobs = sample_support.sample_support_logprobs
+    if logprobs is None:
+        return None
+    return pack_ndarray(logprobs, allowed_dtypes=SAMPLE_SUPPORT_LOGPROBS_DTYPES)
+
+
+def decode_packed_sample_support_logprobs(payload: dict[str, Any]) -> SampleSupportLogprobs:
+    decoded, _ = unpack_ndarray(
+        payload,
+        allowed_dtypes=SAMPLE_SUPPORT_LOGPROBS_DTYPES,
+        ndim=_SAMPLE_SUPPORT_LOGPROBS_NDIM,
+    )
+    return decoded
 
 
 def _data_prefix(field: str) -> bytes:

@@ -13,6 +13,7 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     compute_flashreinforce_outcome_advantage,
     flashreinforce_policy_loss,
     score_centering_token_loss,
+    score_centering_token_loss_from_support,
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.train.config import (
@@ -854,6 +855,57 @@ def test_score_centering_topk_helper_returns_finite_loss():
     )
     assert torch.isfinite(loss).all()
     torch.testing.assert_close(loss, -sampled_logp)
+
+
+def test_score_centering_support_handles_a_sampled_token_outside_the_head():
+    logits = torch.tensor([[[1.0, 0.5, -0.5, -1.0]]], requires_grad=True)
+    train_logp = torch.log_softmax(logits, dim=-1)
+    train_head = train_logp[..., :2]
+    sampler_head = torch.log(torch.tensor([[[0.45, 0.25]]]))
+    sampled_train_logp = train_logp[..., 3]
+    sampled_sampler_logp = torch.log(torch.tensor([[0.1]]))
+
+    loss = score_centering_token_loss_from_support(
+        train_head,
+        sampler_head,
+        sampled_train_logp,
+        sampled_sampler_logp,
+        torch.ones_like(sampled_train_logp),
+    )
+    assert torch.isfinite(loss).all()
+    loss.sum().backward()
+    assert logits.grad is not None
+    assert torch.isfinite(logits.grad).all()
+
+
+def test_flashreinforce_score_centering_branch_preserves_gate_and_returns_finite_gradients():
+    current = torch.tensor([[-1.0, -1.1]], requires_grad=True)
+    behavior = torch.tensor([[-1.05, -1.15]])
+    config = AlgorithmConfig(
+        policy_loss_type="flashreinforce",
+        loss_reduction="sequence_mean",
+        flashreinforce=FlashReinforceConfig(
+            sequence_kl_threshold=float("inf"),
+            score_centering=True,
+            score_centering_weight="none",
+        ),
+        off_policy_correction=NULL_OFF_POLICY_CORR,
+    )
+    loss, metrics = flashreinforce_policy_loss(
+        current,
+        None,
+        torch.tensor([[0.5, 0.5]]),
+        config,
+        loss_mask=torch.ones_like(current),
+        rollout_logprobs=behavior,
+        score_centering_train_logprobs=torch.log(torch.tensor([[[0.5, 0.2], [0.4, 0.3]]])),
+        score_centering_sampler_logprobs=torch.log(torch.tensor([[[0.45, 0.25], [0.35, 0.25]]])),
+    )
+    assert metrics["flashreinforce/acceptance_rate"] == pytest.approx(1.0)
+    assert metrics["flashreinforce/score_centering"] == 1.0
+    loss.backward()
+    assert current.grad is not None
+    assert torch.isfinite(current.grad).all()
 
 
 def test_bpo_centers_rewards_within_prompt_groups():

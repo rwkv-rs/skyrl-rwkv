@@ -1170,6 +1170,8 @@ def flashreinforce_policy_loss(
     loss_mask: Optional[torch.Tensor] = None,
     rollout_logprobs: Optional[torch.Tensor] = None,
     real_rows: Optional[torch.Tensor] = None,
+    score_centering_train_logprobs: Optional[torch.Tensor] = None,
+    score_centering_sampler_logprobs: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, dict[str, float]]:
     """FlashREINFORCE loss using behavior IS and a sequence-level Bernoulli-KL gate.
 
@@ -1251,9 +1253,41 @@ def flashreinforce_policy_loss(
         weights = ratio * advantages.detach().float()
 
     active_mask = action_mask & admitted[:, None]
-    # ``advantages`` is pre-scaled for sample mean. Multiplying by the detached ratio
-    # preserves the score-function gradient while the current log-prob remains live.
-    loss = -(weights * current * active_mask).sum()
+    if config.flashreinforce.score_centering:
+        if score_centering_train_logprobs is None or score_centering_sampler_logprobs is None:
+            raise ValueError("flashreinforce.score_centering requires trainer and sampler top-k logprobs")
+        if score_centering_train_logprobs.shape[:2] != current.shape:
+            raise ValueError(
+                "flashreinforce score-centering trainer support must have [batch, response_tokens, top_k] shape"
+            )
+        if score_centering_sampler_logprobs.shape != score_centering_train_logprobs.shape:
+            raise ValueError("flashreinforce trainer and sampler score-centering supports must have the same shape")
+
+        if config.flashreinforce.score_centering_weight == "none":
+            weight_fn = torch.ones_like
+        else:
+            clip = config.flashreinforce.score_centering_weight_clip
+
+            def weight_fn(ratio: torch.Tensor) -> torch.Tensor:
+                return ratio.clamp_min(0.0).clamp_max(clip)
+
+        centered_token_loss = score_centering_token_loss_from_support(
+            score_centering_train_logprobs,
+            score_centering_sampler_logprobs,
+            current,
+            behavior,
+            advantages,
+            weight_fn=weight_fn,
+            eps=config.flashreinforce.score_centering_eps,
+        )
+        # ``advantages`` is pre-scaled for sample mean.  The gate remains the
+        # FlashREINFORCE admission rule; Score-Centering only replaces the
+        # admitted token score with its corrected sampler-expectation estimate.
+        loss = (centered_token_loss * active_mask).sum()
+    else:
+        # ``advantages`` is pre-scaled for sample mean. Multiplying by the detached ratio
+        # preserves the score-function gradient while the current log-prob remains live.
+        loss = -(weights * current * active_mask).sum()
     active_count = action_mask.sum().clamp_min(1)
     loss_metrics = {
         "clip_ratio": 0.0,
@@ -1263,6 +1297,9 @@ def flashreinforce_policy_loss(
         "flashreinforce/ratio_mean": ratio[action_mask].mean().item(),
         "flashreinforce/active_token_rate": active_mask.sum().float().div(active_count).item(),
     }
+    if config.flashreinforce.score_centering:
+        loss_metrics["flashreinforce/score_centering"] = 1.0
+
     return loss, loss_metrics
 
 
@@ -1328,6 +1365,54 @@ def bpo_policy_loss(
     return loss, metrics
 
 
+def score_centering_token_loss_from_support(
+    train_head_logp: torch.Tensor,
+    samp_head_logp: torch.Tensor,
+    token_logp: torch.Tensor,
+    samp_token_logp: torch.Tensor,
+    advantage: torch.Tensor,
+    weight_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Compute Score-Centering when the trainer has only the sampler support head.
+
+    ``train_head_logp`` is live (and therefore carries the policy gradient), while
+    the sampler head and sampled-token logprobs are rollout side channels.  The
+    sampled token need not occur in the support head; its policy logprob is passed
+    separately for exactly that case.
+    """
+    if weight_fn is None:
+        weight_fn = torch.ones_like
+    if train_head_logp.ndim != 3 or samp_head_logp.shape != train_head_logp.shape:
+        raise ValueError("trainer and sampler support heads must have the same [batch, tokens, top_k] shape")
+    if token_logp.shape != samp_token_logp.shape or token_logp.shape != train_head_logp.shape[:-1]:
+        raise ValueError("sampled-token logprobs must match the support-head batch/token shape")
+    if advantage.shape != token_logp.shape:
+        raise ValueError("Score-Centering advantages must match sampled-token logprobs")
+
+    trainer_head = train_head_logp.float()
+    sampler_head = samp_head_logp.detach().float()
+    trainer_token = token_logp.float()
+    sampler_token = samp_token_logp.detach().float()
+    valid_head = torch.isfinite(trainer_head) & torch.isfinite(sampler_head)
+    p_head = torch.where(valid_head, trainer_head.exp(), 0.0)
+    q_head = torch.where(valid_head, sampler_head.exp(), 0.0)
+    p_tail = (1 - p_head.sum(dim=-1)).clamp_min(eps)
+    q_tail = (1 - q_head.sum(dim=-1)).clamp_min(eps)
+    rho = q_tail / p_tail
+    alpha = rho * weight_fn(1 / rho)
+    safe_trainer_head = torch.where(valid_head, trainer_head, 0.0)
+    safe_sampler_head = torch.where(valid_head, sampler_head, 0.0)
+    head_ratio = torch.where(valid_head, (safe_trainer_head - safe_sampler_head).exp(), 1.0)
+    head_weight = torch.where(valid_head, weight_fn(head_ratio), 0.0)
+    residual = q_head * head_weight - alpha.unsqueeze(-1) * p_head
+    # Stop-gradient only on the score coefficient, not on the trainer logprob.
+    head_score = safe_trainer_head
+    correction = (residual.detach() * head_score).sum(dim=-1)
+    token_weight = weight_fn((trainer_token - sampler_token).exp())
+    return -advantage.detach() * (token_weight.detach() * trainer_token - correction)
+
+
 def score_centering_token_loss(
     train_logp: torch.Tensor,
     samp_logp: torch.Tensor,
@@ -1338,17 +1423,7 @@ def score_centering_token_loss(
     weight_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    """Compute the top-k score-centering correction from the reference implementation.
-
-    This helper is intentionally separate from the default policy losses. SkyRL currently
-    records sampler support IDs but does not pass the trainer's full-vocabulary logits to
-    the policy-loss registry, so enabling this correction in the training path requires a
-    later logits/support plumbing change. Keeping the numerically sensitive formula here
-    makes that future integration testable without pretending chosen-token logprobs are
-    full score centering.
-    """
-    if weight_fn is None:
-        weight_fn = torch.ones_like
+    """Compute the top-k Score-Centering correction from full trainer logprobs."""
     if train_logp.shape[:-1] != topk_ids.shape[:-1] or samp_logp.shape != topk_ids.shape:
         raise ValueError("train_logp and sampler top-k tensors have incompatible shapes")
     if sampled_token.shape != samp_token_logp.shape or sampled_token.shape != train_logp.shape[:-1]:
@@ -1356,17 +1431,15 @@ def score_centering_token_loss(
 
     head_logp = train_logp.float().gather(-1, topk_ids.long())
     token_logp = train_logp.float().gather(-1, sampled_token.long().unsqueeze(-1)).squeeze(-1)
-    sampler_head_logp = samp_logp.float()
-    p_head, q_head = head_logp.exp(), sampler_head_logp.exp()
-    p_tail = (1 - p_head.sum(dim=-1)).clamp_min(eps)
-    q_tail = (1 - q_head.sum(dim=-1)).clamp_min(eps)
-    rho = q_tail / p_tail
-    alpha = rho * weight_fn(1 / rho)
-    head_weight = weight_fn((head_logp - sampler_head_logp).exp())
-    residual = q_head * head_weight - alpha.unsqueeze(-1) * p_head
-    correction = (residual.detach() * head_logp).sum(dim=-1)
-    token_weight = weight_fn((token_logp - samp_token_logp.float()).exp())
-    return -advantage.detach() * (token_weight.detach() * token_logp - correction)
+    return score_centering_token_loss_from_support(
+        head_logp,
+        samp_logp,
+        token_logp,
+        samp_token_logp,
+        advantage,
+        weight_fn=weight_fn,
+        eps=eps,
+    )
 
 
 def reduce_loss(

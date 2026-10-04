@@ -975,7 +975,10 @@ def test_appending_packed_field_padding_keeps_the_real_segments(key, pad_count):
     assert torch.equal(appended.values, _PACKED_PADDING_EXPECTED_ROW[key](field).expand_as(appended.values))
 
 
-@pytest.mark.parametrize(("key", "rows_per_dummy_row"), [(ROUTE_KEY, 1), (SAMPLE_SUPPORT_FIELD, 0)])
+@pytest.mark.parametrize(
+    ("key", "rows_per_dummy_row"),
+    [(ROUTE_KEY, 1), (SAMPLE_SUPPORT_FIELD, 0)],
+)
 def test_dummy_row_segments_cover_the_single_attended_token(key, rows_per_dummy_row):
     field = _ZERO_COPY_PAYLOADS[key]()
 

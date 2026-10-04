@@ -10,6 +10,7 @@ import pytest
 
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_DTYPE,
+    SAMPLE_SUPPORT_LOGPROBS_DTYPE,
     SampleSupportTrace,
 )
 from skyrl.train.config import ChatTemplateConfig, GeneratorConfig
@@ -28,7 +29,7 @@ from skyrl.train.generators.skyrl_gym_generator import (
 )
 from skyrl.train.generators.utils import build_vllm_cache_salt
 from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput
-from tests.backends.skyrl_train.sample_support_helpers import csr, dense
+from tests.backends.skyrl_train.sample_support_helpers import csr, dense, dense_logprobs
 
 # Mock constants, where 4 is the eos token id
 MOCK_LLM_OUTPUT_IDS = [1, 10, 12, 4]
@@ -478,7 +479,13 @@ async def test_agent_loop_uses_incremental_replay_metadata_traces(
             # The second turn routes to an expert id above the uint8 range so the
             # trace must widen the first turn's compacted rows.
             routes[0, 0, 0] = 300
-        sample_support = csr([[10, 100 + generation_index], [11, 110 + generation_index]])
+        sample_support = csr(
+            [[10, 100 + generation_index], [11, 110 + generation_index]],
+            logprobs=[
+                [-0.1, -1.0 - generation_index],
+                [-0.2, -1.1 - generation_index],
+            ],
+        )
         generation_index += 1
         return {
             "responses": ["mocked output"],
@@ -515,6 +522,11 @@ async def test_agent_loop_uses_incremental_replay_metadata_traces(
     np.testing.assert_array_equal(support[:2], np.array([[10, 100], [11, 110]], dtype=SAMPLE_SUPPORT_DTYPE))
     np.testing.assert_array_equal(support[-2:], np.array([[10, 101], [11, 111]], dtype=SAMPLE_SUPPORT_DTYPE))
     assert np.all(support[2:-2] == -1)
+    support_logprobs = dense_logprobs(output.rollout_sample_support)
+    assert support_logprobs.dtype == SAMPLE_SUPPORT_LOGPROBS_DTYPE
+    np.testing.assert_array_equal(support_logprobs[:2], np.array([[-0.1, -1.0], [-0.2, -1.1]], dtype=np.float32))
+    np.testing.assert_array_equal(support_logprobs[-2:], np.array([[-0.1, -2.0], [-0.2, -2.1]], dtype=np.float32))
+    assert np.all(np.isneginf(support_logprobs[2:-2]))
 
 
 @pytest.mark.asyncio

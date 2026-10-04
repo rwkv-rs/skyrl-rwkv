@@ -46,6 +46,7 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     build_logprobs_content,
     pack_routed_experts,
     pack_sample_support,
+    pack_sample_support_logprobs,
 )
 from skyrl.backends.skyrl_train.inference_servers.protocols import ServerActorProtocol
 from skyrl.backends.skyrl_train.utils.sample_support import (
@@ -100,6 +101,8 @@ def _sample_support_from_flat_logprobs(
     """Extract sampled scores and post-filter CSR support from vLLM's flat rows.
 
     Each row is ``[sampled token, top-1, ..., top-k]``; filtered candidates are ``-inf``.
+    Every member also keeps its sampler logprob as the support's second column, in the same
+    normalization mode as the vLLM engine (raw for Score-Centering, processed for replay).
     """
     row_width = top_k + 1
     token_ids = np.asarray(logprobs.token_ids, dtype=SAMPLE_SUPPORT_DTYPE).reshape(-1, row_width)
@@ -109,9 +112,10 @@ def _sample_support_from_flat_logprobs(
         raise ValueError("sample-support capture received non-finite sampled logprob(s)")
     sampled = token_ids[:, 0]
     candidate_ids = token_ids[:, 1:]
+    candidate_logprobs = processed_logprobs[:, 1:]
     # vLLM emits filtered candidates as -inf. Treat all non-finite values
     # (including NaN and +inf) as absent.
-    present = np.isfinite(processed_logprobs[:, 1:])
+    present = np.isfinite(candidate_logprobs)
 
     # vLLM's approximate top-k/top-p pivot can omit the sampled token. Replace the
     # weakest valid candidate so the row keeps its size and contains the sample.
@@ -121,6 +125,8 @@ def _sample_support_from_flat_logprobs(
         weakest_col = top_k - 1 - np.argmax(present[rows, ::-1], axis=1)
         candidate_ids = candidate_ids.copy()
         candidate_ids[rows, weakest_col] = sampled[rows]
+        candidate_logprobs = candidate_logprobs.copy()
+        candidate_logprobs[rows, weakest_col] = sampled_logprobs_values[rows]
         logger.warning(
             "sample-support repair: %d token(s) had the sampled id absent from top-%d support; "
             "overwrote the weakest member to preserve the invariant (vLLM approx top-k/top-p "
@@ -131,7 +137,7 @@ def _sample_support_from_flat_logprobs(
             int(rows[0]),
         )
     sampled_logprobs = [{"logprob": float(value)} for value in sampled_logprobs_values]
-    return sampled_logprobs, CompactSampleSupport.from_masked_rows(candidate_ids, present)
+    return sampled_logprobs, CompactSampleSupport.from_masked_rows(candidate_ids, present, candidate_logprobs)
 
 
 class VLLMServerActor(ServerActorProtocol):
@@ -641,18 +647,20 @@ class VLLMServerActor(ServerActorProtocol):
 
             capture_sample_support = body.get("return_sample_support", False)
             if capture_sample_support:
-                # Sample support requires a bounded, non-degenerate top-k set.
-                top_k = sampling_params_dict.get("top_k")
-                if not isinstance(top_k, int) or top_k <= 1:
+                # Capture support independently from sampling.  In particular, a
+                # rollout may keep top_k=-1 while requesting a diagnostic top-k
+                # support set for Score-Centering.
+                support_top_k = body.get("sample_support_top_k", sampling_params_dict.get("top_k"))
+                if not isinstance(support_top_k, int) or support_top_k <= 1:
                     raise HTTPException(
                         status_code=400,
                         detail=(
-                            "return_sample_support requires sampling_params.top_k > 1, got "
-                            f"{top_k!r}. Sample-support capture is opt-in per request."
+                            "return_sample_support requires sample_support_top_k > 1, got "
+                            f"{support_top_k!r}. Sample-support capture is opt-in per request."
                         ),
                     )
                 sampling_params_dict["flat_logprobs"] = True
-                sampling_params_dict["logprobs"] = top_k
+                sampling_params_dict["logprobs"] = support_top_k
                 # This endpoint returns token ids only, so the API-server process need not detokenize
                 # the k + 1 candidates per token; that work otherwise starves the event loop that also
                 # serves pause/weight-sync. Stop strings still need the decoded text.
@@ -687,13 +695,12 @@ class VLLMServerActor(ServerActorProtocol):
 
             logprobs = None
             packed_sample_support = None
+            packed_sample_support_logprobs = None
             if capture_sample_support:
-                content, sample_support = _sample_support_from_flat_logprobs(
-                    resp.logprobs,
-                    sampling_params_dict["top_k"],
-                )
+                content, sample_support = _sample_support_from_flat_logprobs(resp.logprobs, support_top_k)
                 logprobs = {"content": content}
                 packed_sample_support = pack_sample_support(sample_support)
+                packed_sample_support_logprobs = pack_sample_support_logprobs(sample_support)
             elif resp.logprobs is not None:
                 content, num_clamped = build_logprobs_content(token_ids_out, resp.logprobs)
                 if num_clamped:
@@ -715,6 +722,7 @@ class VLLMServerActor(ServerActorProtocol):
                         "logprobs": logprobs,
                         PackedField.ROUTED_EXPERTS.value: routed_experts,
                         PackedField.ROLLOUT_SAMPLE_SUPPORT.value: packed_sample_support,
+                        PackedField.ROLLOUT_SAMPLE_SUPPORT_LOGPROBS.value: packed_sample_support_logprobs,
                     }
                 ]
             }

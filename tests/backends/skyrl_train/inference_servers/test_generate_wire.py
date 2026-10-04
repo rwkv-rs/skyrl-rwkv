@@ -17,10 +17,12 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     build_logprobs_content,
     decode_packed_routed_experts,
     decode_packed_sample_support,
+    decode_packed_sample_support_logprobs,
     load_packed_body,
     pack_ndarray,
     pack_routed_experts,
     pack_sample_support,
+    pack_sample_support_logprobs,
     unpack_ndarray,
 )
 from tests.backends.skyrl_train.sample_support_helpers import csr, dense
@@ -238,6 +240,16 @@ def test_packed_sample_support_decodes_from_a_spliced_body():
 
 def _raw_support_envelope(data, **sidecar) -> dict:
     return pack_ndarray(np.asarray(data, dtype=np.int32), allowed_dtypes=_INT32, extra=sidecar)
+
+
+def test_packed_sample_support_logprobs_round_trip():
+    support = csr([[10, 11], [-1, -1]], logprobs=[[-0.1, -1.2], [-0.3, -0.0]])
+
+    decoded = decode_packed_sample_support_logprobs(orjson.loads(orjson.dumps(pack_sample_support_logprobs(support))))
+
+    assert decoded.dtype == np.float32
+    assert decoded.flags.c_contiguous
+    assert np.array_equal(decoded, support.sample_support_logprobs)
 
 
 # Shape, base64, byte-size and dtype allow-listing are covered generically by the

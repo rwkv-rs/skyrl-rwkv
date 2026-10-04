@@ -29,14 +29,14 @@ if [[ "${1:-}" == --prepare-flashrwkv2 ]]; then
   fi
   export MAX_JOBS="${MAX_JOBS:-2}"
   uv sync --extra rwkv
-  uv run --isolated --no-sync --extra rwkv "$UV_PROJECT_ENVIRONMENT/bin/python" examples/train/rwkv/prepare_flashrwkv2.py
+  uv run --no-sync --extra rwkv python examples/train/rwkv/prepare_flashrwkv2.py
   exit 0
 fi
 
 # Check the exact native cache key before loading.
-uv run --isolated --no-sync --extra rwkv "$UV_PROJECT_ENVIRONMENT/bin/python" examples/train/rwkv/prepare_flashrwkv2.py --check
+uv run --no-sync --extra rwkv python examples/train/rwkv/prepare_flashrwkv2.py --check
 
-uv run --isolated --no-sync --extra rwkv "$UV_PROJECT_ENVIRONMENT/bin/python" -m "$TRAINING_ENTRYPOINT" \
+uv run --no-sync --extra rwkv -m "$TRAINING_ENTRYPOINT" \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
   trainer.algorithm.policy_loss_type=flashreinforce \

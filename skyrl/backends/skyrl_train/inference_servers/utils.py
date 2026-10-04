@@ -301,7 +301,13 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     # Sample-support capture asks for one logprob per top-k candidate, post-filter, so the
     # -inf entries that mark filtered candidates survive to the capture path.
     if ie_cfg.enable_return_sample_support_set:
-        args.max_logprobs = cfg.generator.sampling_params.top_k
+        args.max_logprobs = (
+            ie_cfg.sample_support_top_k
+            if ie_cfg.sample_support_top_k is not None
+            else cfg.generator.sampling_params.top_k
+        )
+        if cfg.trainer.algorithm.flashreinforce.score_centering:
+            args.logprobs_mode = ie_cfg.sample_support_logprobs_mode
 
     # The sharded_rdt backend pulls weight slices from a named trainer actor over
     # Ray's NIXL tensor transport, so the inference workers MUST be Ray actors.

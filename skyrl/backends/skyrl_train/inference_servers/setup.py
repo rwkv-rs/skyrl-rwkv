@@ -292,7 +292,10 @@ def build_new_inference_client(
         tokenizer=tokenizer,
         enable_return_routed_experts=ie_cfg.enable_return_routed_experts,
         enable_return_sample_support_set=ie_cfg.enable_return_sample_support_set,
-        enable_return_sample_support_logprobs=cfg.trainer.algorithm.enable_score_centering,
+        enable_return_sample_support_logprobs=(
+            cfg.trainer.algorithm.enable_score_centering or cfg.trainer.algorithm.flashreinforce.score_centering
+        ),
+        sample_support_top_k=ie_cfg.sample_support_top_k,
         uses_lora_weight_sync=_uses_lora_weight_sync(cfg),
     )
 

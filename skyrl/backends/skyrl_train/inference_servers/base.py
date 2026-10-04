@@ -35,6 +35,9 @@ class InferenceEngineInput(TypedDict):
     routed_experts_prompt_starts: Optional[List[int]]
     # Per-batch opt-in; the engine must enable sample-support capture at startup.
     return_sample_support: Optional[bool]
+    # Capture support width independently of sampling_params.top_k.  This keeps
+    # diagnostics from changing the rollout distribution (e.g. top_k=-1).
+    sample_support_top_k: Optional[int]
 
 
 class InferenceEngineOutput(TypedDict):
@@ -51,7 +54,8 @@ class InferenceEngineOutput(TypedDict):
     response_logprobs: Optional[List[List[float]]]
     prompt_logprobs: Optional[List[List[float]]]  # per-prompt-token logprobs under the current model
     rollout_expert_indices: Optional[List[RoutedExpertIndices]]
-    # One CSR support block, with a row per generated token, per prompt.
+    # One CSR support block, with a row per generated token, per prompt. Score-Centering
+    # adds the sampler logprob of every member as a second member column.
     rollout_sample_support: Optional[List[CompactSampleSupport]]
 
 

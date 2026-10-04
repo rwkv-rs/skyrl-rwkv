@@ -31,6 +31,7 @@ SAMPLE_SUPPORT_DTYPE = np.dtype(np.int32)
 SAMPLE_SUPPORT_TORCH_DTYPE = torch.int32
 SAMPLE_SUPPORT_DTYPES = frozenset({SAMPLE_SUPPORT_DTYPE})
 SAMPLE_SUPPORT_LOGPROBS_DTYPE = np.dtype(np.float32)
+SAMPLE_SUPPORT_LOGPROBS_TORCH_DTYPE = torch.float32
 SAMPLE_SUPPORT_FIELD = "rollout_sample_support"
 # Sentinel outside the valid packed-row range.
 SAMPLE_SUPPORT_NO_ROW = -1

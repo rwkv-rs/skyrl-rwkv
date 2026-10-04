@@ -595,18 +595,20 @@ class VLLMServerActor(ServerActorProtocol):
                     detail="return_sample_support_logprobs requires return_sample_support",
                 )
             if capture_sample_support:
-                # Sample support requires a bounded, non-degenerate top-k set.
-                top_k = sampling_params_dict.get("top_k")
-                if not isinstance(top_k, int) or top_k <= 1:
+                # Capture support independently from sampling.  In particular, a
+                # rollout may keep top_k=-1 while requesting a diagnostic top-k
+                # support set for Score-Centering.
+                support_top_k = body.get("sample_support_top_k", sampling_params_dict.get("top_k"))
+                if not isinstance(support_top_k, int) or support_top_k <= 1:
                     raise HTTPException(
                         status_code=400,
                         detail=(
-                            "return_sample_support requires sampling_params.top_k > 1, got "
-                            f"{top_k!r}. Sample-support capture is opt-in per request."
+                            "return_sample_support requires sample_support_top_k > 1, got "
+                            f"{support_top_k!r}. Sample-support capture is opt-in per request."
                         ),
                     )
                 sampling_params_dict["flat_logprobs"] = True
-                sampling_params_dict["logprobs"] = top_k
+                sampling_params_dict["logprobs"] = support_top_k
                 # This endpoint returns token ids only, so the API-server process need not detokenize
                 # the k + 1 candidates per token; that work otherwise starves the event loop that also
                 # serves pause/weight-sync. Stop strings still need the decoded text.
@@ -645,7 +647,7 @@ class VLLMServerActor(ServerActorProtocol):
             if capture_sample_support:
                 content, sample_support = _sample_support_from_flat_logprobs(
                     resp.logprobs,
-                    sampling_params_dict["top_k"],
+                    support_top_k,
                     with_member_logprobs=capture_sample_support_logprobs,
                 )
                 logprobs = {"content": content}

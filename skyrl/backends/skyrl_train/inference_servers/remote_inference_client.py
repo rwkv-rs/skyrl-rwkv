@@ -369,6 +369,7 @@ class RemoteGenerateClient:
         routed_experts_prompt_start: Optional[int] = None,
         return_sample_support: bool = False,
         return_sample_support_logprobs: bool = False,
+        sample_support_top_k: Optional[int] = None,
         mm_features: Optional[MultiModalFeatures] = None,
         cache_salt: Optional[str] = None,
     ) -> RemoteGenerateResult:
@@ -400,6 +401,8 @@ class RemoteGenerateClient:
         }
         if return_sample_support:
             payload["return_sample_support"] = True
+            if sample_support_top_k is not None:
+                payload["sample_support_top_k"] = sample_support_top_k
         if return_sample_support_logprobs:
             payload["return_sample_support_logprobs"] = True
         if mm_features:
@@ -535,6 +538,8 @@ class RemoteInferenceClient(InferenceEngineInterface):
     enable_return_sample_support_logprobs: bool = False
     """Whether captured support also carries each member's sampler logprob (score centering).
     Requires ``enable_return_sample_support_set``."""
+    sample_support_top_k: Optional[int] = None
+    """Diagnostic support width; independent of the rollout sampler's ``top_k``."""
 
     uses_lora_weight_sync: bool = False
     """True when the trainer syncs LoRA adapters (rather than full/merged weights). When True,
@@ -687,6 +692,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
             "return_sample_support", False
         )
         return_sample_support_logprobs = return_sample_support and self.enable_return_sample_support_logprobs
+        sample_support_top_k = input_batch.get("sample_support_top_k", self.sample_support_top_k)
         get_logprobs = sampling_params.get("logprobs") is not None
 
         # Two semaphores decouple the generate and detokenize stages:
@@ -715,6 +721,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
                     ),
                     return_sample_support=return_sample_support,
                     return_sample_support_logprobs=return_sample_support_logprobs,
+                    sample_support_top_k=sample_support_top_k,
                     model=model,
                     cache_salt=cache_salt,
                 )
@@ -729,6 +736,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
                     ),
                     return_sample_support=return_sample_support,
                     return_sample_support_logprobs=return_sample_support_logprobs,
+                    sample_support_top_k=sample_support_top_k,
                     model=model,
                     cache_salt=cache_salt,
                 )
@@ -769,6 +777,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         routed_experts_prompt_start: Optional[int] = None,
         return_sample_support: bool = False,
         return_sample_support_logprobs: bool = False,
+        sample_support_top_k: Optional[int] = None,
     ) -> Dict[str, Any]:
         result = await self._get_generate_client().generate(
             prompt_token_ids=prompt_token_ids,
@@ -779,6 +788,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
             routed_experts_prompt_start=routed_experts_prompt_start,
             return_sample_support=return_sample_support,
             return_sample_support_logprobs=return_sample_support_logprobs,
+            sample_support_top_k=sample_support_top_k,
             mm_features=mm_features,
             cache_salt=cache_salt,
         )

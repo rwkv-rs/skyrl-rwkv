@@ -503,6 +503,9 @@ class SkyRLGymGenerator(GeneratorInterface):
                     cache_salt=cache_salt,
                     routed_experts_prompt_starts=[routed_expert_trace.prompt_start] if routed_expert_trace else None,
                     return_sample_support=capture_sample_support,
+                    sample_support_top_k=(
+                        self.generator_cfg.inference_engine.sample_support_top_k if capture_sample_support else None
+                    ),
                 )
                 llm_call_start_time = time.monotonic()
                 engine_output = await self.inference_engine_client.generate(engine_input, model=self.policy_model_name)
@@ -947,6 +950,9 @@ class SkyRLGymGenerator(GeneratorInterface):
             prompt_token_ids=prompt_token_ids,
             sampling_params=sampling_params,
             return_sample_support=capture_sample_support,
+            sample_support_top_k=(
+                self.generator_cfg.inference_engine.sample_support_top_k if capture_sample_support else None
+            ),
             cache_salt=cache_salt,
         )
         engine_output = await self.inference_engine_client.generate(engine_input, model=self.policy_model_name)
@@ -1189,7 +1195,6 @@ class SkyRLGymGenerator(GeneratorInterface):
         rollout_sample_support = (
             sample_support_values if any(value is not None for value in sample_support_values) else None
         )
-
         rollout_metrics = get_rollout_metrics(
             responses,
             rewards,

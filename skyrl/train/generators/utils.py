@@ -316,7 +316,11 @@ def concatenate_generator_outputs(
     """
     assert len(generator_outputs) > 0
     # Per-token side channels must be populated consistently across batches.
-    for all_or_nothing_field in ("rollout_logprobs", "rollout_expert_indices", "rollout_sample_support"):
+    for all_or_nothing_field in (
+        "rollout_logprobs",
+        "rollout_expert_indices",
+        "rollout_sample_support",
+    ):
         present = [output.get(all_or_nothing_field) is not None for output in generator_outputs]
         if any(present) and not all(present):
             raise ValueError(
@@ -906,7 +910,8 @@ def _merge_single_trajectory(gen_out: GeneratorOutput) -> GeneratorOutput:
     last = 0
 
     def flush():
-        nonlocal acc_prompt, acc_response, acc_loss_mask, acc_logprobs, acc_sample_support, acc_rewards_tokens, last
+        nonlocal acc_prompt, acc_response, acc_loss_mask, acc_logprobs, acc_sample_support
+        nonlocal acc_rewards_tokens, last
         out_prompt_ids.append(acc_prompt)
         out_response_ids.append(acc_response)
         out_loss_masks.append(acc_loss_mask)

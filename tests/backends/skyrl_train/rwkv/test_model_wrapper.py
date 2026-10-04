@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -11,12 +12,16 @@ from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
     refresh_rwkv_runtime_weights,
 )
 from skyrl.backends.skyrl_train.utils import torch_utils as torch_utils_module
+from skyrl.backends.skyrl_train.utils.packed_ragged_tensor import PackedRaggedTensor
+from skyrl.backends.skyrl_train.utils.sample_support import (
+    SAMPLE_SUPPORT_DTYPE,
+    SAMPLE_SUPPORT_LOGPROBS_DTYPE,
+    CompactSampleSupport,
+)
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
 from skyrl.backends.skyrl_train.workers import model_wrapper as model_wrapper_module
-from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
-    FSDPPolicyWorkerBase,
-    FSDPWeightExtractor,
-)
+from skyrl.backends.skyrl_train.weight_sync.sources import FsdpWeightSource
+from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
 from skyrl.train.config import SamplingParams, SkyRLTrainConfig
 
@@ -24,6 +29,19 @@ from skyrl.train.config import SamplingParams, SkyRLTrainConfig
 @pytest.fixture(autouse=True)
 def use_torch_logprobs(monkeypatch):
     monkeypatch.setattr(torch_utils_module, "FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE", False)
+
+
+def _packed_support(
+    segment_ids: list[list[list[int]]],
+    segment_logprobs: list[list[list[float]]],
+) -> PackedRaggedTensor:
+    """Pack one ``[tokens, top_k]`` candidate grid and its sampler scores per trajectory."""
+    rows = []
+    for ids, logprobs in zip(segment_ids, segment_logprobs):
+        grid = np.asarray(ids, dtype=SAMPLE_SUPPORT_DTYPE)
+        scores = np.asarray(logprobs, dtype=SAMPLE_SUPPORT_LOGPROBS_DTYPE)
+        rows.append(CompactSampleSupport.from_masked_rows(grid, grid >= 0, logprobs=scores))
+    return PackedRaggedTensor.from_rows(rows)
 
 
 class ToyCausalLM(torch.nn.Module):
@@ -172,6 +190,83 @@ def test_rwkv_ragged_batch_restores_padding_and_entropy_positions():
     assert torch.equal(output["entropy"][1, :2], torch.zeros(2))
 
 
+def test_rwkv_score_centering_returns_aligned_support_heads():
+    model = ToyCausalLM()
+    wrapper = HFModelWrapper(model)
+    sequences = torch.tensor([[1, 2, 3, 4]])
+    support = _packed_support([[[2, 7], [3, 8]]], [[[-0.2, -1.5], [-0.3, -1.4]]])
+
+    action_log_probs, output = wrapper(
+        sequences,
+        num_actions=2,
+        attention_mask=torch.ones_like(sequences),
+        sample_support=support,
+        loss_mask=torch.ones(1, 2, dtype=torch.bool),
+        enable_score_centering=True,
+        return_output=True,
+    )
+
+    assert action_log_probs.shape == (1, 2)
+    assert output["score_centering_train_logprobs"].shape == (1, 2, 2)
+    assert output["score_centering_sampler_logprobs"].shape == (1, 2, 2)
+    assert torch.isfinite(output["score_centering_train_logprobs"]).all()
+
+
+@pytest.mark.parametrize("distributed", [False, True])
+def test_rwkv_score_centering_ragged_batch_preserves_token_and_support_axes(monkeypatch, distributed):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: distributed)
+    model = ToyCausalLM()
+    wrapper = HFModelWrapper(model)
+    sequences = torch.tensor([[0, 0, 1, 2, 3], [4, 5, 6, 7, 8]])
+    attention_mask = torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]])
+    segment_ids = [[[3, 9]], [[7, 10], [8, 11]]]
+    segment_logprobs = [[[-0.2, -1.5]], [[-0.3, -1.4], [-0.4, -1.3]]]
+    support = _packed_support(segment_ids, segment_logprobs)
+
+    action_log_probs, output = wrapper(
+        sequences,
+        num_actions=2,
+        attention_mask=attention_mask,
+        sample_support=support,
+        loss_mask=torch.tensor([[0, 1], [1, 1]], dtype=torch.bool),
+        enable_score_centering=True,
+        return_output=True,
+    )
+
+    trainer_head = output["score_centering_train_logprobs"]
+    sampler_head = output["score_centering_sampler_logprobs"]
+    assert trainer_head.shape == sampler_head.shape == (2, 2, 2)
+    assert torch.isneginf(trainer_head[0, 0]).all()
+    assert torch.isneginf(sampler_head[0, 0]).all()
+    for row, length in enumerate([1, 2]):
+        real_sequence = sequences[row, attention_mask[row].bool()].unsqueeze(0)
+        logprobs = model(real_sequence)["logits"].float().log_softmax(-1)[0, -length - 1 : -1]
+        expected = logprobs.gather(-1, torch.as_tensor(segment_ids[row]))
+        torch.testing.assert_close(trainer_head[row, -length:], expected)
+        torch.testing.assert_close(sampler_head[row, -length:], torch.as_tensor(segment_logprobs[row]))
+    (action_log_probs.sum() + trainer_head[torch.isfinite(trainer_head)].sum()).backward()
+    assert torch.isfinite(model.lm_head.weight.grad).all()
+
+
+def test_rwkv_score_centering_ignores_padding_support_rows():
+    model = ToyCausalLM()
+    wrapper = HFModelWrapper(model)
+    support = _packed_support([[[-1, -1], [-1, -1]]], [[[0.0, 0.0], [0.0, 0.0]]])
+
+    _, output = wrapper(
+        torch.tensor([[1, 2, 3, 4]]),
+        num_actions=2,
+        attention_mask=torch.ones(1, 4, dtype=torch.bool),
+        sample_support=support,
+        loss_mask=torch.ones(1, 2, dtype=torch.bool),
+        enable_score_centering=True,
+        return_output=True,
+    )
+
+    assert torch.isneginf(output["score_centering_train_logprobs"]).all()
+    assert torch.isneginf(output["score_centering_sampler_logprobs"]).all()
+
+
 def test_rwkv_recurrent_forward_preserves_gradients():
     model = ToyCausalLM()
     wrapper = HFModelWrapper(model)
@@ -186,15 +281,20 @@ def test_rwkv_recurrent_forward_preserves_gradients():
     assert torch.isfinite(model.lm_head.weight.grad).all()
 
 
-def test_rwkv_weight_extractor_matches_fsdp_bf16_forward_dtype(monkeypatch):
-    source = torch.tensor([1.003, -2.007], dtype=torch.float32)
-    extractor = FSDPWeightExtractor(torch.nn.Module(), rwkv_effective_bf16=True)
-    monkeypatch.setattr(extractor, "_gather_tensor", lambda param: param)
+def test_rwkv_weight_source_matches_fsdp_bf16_forward_dtype():
+    values = torch.tensor([1.003, -2.007], dtype=torch.float32)
 
-    actual = extractor._gather_for_dtype(source, torch.float16)
+    class _Holding(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(values)
 
-    assert torch.equal(actual, source.to(torch.bfloat16).to(torch.float16))
-    assert not torch.equal(actual, source.to(torch.float16))
+    rwkv = dict(FsdpWeightSource(_Holding(), torch.float16, rwkv_effective_bf16=True))["weight"].cpu()
+    direct = dict(FsdpWeightSource(_Holding(), torch.float16))["weight"].cpu()
+
+    assert torch.equal(rwkv, values.to(torch.bfloat16).to(torch.float16))
+    assert not torch.equal(rwkv, values.to(torch.float16))
+    assert torch.equal(direct, values.to(torch.float16))
 
 
 def test_rwkv_weight_reload_preserves_runtime_layout_and_derived_storage():

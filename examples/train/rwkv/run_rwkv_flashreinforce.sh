@@ -13,6 +13,7 @@ fi
 : "${NUM_GPUS:=8}"
 : "${MICRO_BATCH_SIZE:=2}"
 : "${LOGGER:=wandb}"
+: "${TRAINING_ENTRYPOINT:=skyrl.train.entrypoints.main_base}"
 : "${RUN_NAME:=rwkv7-g1j-gsm8k-flashreinforce-50step}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
 export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
@@ -35,7 +36,7 @@ fi
 # Check the exact native cache key before loading.
 uv run --no-sync --extra rwkv python examples/train/rwkv/prepare_flashrwkv2.py --check
 
-uv run --no-sync --extra rwkv -m skyrl.train.entrypoints.main_base \
+uv run --no-sync --extra rwkv -m "$TRAINING_ENTRYPOINT" \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
   trainer.algorithm.policy_loss_type=flashreinforce \

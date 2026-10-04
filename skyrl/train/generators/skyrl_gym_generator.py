@@ -30,8 +30,12 @@ from skyrl.backends.skyrl_train.utils.routed_experts import (
 )
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_DTYPE,
+    SAMPLE_SUPPORT_LOGPROBS_DTYPE,
+    SAMPLE_SUPPORT_LOGPROBS_PADDING,
     SAMPLE_SUPPORT_PADDING,
     SampleSupport,
+    SampleSupportLogprobs,
+    SampleSupportLogprobsTrace,
     SampleSupportTrace,
 )
 from skyrl.train.config import GeneratorConfig, SkyRLGymConfig
@@ -67,6 +71,7 @@ class TrajectoryOutput:
     env_metrics: Dict[str, Any]
     rollout_expert_indices: Optional[RoutedExpertIndices] = None
     rollout_sample_support: Optional[SampleSupport] = None
+    rollout_sample_support_logprobs: Optional[SampleSupportLogprobs] = None
     pixel_values: Optional[torch.Tensor] = None
     image_grid_thw: Optional[torch.Tensor] = None
     # End-to-end wall-clock time (seconds) to generate this trajectory. Optional: agent loops may
@@ -100,8 +105,10 @@ class AgentLoopState:
     done: bool
     routed_expert_trace: Optional[RoutedExpertTrace] = None
     sample_support_trace: Optional[SampleSupportTrace] = None
+    sample_support_logprobs_trace: Optional[SampleSupportLogprobsTrace] = None
     # Support for an EOS sliced from a single-turn response.
     dropped_eos_sample_support: Optional[SampleSupport] = None
+    dropped_eos_sample_support_logprobs: Optional[SampleSupportLogprobs] = None
 
 
 @dataclass
@@ -113,6 +120,7 @@ class TurnOutput:
     obs_ids: List[int]
     reward: Optional[float]
     rollout_sample_support: Optional[SampleSupport] = None
+    rollout_sample_support_logprobs: Optional[SampleSupportLogprobs] = None
     added_eos: bool = False
 
     def get_turn_rollout_sample_support(self) -> Optional[SampleSupport]:
@@ -128,6 +136,20 @@ class TurnOutput:
             dtype=self.rollout_sample_support.dtype,
         )
         return np.concatenate((self.rollout_sample_support, padding), axis=0)
+
+    def get_turn_rollout_sample_support_logprobs(self) -> Optional[SampleSupportLogprobs]:
+        """Return top-k sampler logprobs padded over synthetic EOS and observation tokens."""
+        if self.rollout_sample_support_logprobs is None:
+            return None
+        padding_count = int(self.added_eos) + len(self.obs_ids)
+        if not padding_count:
+            return self.rollout_sample_support_logprobs
+        padding = np.full(
+            (padding_count, self.rollout_sample_support_logprobs.shape[1]),
+            SAMPLE_SUPPORT_LOGPROBS_PADDING,
+            dtype=self.rollout_sample_support_logprobs.dtype,
+        )
+        return np.concatenate((self.rollout_sample_support_logprobs, padding), axis=0)
 
     def get_turn_loss_mask(self) -> List[int]:
         """
@@ -456,7 +478,15 @@ class SkyRLGymGenerator(GeneratorInterface):
                 self.generator_cfg.inference_engine.enable_return_sample_support_set
                 and training_phase != TRAINING_PHASE_EVAL
             )
-            sample_support_width = current_sampling_params["top_k"] if capture_sample_support else 0
+            sample_support_width = (
+                (
+                    self.generator_cfg.inference_engine.sample_support_top_k
+                    if self.generator_cfg.inference_engine.sample_support_top_k is not None
+                    else current_sampling_params["top_k"]
+                )
+                if capture_sample_support
+                else 0
+            )
             # Eval trajectories do not consume routed-expert indices.
             capture_routed_experts = (
                 self.generator_cfg.inference_engine.enable_return_routed_experts
@@ -481,6 +511,10 @@ class SkyRLGymGenerator(GeneratorInterface):
                 done=False,
                 routed_expert_trace=RoutedExpertTrace() if capture_routed_experts else None,
                 sample_support_trace=SampleSupportTrace() if capture_sample_support and not is_step_wise else None,
+                # The side-channel logprobs are optional for compatibility with older
+                # inference clients; start the trace lazily when the first response
+                # actually contains them.
+                sample_support_logprobs_trace=None,
             )
 
             while not agent_loop_state.done:
@@ -511,6 +545,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                     cache_salt=cache_salt,
                     routed_experts_prompt_starts=[routed_expert_trace.prompt_start] if routed_expert_trace else None,
                     return_sample_support=capture_sample_support,
+                    sample_support_top_k=sample_support_width if capture_sample_support else None,
                 )
                 llm_call_start_time = time.monotonic()
                 engine_output = await self.inference_engine_client.generate(engine_input, model=self.policy_model_name)
@@ -540,6 +575,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                     )
 
                 sample_support_rows = None
+                sample_support_logprobs_rows = None
                 if capture_sample_support:
                     assert (
                         self.custom_chat_template is None
@@ -556,6 +592,35 @@ class SkyRLGymGenerator(GeneratorInterface):
                         raise ValueError(
                             f"Sample support has {sample_support_rows.shape[0]} rows for {len(output_ids)} tokens"
                         )
+                    raw_sample_support_logprobs = engine_output.get("rollout_sample_support_logprobs", None)
+                    has_sample_support_logprobs = (
+                        raw_sample_support_logprobs is not None and raw_sample_support_logprobs[0] is not None
+                    )
+                    if has_sample_support_logprobs:
+                        if not is_step_wise and agent_loop_state.sample_support_logprobs_trace is None:
+                            if (
+                                agent_loop_state.sample_support_trace is not None
+                                and agent_loop_state.sample_support_trace.num_rows
+                            ):
+                                raise ValueError(
+                                    "Sample-support logprobs appeared after earlier support rows; capture must "
+                                    "cover the entire trajectory"
+                                )
+                            agent_loop_state.sample_support_logprobs_trace = SampleSupportLogprobsTrace()
+                        sample_support_logprobs_rows = np.asarray(
+                            raw_sample_support_logprobs[0],
+                            dtype=SAMPLE_SUPPORT_LOGPROBS_DTYPE,
+                            order="C",
+                        ).reshape(-1, sample_support_width)
+                        if sample_support_logprobs_rows.shape != sample_support_rows.shape:
+                            raise ValueError(
+                                "Sample support IDs and logprobs must have the same shape, got "
+                                f"{sample_support_rows.shape} and {sample_support_logprobs_rows.shape}"
+                            )
+                    elif not is_step_wise and agent_loop_state.sample_support_logprobs_trace is not None:
+                        raise ValueError("Sample-support logprobs are missing for one generated turn")
+                    elif self.generator_cfg.inference_engine.sample_support_logprobs_mode == "raw_logprobs":
+                        raise ValueError("Score-Centering support capture did not return sampler logprobs")
                 # Append eos when sampling_params.stop is not None. Does not affect 3.a as chat templates add eos_token.
                 # sampling_params is not None for eval, but None for training (which uses engine.sampling_params which are from cfg)
                 stop_strs = current_sampling_params.get("stop", None)
@@ -622,6 +687,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                     reward=step_reward,
                     obs_ids=obs_ids,
                     rollout_sample_support=sample_support_rows,
+                    rollout_sample_support_logprobs=sample_support_logprobs_rows,
                     added_eos=added_eos,
                 )
 
@@ -639,6 +705,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                         turn_loss_mask = [0] * len(turn_loss_mask)
                     turn_response_logprobs: Optional[List[float]] = turn_output.get_turn_rollout_logprobs()
                     turn_sample_support = turn_output.get_turn_rollout_sample_support()
+                    turn_sample_support_logprobs = turn_output.get_turn_rollout_sample_support_logprobs()
 
                     per_step_output = TrajectoryOutput(
                         response_ids=turn_response_ids,
@@ -649,13 +716,18 @@ class SkyRLGymGenerator(GeneratorInterface):
                         stop_reason=stop_reason,
                         env_metrics=env.get_metrics() if agent_loop_state.done else {},
                         rollout_sample_support=turn_sample_support,
+                        rollout_sample_support_logprobs=turn_sample_support_logprobs,
                     )
                     agent_loop_output.step_outputs.append(per_step_output)
 
                 # 3. Update states: input ids, loss_mask, chat_history, etc.
                 # Three ways of managing input
                 sample_support_trace = agent_loop_state.sample_support_trace
+                sample_support_logprobs_trace = agent_loop_state.sample_support_logprobs_trace
                 support_rows_before = sample_support_trace.num_rows if sample_support_trace is not None else 0
+                support_logprobs_rows_before = (
+                    sample_support_logprobs_trace.num_rows if sample_support_logprobs_trace is not None else 0
+                )
                 input_length_before = len(agent_loop_state.input_ids)
                 if retokenize_chat_history:
                     # a. custom chat template
@@ -681,6 +753,13 @@ class SkyRLGymGenerator(GeneratorInterface):
                         f"sample-support trace advanced {support_rows_added} rows for {tokens_added} tokens "
                         f"appended by this turn"
                     )
+                if sample_support_logprobs_trace is not None:
+                    support_logprobs_rows_added = sample_support_logprobs_trace.num_rows - support_logprobs_rows_before
+                    tokens_added = len(agent_loop_state.input_ids) - input_length_before
+                    assert support_logprobs_rows_added == tokens_added, (
+                        f"sample-support logprob trace advanced {support_logprobs_rows_added} rows for "
+                        f"{tokens_added} tokens appended by this turn"
+                    )
                 # The trace covers this observation, which the response never keeps.
                 final_observation_token_count = len(turn_output.obs_ids)
 
@@ -695,6 +774,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             rollout_logprobs = None
             rollout_expert_indices_out = None
             rollout_sample_support_out = None
+            rollout_sample_support_logprobs_out = None
             response_ids = None
 
             # Prepare the final loss_mask, response_ids and rollout_logprobs .
@@ -756,6 +836,12 @@ class SkyRLGymGenerator(GeneratorInterface):
                             agent_loop_state.sample_support_trace.append(dropped_row, expected_rows=1)
                         else:
                             agent_loop_state.sample_support_trace.append_padding(1)
+                    if agent_loop_state.sample_support_logprobs_trace is not None:
+                        dropped_logprob_row = agent_loop_state.dropped_eos_sample_support_logprobs
+                        if dropped_logprob_row is not None:
+                            agent_loop_state.sample_support_logprobs_trace.append(dropped_logprob_row, expected_rows=1)
+                        else:
+                            agent_loop_state.sample_support_logprobs_trace.append_padding(1)
                     appended_eos_token = True
 
             if agent_loop_state.routed_expert_trace is not None and agent_loop_state.routed_expert_trace.prompt_start:
@@ -765,6 +851,14 @@ class SkyRLGymGenerator(GeneratorInterface):
                 )
             if agent_loop_state.sample_support_trace is not None and agent_loop_state.sample_support_trace.num_rows:
                 rollout_sample_support_out = agent_loop_state.sample_support_trace.finalize(
+                    token_count=len(response_ids),
+                    extra_rows=final_observation_token_count,
+                )
+            if (
+                agent_loop_state.sample_support_logprobs_trace is not None
+                and agent_loop_state.sample_support_logprobs_trace.num_rows
+            ):
+                rollout_sample_support_logprobs_out = agent_loop_state.sample_support_logprobs_trace.finalize(
                     token_count=len(response_ids),
                     extra_rows=final_observation_token_count,
                 )
@@ -788,6 +882,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                     env_metrics=env_metrics,
                     rollout_expert_indices=rollout_expert_indices_out,
                     rollout_sample_support=rollout_sample_support_out,
+                    rollout_sample_support_logprobs=rollout_sample_support_logprobs_out,
                 )
 
             agent_loop_output = self._post_process_agent_loop_output(
@@ -952,6 +1047,18 @@ class SkyRLGymGenerator(GeneratorInterface):
             self.generator_cfg.inference_engine.enable_return_sample_support_set
             and training_phase != TRAINING_PHASE_EVAL
         )
+        current_sampling_params = (
+            sampling_params if sampling_params is not None else asdict(self.generator_cfg.sampling_params)
+        )
+        sample_support_width = (
+            (
+                self.generator_cfg.inference_engine.sample_support_top_k
+                if self.generator_cfg.inference_engine.sample_support_top_k is not None
+                else current_sampling_params["top_k"]
+            )
+            if capture_sample_support
+            else 0
+        )
         capture_routed_experts = (
             self.generator_cfg.inference_engine.enable_return_routed_experts and training_phase != TRAINING_PHASE_EVAL
         )
@@ -959,6 +1066,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             prompt_token_ids=prompt_token_ids,
             sampling_params=sampling_params,
             return_sample_support=capture_sample_support,
+            sample_support_top_k=sample_support_width if capture_sample_support else None,
             cache_salt=cache_salt,
         )
         engine_output = await self.inference_engine_client.generate(engine_input, model=self.policy_model_name)
@@ -970,6 +1078,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             engine_output.get("rollout_expert_indices", None) if capture_routed_experts else None
         )
         raw_rollout_sample_support = engine_output.get("rollout_sample_support", None)
+        raw_rollout_sample_support_logprobs = engine_output.get("rollout_sample_support_logprobs", None)
 
         truncated_responses = []
         rewards = []
@@ -978,6 +1087,9 @@ class SkyRLGymGenerator(GeneratorInterface):
         truncated_logprobs: Optional[List[List[float]]] = [] if logprobs is not None else None
         truncated_indices: Optional[List[RoutedExpertIndices]] = [] if raw_rollout_expert_indices is not None else None
         truncated_sample_support: Optional[List[SampleSupport]] = [] if raw_rollout_sample_support is not None else None
+        truncated_sample_support_logprobs: Optional[List[SampleSupportLogprobs]] = (
+            [] if raw_rollout_sample_support_logprobs is not None else None
+        )
 
         for i, (output, response, env, env_class) in enumerate(zip(outputs, responses, envs, env_classes)):
             self._set_generation_metadata(
@@ -1012,6 +1124,10 @@ class SkyRLGymGenerator(GeneratorInterface):
                 truncated_indices.append(sample_indices[: prompt_len + len(response)])
             if raw_rollout_sample_support is not None:
                 truncated_sample_support.append(raw_rollout_sample_support[i][: len(response)])
+            if raw_rollout_sample_support_logprobs is not None:
+                if raw_rollout_sample_support_logprobs[i] is None:
+                    raise ValueError("Sample-support logprobs are missing for one generated response")
+                truncated_sample_support_logprobs.append(raw_rollout_sample_support_logprobs[i][: len(response)])
 
             # Get environment-specific metrics
             env_metrics.append(env.get_metrics())
@@ -1034,6 +1150,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             "rollout_logprobs": truncated_logprobs,
             "rollout_expert_indices": truncated_indices,
             "rollout_sample_support": truncated_sample_support,
+            "rollout_sample_support_logprobs": truncated_sample_support_logprobs,
         }
 
         return generator_output
@@ -1199,6 +1316,19 @@ class SkyRLGymGenerator(GeneratorInterface):
         rollout_sample_support = (
             sample_support_values if any(value is not None for value in sample_support_values) else None
         )
+        if self.generator_cfg.step_wise_trajectories:
+            sample_support_logprobs_values = [
+                step_output.rollout_sample_support_logprobs
+                for output in all_outputs
+                for step_output in output.step_outputs
+            ]
+        else:
+            sample_support_logprobs_values = [output.rollout_sample_support_logprobs for output in all_outputs]
+        rollout_sample_support_logprobs = (
+            sample_support_logprobs_values
+            if any(value is not None for value in sample_support_logprobs_values)
+            else None
+        )
 
         rollout_metrics = get_rollout_metrics(
             responses,
@@ -1234,6 +1364,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             "trajectory_time_splits": out_trajectory_time_splits,
             "rollout_expert_indices": rollout_expert_indices,
             "rollout_sample_support": rollout_sample_support,
+            "rollout_sample_support_logprobs": rollout_sample_support_logprobs,
             "is_last_step": is_last_step,
             "env_metrics": env_metrics,
         }
@@ -1295,7 +1426,11 @@ class SkyRLGymGenerator(GeneratorInterface):
         """
         assert self.use_conversation_multi_turn and self.custom_chat_template
 
-        if agent_loop_state.routed_expert_trace is not None or agent_loop_state.sample_support_trace is not None:
+        if (
+            agent_loop_state.routed_expert_trace is not None
+            or agent_loop_state.sample_support_trace is not None
+            or agent_loop_state.sample_support_logprobs_trace is not None
+        ):
             raise NotImplementedError(
                 "retokenizing the chat history does not feed the per-token side-channel traces, so routes and "
                 "sample support would not align with the retokenized response. `generator.chat_template` is "
@@ -1380,6 +1515,11 @@ class SkyRLGymGenerator(GeneratorInterface):
             turn_sample_support = turn_output.get_turn_rollout_sample_support()
             if agent_loop_state.sample_support_trace is not None and turn_sample_support is not None:
                 agent_loop_state.sample_support_trace.append(turn_sample_support, expected_rows=len(turn_ids))
+            turn_sample_support_logprobs = turn_output.get_turn_rollout_sample_support_logprobs()
+            if agent_loop_state.sample_support_logprobs_trace is not None and turn_sample_support_logprobs is not None:
+                agent_loop_state.sample_support_logprobs_trace.append(
+                    turn_sample_support_logprobs, expected_rows=len(turn_ids)
+                )
 
         return agent_loop_state
 
@@ -1440,6 +1580,11 @@ class SkyRLGymGenerator(GeneratorInterface):
             if dropped_eos and turn_output.rollout_sample_support is not None
             else None
         )
+        agent_loop_state.dropped_eos_sample_support_logprobs = (
+            turn_output.rollout_sample_support_logprobs[len(new_resp_tokens) : len(new_resp_tokens) + 1]
+            if dropped_eos and turn_output.rollout_sample_support_logprobs is not None
+            else None
+        )
 
         turn_ids = new_resp_tokens + obs_ids_to_add
         loss_mask_for_turn = [1] * len(new_resp_tokens) + [0] * len(obs_ids_to_add)
@@ -1463,4 +1608,13 @@ class SkyRLGymGenerator(GeneratorInterface):
                 turn_output.rollout_sample_support[: len(new_resp_tokens)], expected_rows=len(new_resp_tokens)
             )
             agent_loop_state.sample_support_trace.append_padding(len(obs_ids_to_add))
+        if (
+            agent_loop_state.sample_support_logprobs_trace is not None
+            and turn_output.rollout_sample_support_logprobs is not None
+        ):
+            agent_loop_state.sample_support_logprobs_trace.append(
+                turn_output.rollout_sample_support_logprobs[: len(new_resp_tokens)],
+                expected_rows=len(new_resp_tokens),
+            )
+            agent_loop_state.sample_support_logprobs_trace.append_padding(len(obs_ids_to_add))
         return agent_loop_state

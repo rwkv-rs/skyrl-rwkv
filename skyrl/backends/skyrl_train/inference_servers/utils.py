@@ -239,10 +239,18 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
         # Other values from engine kwargs are rejected by _validate_logprobs_mode.
         logprobs_mode=VLLM_LOGPROBS_MODE,
     )
-    # Sample-support capture asks for one logprob per top-k candidate, post-filter, so the
-    # -inf entries that mark filtered candidates survive to the capture path.
+    # Sample-support capture asks for one logprob per diagnostic candidate.  The
+    # width is independent of sampling_params.top_k so diagnostics do not alter
+    # the rollout distribution (Score-Centering commonly samples with top_k=-1).
     if ie_cfg.enable_return_sample_support_set:
-        overrides["max_logprobs"] = cfg.generator.sampling_params.top_k
+        support_top_k = (
+            ie_cfg.sample_support_top_k
+            if ie_cfg.sample_support_top_k is not None
+            else cfg.generator.sampling_params.top_k
+        )
+        overrides["max_logprobs"] = support_top_k
+        if cfg.trainer.algorithm.flashreinforce.score_centering:
+            overrides["logprobs_mode"] = ie_cfg.sample_support_logprobs_mode
     for key, value in overrides.items():
         setattr(args, key, value)
 

@@ -16,8 +16,11 @@ from skyrl.backends.skyrl_train.utils.routed_experts import (
 )
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_DTYPES,
+    SAMPLE_SUPPORT_LOGPROBS_DTYPES,
+    SAMPLE_SUPPORT_LOGPROBS_TORCH_DTYPE,
     SAMPLE_SUPPORT_TORCH_DTYPE,
     SampleSupport,
+    SampleSupportLogprobs,
 )
 
 logger = logging.getLogger(__name__)
@@ -240,6 +243,60 @@ def build_sample_support(
     packed = torch.empty((int(response_lens.sum()), top_k), dtype=SAMPLE_SUPPORT_TORCH_DTYPE)
     for sample_index in range(num_samples):
         _fill_sample_support_segment(packed, cu_seqlens, rollout_sample_support, sample_index)
+    return PackedTensor(packed, cu_seqlens)
+
+
+def build_sample_support_logprobs(
+    rollout_sample_support_logprobs: List[SampleSupportLogprobs],
+    response_lens: np.ndarray,
+) -> PackedTensor:
+    """Pack sampler top-k logprobs with the same response-row layout as support IDs."""
+    num_samples = len(rollout_sample_support_logprobs)
+    if num_samples == 0:
+        raise ValueError("rollout_sample_support_logprobs must contain at least one trajectory")
+    for sample_index, rows in enumerate(rollout_sample_support_logprobs):
+        if not isinstance(rows, np.ndarray):
+            raise TypeError(
+                "rollout_sample_support_logprobs entries must be NumPy arrays, "
+                f"got {type(rows).__name__} at sample {sample_index}"
+            )
+        if rows.dtype not in SAMPLE_SUPPORT_LOGPROBS_DTYPES:
+            supported = ", ".join(dtype.name for dtype in SAMPLE_SUPPORT_LOGPROBS_DTYPES)
+            raise ValueError(
+                "rollout_sample_support_logprobs entries must use a canonical dtype "
+                f"({supported}), got {rows.dtype} at sample {sample_index}"
+            )
+
+    first_shape = rollout_sample_support_logprobs[0].shape
+    if len(first_shape) != 2 or first_shape[1] < 1:
+        raise ValueError(
+            "rollout_sample_support_logprobs must be [response_tokens, top_k] arrays, "
+            f"got shape {first_shape} at sample 0"
+        )
+    top_k = first_shape[1]
+    for sample_index, rows in enumerate(rollout_sample_support_logprobs):
+        if rows.ndim != 2 or rows.shape[1] != top_k:
+            raise ValueError(
+                f"rollout_sample_support_logprobs entries must share top_k {top_k}, "
+                f"got shape {rows.shape} at sample {sample_index}"
+            )
+        expected = int(response_lens[sample_index])
+        if rows.shape[0] != expected:
+            raise ValueError(
+                f"Trajectory {sample_index} has {rows.shape[0]} support-logprob rows for {expected} response tokens"
+            )
+        if not np.isfinite(rows).all():
+            raise ValueError(f"rollout_sample_support_logprobs[{sample_index}] contains non-finite values")
+
+    cu_seqlens = cu_seqlens_from_lengths(response_lens)
+    packed = torch.empty(
+        (int(response_lens.sum()), top_k),
+        dtype=SAMPLE_SUPPORT_LOGPROBS_TORCH_DTYPE,
+    )
+    for sample_index, rows in enumerate(rollout_sample_support_logprobs):
+        if not rows.flags.c_contiguous or not rows.flags.writeable:
+            rows = rows.copy(order="C")
+        packed[int(cu_seqlens[sample_index]) : int(cu_seqlens[sample_index + 1])] = torch.from_numpy(rows)
     return PackedTensor(packed, cu_seqlens)
 
 

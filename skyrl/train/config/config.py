@@ -796,10 +796,28 @@ class FlashReinforceConfig(BaseConfig):
 
     sequence_kl_threshold: float = 3e-3
     """Mean sampled-action Bernoulli KL threshold for whole-trajectory admission; infinity disables the gate."""
+    score_centering: bool = False
+    """Apply the optional sampler-support Score-Centering correction."""
+    score_centering_top_k: int = 128
+    """Number of sampler candidates recorded for the Score-Centering approximation."""
+    score_centering_weight: str = "tis"
+    """Score-Centering weight: ``"none"`` or truncated-IS ``"tis"``."""
+    score_centering_weight_clip: float = 2.0
+    """Upper bound for the optional truncated-IS weight."""
+    score_centering_eps: float = 1e-6
+    """Probability-mass floor used by the top-k/tail correction."""
 
     def __post_init__(self) -> None:
         if self.sequence_kl_threshold < 0:
             raise ValueError("flashreinforce.sequence_kl_threshold must be nonnegative")
+        if self.score_centering_top_k <= 1:
+            raise ValueError("flashreinforce.score_centering_top_k must be greater than one")
+        if self.score_centering_weight not in {"none", "tis"}:
+            raise ValueError("flashreinforce.score_centering_weight must be 'none' or 'tis'")
+        if self.score_centering_weight_clip <= 0:
+            raise ValueError("flashreinforce.score_centering_weight_clip must be positive")
+        if self.score_centering_eps <= 0:
+            raise ValueError("flashreinforce.score_centering_eps must be positive")
 
 
 @dataclass
@@ -1297,6 +1315,10 @@ class InferenceEngineConfig(BaseConfig):
     Used together with ``trainer.policy.megatron_config.moe_enable_routing_replay``."""
     enable_return_sample_support_set: bool = False
     """Return the bounded sampler support used to renormalize rollout logprobs."""
+    sample_support_top_k: Optional[int] = None
+    """Support width captured independently of ``sampling_params.top_k``."""
+    sample_support_logprobs_mode: str = "processed_logprobs"
+    """vLLM normalization used for captured support: ``processed_logprobs`` or ``raw_logprobs``."""
     max_num_batched_tokens: int = 8192
     """vLLM continuous-batching parameter: maximum number of tokens to pack into a batch."""
     enforce_eager: bool = False
@@ -1944,6 +1966,26 @@ class SkyRLTrainConfig(BaseConfig):
         if self.trainer.algorithm.temperature is None:
             self.trainer.algorithm.temperature = self.generator.sampling_params.temperature
 
+        flashreinforce = self.trainer.algorithm.flashreinforce
+        if flashreinforce.score_centering:
+            if self.trainer.algorithm.policy_loss_type not in ("flashreinforce", "flash_reinforce"):
+                raise ValueError("flashreinforce.score_centering requires policy_loss_type=flashreinforce")
+            if self.trainer.strategy != "fsdp":
+                raise ValueError("flashreinforce.score_centering currently requires trainer.strategy=fsdp")
+            if not self.generator.use_conversation_multi_turn:
+                raise ValueError(
+                    "flashreinforce.score_centering requires generator.use_conversation_multi_turn=True because "
+                    "a synthetic EOS has no captured sampler support"
+                )
+            if self.generator.sampling_params.logprobs is None:
+                raise ValueError(
+                    "flashreinforce.score_centering requires generator.sampling_params.logprobs so the "
+                    "sampled-token behavior logprob is retained"
+                )
+            self.generator.inference_engine.enable_return_sample_support_set = True
+            self.generator.inference_engine.sample_support_top_k = flashreinforce.score_centering_top_k
+            self.generator.inference_engine.sample_support_logprobs_mode = "raw_logprobs"
+
         if self.trainer.algorithm.enable_sample_support_replay:
             if not self.generator.inference_engine.enable_return_sample_support_set:
                 raise ValueError(
@@ -1965,8 +2007,19 @@ class SkyRLTrainConfig(BaseConfig):
             sampling_params = self.generator.sampling_params
             if sampling_params.temperature <= 0:
                 raise ValueError("sample-support capture requires generator.sampling_params.temperature > 0")
-            if sampling_params.top_k <= 1:
-                raise ValueError("sample-support capture requires generator.sampling_params.top_k > 1")
+            support_top_k = self.generator.inference_engine.sample_support_top_k
+            if support_top_k is None:
+                support_top_k = sampling_params.top_k
+            if support_top_k <= 1:
+                raise ValueError("sample-support capture requires sample_support_top_k > 1")
+            if self.generator.inference_engine.sample_support_logprobs_mode not in {
+                "raw_logprobs",
+                "processed_logprobs",
+            }:
+                raise ValueError(
+                    "generator.inference_engine.sample_support_logprobs_mode must be "
+                    "'raw_logprobs' or 'processed_logprobs'"
+                )
             if sampling_params.repetition_penalty != 1.0:
                 raise ValueError("sample-support capture requires repetition_penalty=1.0")
             if sampling_params.additional_kwargs:

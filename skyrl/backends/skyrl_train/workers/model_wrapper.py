@@ -95,6 +95,40 @@ class _SampleSupportChannels:
         )
 
 
+def _score_centering_support_head_logprobs(
+    logits: torch.Tensor,
+    row_ids: torch.Tensor,
+    sample_support: PackedTensor,
+    sample_support_logprobs: PackedTensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Score recorded sampler candidates against a full-vocabulary trainer forward."""
+    if sample_support.values.shape != sample_support_logprobs.values.shape:
+        raise ValueError(
+            "sample-support IDs and logprobs must have the same packed shape, got "
+            f"{tuple(sample_support.values.shape)} and {tuple(sample_support_logprobs.values.shape)}"
+        )
+    top_k = sample_support.values.shape[1]
+    if sample_support.values.shape[0] == 0:
+        empty_shape = (*row_ids.shape, top_k)
+        return logits.new_full(empty_shape, float("-inf")), logits.new_full(empty_shape, float("-inf"))
+    safe_row_ids = row_ids.clamp_min(0)
+    support_ids = sample_support.values.index_select(0, safe_row_ids.reshape(-1)).reshape(*row_ids.shape, top_k)
+    sampler_logprobs = sample_support_logprobs.values.index_select(0, safe_row_ids.reshape(-1)).reshape(
+        *row_ids.shape, top_k
+    )
+    row_valid = row_ids.ge(0).unsqueeze(-1)
+    candidate_valid = support_ids.ge(0)
+    candidate_ids = support_ids.clamp_min(0).long()
+
+    logits_float = logits.float()
+    log_partition = torch.logsumexp(logits_float, dim=-1)
+    valid_candidates = row_valid & candidate_valid
+    trainer_head_logprobs = logits_float.gather(-1, candidate_ids) - log_partition.unsqueeze(-1)
+    trainer_head_logprobs = torch.where(valid_candidates, trainer_head_logprobs, float("-inf"))
+    sampler_logprobs = torch.where(valid_candidates, sampler_logprobs.float(), float("-inf"))
+    return trainer_head_logprobs, sampler_logprobs
+
+
 class HFModelWrapper(nn.Module):
     """
     Base class for wrapped HF models in reinforcement learning.
@@ -149,6 +183,7 @@ class HFModelWrapper(nn.Module):
         self.attn_implementation = "flash_attention_2" if use_flash_attention_2 else "sdpa"
         self.remove_microbatch_padding = remove_microbatch_padding
         self.is_vlm = False
+
 
         if isinstance(pretrain_or_model, str):
             if load_in_4bit:
@@ -289,7 +324,8 @@ class HFModelWrapper(nn.Module):
         else:
             self.model = pretrain_or_model
 
-        self.is_rwkv = self.model.config.model_type == "rwkv"
+        model_config = getattr(self.model, "config", None)
+        self.is_rwkv = getattr(model_config, "model_type", None) == "rwkv"
         if self.is_rwkv:
             if self.remove_microbatch_padding:
                 raise ValueError("RWKV does not support remove_microbatch_padding=true")
@@ -321,12 +357,24 @@ class HFModelWrapper(nn.Module):
         return_output: bool,
         compute_entropy: bool,
         entropy_requires_grad: bool,
+        sample_support: Optional[PackedTensor] = None,
+        sample_support_logprobs: Optional[PackedTensor] = None,
+        enable_score_centering: bool = False,
     ) -> torch.Tensor:
         """Run independent recurrent streams without left padding."""
         batch_size, padded_length = sequences.shape
         valid_lengths = attention_mask.sum(dim=-1)
         log_probs = None
         entropy = None
+        score_centering_train_logprobs = None
+        score_centering_sampler_logprobs = None
+        if enable_score_centering:
+            if sample_support is None or sample_support_logprobs is None:
+                raise ValueError("score centering requires sampler support IDs and logprobs")
+            support_row_ids = sample_support_row_ids_in_batch_positions(
+                sample_support,
+                canonical_token_metadata_layout(attention_mask),
+            )
 
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             # FSDP collectives must be entered the same number of times on every
@@ -352,6 +400,21 @@ class HFModelWrapper(nn.Module):
                 sequence_length = int(sequence_length_tensor.item())
                 bucket_sequences[bucket_row, :sequence_length] = sequences[sequence_index, -sequence_length:]
             bucket_labels = torch.roll(bucket_sequences, shifts=-1, dims=1)
+            bucket_score_row_ids = None
+            if enable_score_centering:
+                bucket_score_row_ids = torch.full(
+                    (bucket_indices.numel(), bucket_length),
+                    SAMPLE_SUPPORT_NO_ROW,
+                    dtype=torch.long,
+                    device=sequences.device,
+                )
+                for bucket_row, (sequence_index, sequence_length_tensor) in enumerate(
+                    zip(bucket_indices, bucket_lengths, strict=True)
+                ):
+                    sequence_length = int(sequence_length_tensor.item())
+                    bucket_score_row_ids[bucket_row, :sequence_length] = support_row_ids[
+                        sequence_index, -sequence_length:
+                    ]
             # RWKV's training kernels require native BF16 throughout the model.
             # CUDA autocast promotes LayerNorm to FP32, so disable an enclosing
             # trainer/ref autocast region while the recurrent model runs.  The
@@ -368,6 +431,13 @@ class HFModelWrapper(nn.Module):
                 self.model.train(was_training)
             bucket_logits = bucket_output["logits"]
             bucket_logits.div_(temperature)
+            if enable_score_centering:
+                bucket_head_logprobs, bucket_sampler_logprobs = _score_centering_support_head_logprobs(
+                    bucket_logits,
+                    bucket_score_row_ids,
+                    sample_support,
+                    sample_support_logprobs,
+                )
             bucket_log_probs = logprobs_from_logits(
                 bucket_logits,
                 bucket_labels,
@@ -382,6 +452,39 @@ class HFModelWrapper(nn.Module):
             if log_probs is None:
                 log_probs = bucket_log_probs.new_zeros((batch_size, padded_length))
             log_probs = log_probs.index_copy(0, bucket_indices, bucket_log_probs)
+
+            if enable_score_centering:
+                bucket_head_logprobs = torch.stack(
+                    [
+                        nn.functional.pad(
+                            row[: int(length.item())],
+                            (0, 0, padded_length - int(length.item()), 0),
+                        )
+                        for row, length in zip(bucket_head_logprobs, bucket_lengths, strict=True)
+                    ]
+                )
+                bucket_sampler_logprobs = torch.stack(
+                    [
+                        nn.functional.pad(
+                            row[: int(length.item())],
+                            (0, 0, padded_length - int(length.item()), 0),
+                        )
+                        for row, length in zip(bucket_sampler_logprobs, bucket_lengths, strict=True)
+                    ]
+                )
+                if score_centering_train_logprobs is None:
+                    score_centering_train_logprobs = bucket_head_logprobs.new_zeros(
+                        (batch_size, padded_length, bucket_head_logprobs.shape[-1])
+                    )
+                    score_centering_sampler_logprobs = bucket_sampler_logprobs.new_zeros(
+                        (batch_size, padded_length, bucket_sampler_logprobs.shape[-1])
+                    )
+                score_centering_train_logprobs = score_centering_train_logprobs.index_copy(
+                    0, bucket_indices, bucket_head_logprobs
+                )
+                score_centering_sampler_logprobs = score_centering_sampler_logprobs.index_copy(
+                    0, bucket_indices, bucket_sampler_logprobs
+                )
 
             if compute_entropy:
                 bucket_entropy = self.chunked_entropy_from_logits_fn(
@@ -409,6 +512,9 @@ class HFModelWrapper(nn.Module):
                 num_actions = num_actions[0]
             else:
                 num_actions = np.array(num_actions)
+        if enable_score_centering:
+            output["score_centering_train_logprobs"] = score_centering_train_logprobs[:, -num_actions - 1 : -1]
+            output["score_centering_sampler_logprobs"] = score_centering_sampler_logprobs[:, -num_actions - 1 : -1]
         action_log_probs = log_probs[:, -num_actions - 1 : -1]
 
         if return_output:
@@ -428,8 +534,10 @@ class HFModelWrapper(nn.Module):
         image_grid_thw: Optional[TensorList] = None,
         mm_token_type_ids: Optional[torch.Tensor] = None,
         sample_support: Optional[PackedTensor] = None,
+        sample_support_logprobs: Optional[PackedTensor] = None,
         loss_mask: Optional[torch.Tensor] = None,
         enable_sample_support_replay: bool = False,
+        enable_score_centering: bool = False,
     ) -> torch.Tensor:
         """Returns action log probs"""
         if self.is_rwkv:
@@ -441,15 +549,20 @@ class HFModelWrapper(nn.Module):
                 return_output,
                 compute_entropy,
                 entropy_requires_grad,
+                sample_support=sample_support,
+                sample_support_logprobs=sample_support_logprobs,
+                enable_score_centering=enable_score_centering,
             )
 
         has_image_inputs = pixel_values is not None or image_grid_thw is not None
         support_channels = None
-        if enable_sample_support_replay:
+        if enable_sample_support_replay or enable_score_centering:
             if sample_support is None:
                 raise ValueError(missing_sample_support_message("FSDP"))
             if loss_mask is None:
-                raise ValueError("sample-support replay is enabled but the microbatch has no loss mask")
+                raise ValueError("sample-support scoring requires the microbatch loss mask; received no loss mask")
+            if enable_score_centering and sample_support_logprobs is None:
+                raise ValueError("score centering requires sampler support logprobs")
             support_channels = _SampleSupportChannels.build(sequences, attention_mask, sample_support, loss_mask)
         if self.is_vlm:
             # VLMs use model specific 3D positional IDs, meaning sequence packing can not be supported.
@@ -539,8 +652,18 @@ class HFModelWrapper(nn.Module):
         logits_BSV = output["logits"]
         logits_BSV.div_(temperature)
 
+        score_centering_train_logprobs = None
+        score_centering_sampler_logprobs = None
+        if support_channels is not None and enable_score_centering:
+            score_centering_train_logprobs, score_centering_sampler_logprobs = _score_centering_support_head_logprobs(
+                logits_BSV,
+                support_channels.row_ids,
+                sample_support,
+                sample_support_logprobs,
+            )
+
         support_entropy = None
-        if support_channels is not None:
+        if support_channels is not None and enable_sample_support_replay:
             # FSDP supplies unsharded, temperature-scaled logits.
             support_scores = score_aligned_sample_support(
                 logits_BSV,
@@ -571,15 +694,22 @@ class HFModelWrapper(nn.Module):
         def to_canonical_batch_positions(values: torch.Tensor) -> torch.Tensor:
             """Undo the Ulysses slice and microbatch unpadding."""
             if self.sequence_parallel_size > 1:
-                dim = values.ndim - 1
-                values = gather_outputs_and_unpad(values, gather_dim=dim, unpad_dim=dim, padding_size=pad_size)
+                # The sequence axis remains dimension 1 for both [batch, seq]
+                # and [batch, seq, top_k] support channels.
+                values = gather_outputs_and_unpad(values, gather_dim=1, unpad_dim=1, padding_size=pad_size)
             if self.remove_microbatch_padding:
-                values = pad_input(
-                    values.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen
-                ).squeeze(-1)
+                values = pad_input(values.transpose(0, 1), indices=nnz_indices, batch=batch_size, seqlen=seqlen)
+                # The model channels are [1, nnz, ...]; pad_input returns
+                # [batch, seqlen, 1, ...], where the singleton is only the
+                # original batch axis.
+                if values.shape[2] == 1:
+                    values = values.squeeze(2)
             return values
 
         log_probs = to_canonical_batch_positions(log_probs)
+        if enable_score_centering:
+            score_centering_train_logprobs = to_canonical_batch_positions(score_centering_train_logprobs)
+            score_centering_sampler_logprobs = to_canonical_batch_positions(score_centering_sampler_logprobs)
 
         if compute_entropy:
             if support_entropy is not None:
@@ -601,6 +731,9 @@ class HFModelWrapper(nn.Module):
             else:
                 num_actions = np.array(num_actions)
         action_log_probs = log_probs[:, -num_actions - 1 : -1]
+        if enable_score_centering:
+            output["score_centering_train_logprobs"] = score_centering_train_logprobs[:, -num_actions - 1 : -1]
+            output["score_centering_sampler_logprobs"] = score_centering_sampler_logprobs[:, -num_actions - 1 : -1]
 
         if return_output:
             return (action_log_probs, output)

@@ -11,6 +11,14 @@ from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
     refresh_rwkv_runtime_weights,
 )
 from skyrl.backends.skyrl_train.utils import torch_utils as torch_utils_module
+from skyrl.backends.skyrl_train.utils.packed_tensor import (
+    PackedTensor,
+    cu_seqlens_from_lengths,
+)
+from skyrl.backends.skyrl_train.utils.sample_support import (
+    SAMPLE_SUPPORT_LOGPROBS_TORCH_DTYPE,
+    SAMPLE_SUPPORT_TORCH_DTYPE,
+)
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
 from skyrl.backends.skyrl_train.workers import model_wrapper as model_wrapper_module
 from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
@@ -170,6 +178,105 @@ def test_rwkv_ragged_batch_restores_padding_and_entropy_positions():
     assert action_log_probs.shape == (3, 2)
     assert output["entropy"].shape == sequences.shape
     assert torch.equal(output["entropy"][1, :2], torch.zeros(2))
+
+
+def test_rwkv_score_centering_returns_aligned_support_heads():
+    model = ToyCausalLM()
+    wrapper = HFModelWrapper(model)
+    sequences = torch.tensor([[1, 2, 3, 4]])
+    support = PackedTensor(
+        torch.tensor([[2, 7], [3, 8]], dtype=SAMPLE_SUPPORT_TORCH_DTYPE),
+        cu_seqlens_from_lengths([2]),
+    )
+    support_logprobs = PackedTensor(
+        torch.tensor([[-0.2, -1.5], [-0.3, -1.4]], dtype=SAMPLE_SUPPORT_LOGPROBS_TORCH_DTYPE),
+        cu_seqlens_from_lengths([2]),
+    )
+
+    action_log_probs, output = wrapper(
+        sequences,
+        num_actions=2,
+        attention_mask=torch.ones_like(sequences),
+        sample_support=support,
+        sample_support_logprobs=support_logprobs,
+        loss_mask=torch.ones(1, 2, dtype=torch.bool),
+        enable_score_centering=True,
+        return_output=True,
+    )
+
+    assert action_log_probs.shape == (1, 2)
+    assert output["score_centering_train_logprobs"].shape == (1, 2, 2)
+    assert output["score_centering_sampler_logprobs"].shape == (1, 2, 2)
+    assert torch.isfinite(output["score_centering_train_logprobs"]).all()
+
+
+@pytest.mark.parametrize("distributed", [False, True])
+def test_rwkv_score_centering_ragged_batch_preserves_token_and_support_axes(monkeypatch, distributed):
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: distributed)
+    model = ToyCausalLM()
+    wrapper = HFModelWrapper(model)
+    sequences = torch.tensor([[0, 0, 1, 2, 3], [4, 5, 6, 7, 8]])
+    attention_mask = torch.tensor([[0, 0, 1, 1, 1], [1, 1, 1, 1, 1]])
+    support = PackedTensor(
+        torch.tensor([[3, 9], [7, 10], [8, 11]], dtype=SAMPLE_SUPPORT_TORCH_DTYPE),
+        cu_seqlens_from_lengths([1, 2]),
+    )
+    support_logprobs = PackedTensor(
+        torch.tensor([[-0.2, -1.5], [-0.3, -1.4], [-0.4, -1.3]], dtype=SAMPLE_SUPPORT_LOGPROBS_TORCH_DTYPE),
+        support.cu_seqlens,
+    )
+
+    action_log_probs, output = wrapper(
+        sequences,
+        num_actions=2,
+        attention_mask=attention_mask,
+        sample_support=support,
+        sample_support_logprobs=support_logprobs,
+        loss_mask=torch.tensor([[0, 1], [1, 1]], dtype=torch.bool),
+        enable_score_centering=True,
+        return_output=True,
+    )
+
+    trainer_head = output["score_centering_train_logprobs"]
+    sampler_head = output["score_centering_sampler_logprobs"]
+    assert trainer_head.shape == sampler_head.shape == (2, 2, 2)
+    assert torch.isneginf(trainer_head[0, 0]).all()
+    assert torch.isneginf(sampler_head[0, 0]).all()
+    for row, length in enumerate([1, 2]):
+        real_sequence = sequences[row, attention_mask[row].bool()].unsqueeze(0)
+        logprobs = model(real_sequence)["logits"].float().log_softmax(-1)[0, -length - 1 : -1]
+        expected = logprobs.gather(-1, support.segment(row).long())
+        torch.testing.assert_close(trainer_head[row, -length:], expected)
+        torch.testing.assert_close(sampler_head[row, -length:], support_logprobs.segment(row))
+    (action_log_probs.sum() + trainer_head[torch.isfinite(trainer_head)].sum()).backward()
+    assert torch.isfinite(model.lm_head.weight.grad).all()
+
+
+def test_rwkv_score_centering_ignores_padding_support_rows():
+    model = ToyCausalLM()
+    wrapper = HFModelWrapper(model)
+    support = PackedTensor(
+        torch.empty((0, 2), dtype=SAMPLE_SUPPORT_TORCH_DTYPE),
+        cu_seqlens_from_lengths([0]),
+    )
+    support_logprobs = PackedTensor(
+        torch.empty((0, 2), dtype=SAMPLE_SUPPORT_LOGPROBS_TORCH_DTYPE),
+        cu_seqlens_from_lengths([0]),
+    )
+
+    _, output = wrapper(
+        torch.tensor([[1, 2, 3, 4]]),
+        num_actions=2,
+        attention_mask=torch.ones(1, 4, dtype=torch.bool),
+        sample_support=support,
+        sample_support_logprobs=support_logprobs,
+        loss_mask=torch.ones(1, 2, dtype=torch.bool),
+        enable_score_centering=True,
+        return_output=True,
+    )
+
+    assert torch.isneginf(output["score_centering_train_logprobs"]).all()
+    assert torch.isneginf(output["score_centering_sampler_logprobs"]).all()
 
 
 def test_rwkv_recurrent_forward_preserves_gradients():

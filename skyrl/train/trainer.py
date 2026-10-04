@@ -47,6 +47,7 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
 )
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_FIELD,
+    SAMPLE_SUPPORT_LOGPROBS_FIELD,
     SAMPLE_SUPPORT_PADDING,
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
@@ -57,6 +58,7 @@ from skyrl.env_vars import SKYRL_RAY_PG_TIMEOUT_IN_S
 from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.dataset import PromptDataset
 from skyrl.train.dataset.preprocess import (
+    build_sample_support_logprobs,
     compute_prompt_boundaries,
     compute_prompt_mini_batch_boundaries,
     convert_prompts_responses_to_batch_tensors,
@@ -935,6 +937,7 @@ class RayPPOTrainer:
         logprobs: Optional[List[List[float]]] = generator_output.get("rollout_logprobs", None)
         rollout_expert_indices = generator_output.get("rollout_expert_indices", None)
         rollout_sample_support = generator_output.get("rollout_sample_support", None)
+        rollout_sample_support_logprobs = generator_output.get(SAMPLE_SUPPORT_LOGPROBS_FIELD, None)
 
         pixel_values = generator_output.get("pixel_values", None)
         image_grid_thw = generator_output.get("image_grid_thw", None)
@@ -969,6 +972,15 @@ class RayPPOTrainer:
             rollout_sample_support,
             max_seq_len=self.cfg.trainer.algorithm.max_seq_len,
         )
+        rollout_sample_support_logprobs_tensor = None
+        if rollout_sample_support_logprobs is not None:
+            if rollout_sample_support is None:
+                raise ValueError(f"{SAMPLE_SUPPORT_LOGPROBS_FIELD} requires {SAMPLE_SUPPORT_FIELD} IDs")
+            rollout_sample_support_logprobs_tensor = build_sample_support_logprobs(
+                rollout_sample_support_logprobs,
+                np.asarray([len(response) for response in response_ids], dtype=np.int64),
+            )
+
         router_padding_mask = None
         if rollout_expert_indices is not None:
             router_padding_mask = make_router_padding_mask(
@@ -998,6 +1010,7 @@ class RayPPOTrainer:
                 "rollout_expert_indices": rollout_expert_indices_tensor,
                 "router_padding_mask": router_padding_mask,
                 SAMPLE_SUPPORT_FIELD: rollout_sample_support_tensor,
+                SAMPLE_SUPPORT_LOGPROBS_FIELD: rollout_sample_support_logprobs_tensor,
                 "pixel_values": pixel_values,
                 "image_grid_thw": image_grid_thw,
             },

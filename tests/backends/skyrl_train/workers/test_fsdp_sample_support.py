@@ -11,6 +11,7 @@ from skyrl.backends.skyrl_train.utils.packed_tensor import (
 )
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_FIELD,
+    SAMPLE_SUPPORT_LOGPROBS_TORCH_DTYPE,
     SAMPLE_SUPPORT_NO_ROW,
     SAMPLE_SUPPORT_PADDING,
     SAMPLE_SUPPORT_TORCH_DTYPE,
@@ -235,6 +236,39 @@ def test_entropy_carries_gradients_only_when_asked(entropy_requires_grad):
     reference_table = model.table.detach().clone().requires_grad_(True)
     _reference_entropy(reference_table, sequences, support, 2).sum().backward()
     torch.testing.assert_close(model.table.grad, reference_table.grad)
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_score_centering_returns_full_trainer_support_heads(packed):
+    sequences = torch.tensor([[1, 2, 3, 4]])
+    support = _support([[[3, 8], [4, 0]]])
+    support_logprobs = PackedTensor(
+        torch.log(torch.tensor([[0.45, 0.25], [0.4, 0.3]], dtype=torch.float64)).to(
+            dtype=SAMPLE_SUPPORT_LOGPROBS_TORCH_DTYPE
+        ),
+        cu_seqlens_from_lengths([2]),
+    )
+    model = _TokenIndexedLM()
+    wrapper = _wrapper(model, packed=packed)
+
+    action_log_probs, output = wrapper(
+        sequences,
+        2,
+        attention_mask=torch.ones_like(sequences),
+        sample_support=support,
+        sample_support_logprobs=support_logprobs,
+        loss_mask=_loss_mask([2], 2),
+        enable_score_centering=True,
+        return_output=True,
+    )
+
+    assert action_log_probs.shape == (1, 2)
+    assert output["score_centering_train_logprobs"].shape == (1, 2, 2)
+    assert output["score_centering_sampler_logprobs"].shape == (1, 2, 2)
+    assert output["score_centering_train_logprobs"].requires_grad
+    output["score_centering_train_logprobs"].sum().backward()
+    assert model.table.grad is not None
+    assert torch.isfinite(model.table.grad).all()
 
 
 def test_replay_never_scores_every_position_over_the_full_vocabulary(monkeypatch):

@@ -33,6 +33,7 @@ def test_generator_output_concatenation():
         "rollout_logprobs",
         "rollout_expert_indices",
         "rollout_sample_support",
+        "rollout_sample_support_logprobs",
         # optional but present in the signature
         "trajectory_ids",
         "trajectory_generation_times",

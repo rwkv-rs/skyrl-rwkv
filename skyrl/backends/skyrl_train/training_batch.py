@@ -19,6 +19,7 @@ from skyrl.backends.skyrl_train.utils.packed_tensor import (
 from skyrl.backends.skyrl_train.utils.replay_utils import replay_padding_row
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_FIELD,
+    SAMPLE_SUPPORT_LOGPROBS_FIELD,
     SAMPLE_SUPPORT_PADDING,
 )
 
@@ -171,7 +172,9 @@ class TensorBatch(dict, Generic[DictType]):
     metadata: Optional[Dict[str, Any]] = None
 
     # These fields may be backed by read-only shared memory after deserialization.
-    ZERO_COPY_KEYS: frozenset[str] = frozenset({"rollout_expert_indices", SAMPLE_SUPPORT_FIELD})
+    ZERO_COPY_KEYS: frozenset[str] = frozenset(
+        {"rollout_expert_indices", SAMPLE_SUPPORT_FIELD, SAMPLE_SUPPORT_LOGPROBS_FIELD}
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -542,6 +545,8 @@ class TrainingInput(TypedDict, total=False):
     router_padding_mask: Optional[Bool[torch.Tensor, "batch_size seq_len"]]  # True = no captured route (skip in replay)
     # Sampler support, packed to RESPONSE tokens: values [sum(response_len_i), top_k] + cu_seqlens
     rollout_sample_support: Optional[PackedTensor]
+    # Sampler top-k logprobs, packed with the same row layout as rollout_sample_support.
+    rollout_sample_support_logprobs: Optional[PackedTensor]
     pixel_values: Optional[TensorList]  # list of `batch_size` [num_patches_i, dim] tensors
     image_grid_thw: Optional[TensorList]  # list of `batch_size` [num_images_i, 3] tensors
 
@@ -578,6 +583,10 @@ PACKED_FIELD_PADDING: Dict[str, PackedFieldPadding] = {
     ),
     SAMPLE_SUPPORT_FIELD: PackedFieldPadding(
         fill=lambda field: SAMPLE_SUPPORT_PADDING,
+        dummy_row_length=0,
+    ),
+    SAMPLE_SUPPORT_LOGPROBS_FIELD: PackedFieldPadding(
+        fill=lambda field: 0.0,
         dummy_row_length=0,
     ),
 }

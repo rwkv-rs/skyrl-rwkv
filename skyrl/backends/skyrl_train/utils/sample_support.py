@@ -17,11 +17,21 @@ from skyrl.backends.skyrl_train.distributed.megatron.token_metadata import (
 from skyrl.backends.skyrl_train.utils.packed_tensor import PackedTensor
 
 SampleSupport: TypeAlias = np.ndarray
+SampleSupportLogprobs: TypeAlias = np.ndarray
 SAMPLE_SUPPORT_DTYPE = np.dtype(np.int32)
 SAMPLE_SUPPORT_TORCH_DTYPE = torch.int32
 SAMPLE_SUPPORT_DTYPES = frozenset({SAMPLE_SUPPORT_DTYPE})
 SAMPLE_SUPPORT_PADDING = -1
 SAMPLE_SUPPORT_FIELD = "rollout_sample_support"
+
+# Score-Centering keeps the sampler's unrenormalized top-k logprobs in a separate
+# side channel.  The ID channel above remains available for sample-support replay.
+SAMPLE_SUPPORT_LOGPROBS_DTYPE = np.dtype(np.float32)
+SAMPLE_SUPPORT_LOGPROBS_TORCH_DTYPE = torch.float32
+SAMPLE_SUPPORT_LOGPROBS_DTYPES = frozenset({SAMPLE_SUPPORT_LOGPROBS_DTYPE})
+SAMPLE_SUPPORT_LOGPROBS_PADDING = 0.0
+SAMPLE_SUPPORT_LOGPROBS_FIELD = "rollout_sample_support_logprobs"
+
 # Sentinel outside the valid packed-row range.
 SAMPLE_SUPPORT_NO_ROW = -1
 
@@ -40,6 +50,20 @@ def validate_sample_support(sample_support: SampleSupport) -> SampleSupport:
     if np.any((sample_support[:, :-1] == SAMPLE_SUPPORT_PADDING) & (sample_support[:, 1:] >= 0)):
         raise ValueError(f"sample support padding must be trailing {SAMPLE_SUPPORT_PADDING} values")
     return sample_support
+
+
+def validate_sample_support_logprobs(sample_support_logprobs: SampleSupportLogprobs) -> SampleSupportLogprobs:
+    """Validate sampler top-k logprobs, including finite trailing padding."""
+    if not isinstance(sample_support_logprobs, np.ndarray):
+        raise TypeError("sample-support logprobs must be a NumPy array")
+    if sample_support_logprobs.ndim != 2 or not np.issubdtype(sample_support_logprobs.dtype, np.floating):
+        raise ValueError(
+            "sample-support logprobs must be a floating [tokens, top_k] array, "
+            f"got shape {sample_support_logprobs.shape} and dtype {sample_support_logprobs.dtype}"
+        )
+    if not np.isfinite(sample_support_logprobs).all():
+        raise ValueError("sample-support logprobs must be finite; use zero for trailing padding")
+    return sample_support_logprobs
 
 
 def align_sample_support_row_ids(
@@ -104,6 +128,32 @@ class SampleSupportTrace:
         if self.num_rows != token_count + extra_rows:
             raise ValueError(
                 f"sample-support trace has {self.num_rows} rows for {token_count} tokens plus "
+                f"{extra_rows} trailing rows"
+            )
+        return self._metadata.finalize(expected_rows=self.num_rows)[:token_count]
+
+
+class SampleSupportLogprobsTrace:
+    """Accumulate sampler top-k logprobs alongside :class:`SampleSupportTrace`."""
+
+    def __init__(self) -> None:
+        self._metadata = TokenMetadataTrace()
+
+    @property
+    def num_rows(self) -> int:
+        return self._metadata.num_rows
+
+    def append(self, sample_support_logprobs: SampleSupportLogprobs, *, expected_rows: int) -> None:
+        self._metadata.append(validate_sample_support_logprobs(sample_support_logprobs), expected_rows=expected_rows)
+
+    def append_padding(self, count: int) -> None:
+        self._metadata.append_padding(count, fill=SAMPLE_SUPPORT_LOGPROBS_PADDING)
+
+    def finalize(self, *, token_count: int, extra_rows: int) -> SampleSupportLogprobs:
+        """Validate the trace length and discard ``extra_rows`` trailing rows."""
+        if self.num_rows != token_count + extra_rows:
+            raise ValueError(
+                f"sample-support logprob trace has {self.num_rows} rows for {token_count} tokens plus "
                 f"{extra_rows} trailing rows"
             )
         return self._metadata.finalize(expected_rows=self.num_rows)[:token_count]

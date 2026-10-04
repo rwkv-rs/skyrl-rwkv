@@ -10,6 +10,8 @@ import pytest
 
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_DTYPE,
+    SAMPLE_SUPPORT_LOGPROBS_DTYPE,
+    SAMPLE_SUPPORT_LOGPROBS_PADDING,
     SAMPLE_SUPPORT_PADDING,
     SampleSupportTrace,
 )
@@ -479,6 +481,10 @@ async def test_agent_loop_uses_incremental_replay_metadata_traces(
             # trace must widen the first turn's compacted rows.
             routes[0, 0, 0] = 300
         sample_support = np.array([[10, 100 + generation_index], [11, 110 + generation_index]], dtype=np.int32)
+        sample_support_logprobs = np.array(
+            [[-0.1, -1.0 - generation_index], [-0.2, -1.1 - generation_index]],
+            dtype=SAMPLE_SUPPORT_LOGPROBS_DTYPE,
+        )
         generation_index += 1
         return {
             "responses": ["mocked output"],
@@ -486,6 +492,7 @@ async def test_agent_loop_uses_incremental_replay_metadata_traces(
             "stop_reasons": ["stop"],
             "rollout_expert_indices": [routes],
             "rollout_sample_support": [sample_support],
+            "rollout_sample_support_logprobs": [sample_support_logprobs],
         }
 
     mock_llm.generate = AsyncMock(side_effect=generate)
@@ -514,6 +521,11 @@ async def test_agent_loop_uses_incremental_replay_metadata_traces(
     np.testing.assert_array_equal(support[:2], np.array([[10, 100], [11, 110]], dtype=SAMPLE_SUPPORT_DTYPE))
     np.testing.assert_array_equal(support[-2:], np.array([[10, 101], [11, 111]], dtype=SAMPLE_SUPPORT_DTYPE))
     assert np.all(support[2:-2] == SAMPLE_SUPPORT_PADDING)
+    support_logprobs = output.rollout_sample_support_logprobs
+    assert support_logprobs.dtype == SAMPLE_SUPPORT_LOGPROBS_DTYPE
+    np.testing.assert_array_equal(support_logprobs[:2], np.array([[-0.1, -1.0], [-0.2, -1.1]], dtype=np.float32))
+    np.testing.assert_array_equal(support_logprobs[-2:], np.array([[-0.1, -2.0], [-0.2, -2.1]], dtype=np.float32))
+    assert np.all(support_logprobs[2:-2] == SAMPLE_SUPPORT_LOGPROBS_PADDING)
 
 
 @pytest.mark.asyncio

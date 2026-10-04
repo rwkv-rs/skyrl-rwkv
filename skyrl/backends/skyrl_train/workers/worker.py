@@ -1137,9 +1137,17 @@ class PolicyWorkerBase(Worker):
                 entropy_requires_grad=self.cfg.algorithm.use_entropy_loss,
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
-                sample_support=experience.rollout_sample_support if sample_support_replay else None,
-                loss_mask=loss_mask if sample_support_replay else None,
+                sample_support=(
+                    experience.rollout_sample_support
+                    if (sample_support_replay or loss_config.flashreinforce.score_centering)
+                    else None
+                ),
+                sample_support_logprobs=(
+                    experience.rollout_sample_support_logprobs if loss_config.flashreinforce.score_centering else None
+                ),
+                loss_mask=loss_mask if (sample_support_replay or loss_config.flashreinforce.score_centering) else None,
                 enable_sample_support_replay=sample_support_replay,
+                enable_score_centering=loss_config.flashreinforce.score_centering,
             )
             # loss function
             # TODO: recompute advantages
@@ -1148,9 +1156,10 @@ class PolicyWorkerBase(Worker):
                 "rollout_logprobs": rollout_action_logprobs,
             }
             if resolved_loss_name in ("flashreinforce", "flash_reinforce"):
-                policy_loss_kwargs["real_rows"] = (
-                    loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
-                )
+                policy_loss_kwargs["real_rows"] = loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
+                if loss_config.flashreinforce.score_centering:
+                    policy_loss_kwargs["score_centering_train_logprobs"] = output["score_centering_train_logprobs"]
+                    policy_loss_kwargs["score_centering_sampler_logprobs"] = output["score_centering_sampler_logprobs"]
             policy_loss, loss_metrics = current_loss_fn(
                 action_log_probs,
                 old_action_log_probs,
@@ -1413,7 +1422,7 @@ class PolicyWorkerBase(Worker):
             loss_config = type(loss_config).from_dict_config(new_loss_config)
 
         with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
-            action_log_probs, _ = self.model(
+            action_log_probs, output = self.model(
                 sequences,
                 num_actions,
                 attention_mask=attention_mask,
@@ -1423,18 +1432,27 @@ class PolicyWorkerBase(Worker):
                 entropy_requires_grad=False,
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
-                sample_support=experience.rollout_sample_support if sample_support_replay else None,
-                loss_mask=loss_mask if sample_support_replay else None,
+                sample_support=(
+                    experience.rollout_sample_support
+                    if (sample_support_replay or loss_config.flashreinforce.score_centering)
+                    else None
+                ),
+                sample_support_logprobs=(
+                    experience.rollout_sample_support_logprobs if loss_config.flashreinforce.score_centering else None
+                ),
+                loss_mask=loss_mask if (sample_support_replay or loss_config.flashreinforce.score_centering) else None,
                 enable_sample_support_replay=sample_support_replay,
+                enable_score_centering=loss_config.flashreinforce.score_centering,
             )
             policy_loss_kwargs = {
                 "loss_mask": loss_mask,
                 "rollout_logprobs": rollout_action_logprobs,
             }
             if loss_fn in ("flashreinforce", "flash_reinforce"):
-                policy_loss_kwargs["real_rows"] = (
-                    loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
-                )
+                policy_loss_kwargs["real_rows"] = loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
+                if loss_config.flashreinforce.score_centering:
+                    policy_loss_kwargs["score_centering_train_logprobs"] = output["score_centering_train_logprobs"]
+                    policy_loss_kwargs["score_centering_sampler_logprobs"] = output["score_centering_sampler_logprobs"]
             policy_loss, _ = current_loss_fn(
                 action_log_probs,
                 old_action_log_probs,

@@ -17,10 +17,12 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     build_logprobs_content,
     decode_packed_routed_experts,
     decode_packed_sample_support,
+    decode_packed_sample_support_logprobs,
     load_packed_body,
     pack_ndarray,
     pack_routed_experts,
     pack_sample_support,
+    pack_sample_support_logprobs,
     unpack_ndarray,
 )
 
@@ -212,6 +214,18 @@ def test_packed_sample_support_round_trip():
     assert decoded.dtype == np.int32
     assert decoded.flags.c_contiguous
     assert np.array_equal(decoded, support)
+
+
+def test_packed_sample_support_logprobs_round_trip():
+    support_logprobs = np.array([[-0.1, -1.2, 0.0], [-0.3, 0.0, 0.0]], dtype=np.float32)
+
+    decoded = decode_packed_sample_support_logprobs(
+        orjson.loads(orjson.dumps(pack_sample_support_logprobs(support_logprobs)))
+    )
+
+    assert decoded.dtype == np.float32
+    assert decoded.flags.c_contiguous
+    assert np.array_equal(decoded, support_logprobs)
 
 
 # Shape, base64, byte-size and dtype allow-listing are covered generically by the

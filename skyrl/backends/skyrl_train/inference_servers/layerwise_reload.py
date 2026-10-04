@@ -70,7 +70,16 @@ def load_rwkv_checkpoint_weights(
     def iter_regular_weights():
         for name, weight in weights:
             if name.endswith(".mlp.value.weight"):
-                model.get_parameter(name).copy_(weight.T)
+                target = model.get_parameter(name)
+                if tuple(target.shape) == tuple(weight.T.shape):
+                    target.copy_(weight.T)
+                elif tuple(target.shape) == tuple(weight.shape):
+                    target.copy_(weight)
+                else:
+                    raise ValueError(
+                        f"RWKV value weight shape mismatch for {name!r}: "
+                        f"target={tuple(target.shape)}, source={tuple(weight.shape)}"
+                    )
                 _log_rwkv_debug_weight(model, name, weight)
                 loaded.add(name)
             else:

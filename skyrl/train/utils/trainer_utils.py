@@ -369,6 +369,7 @@ def dump_train_results(
     generator_input: GeneratorInput,
     generator_output: GeneratorOutput,
     global_step: int,
+    trajectory_metadata: Optional[Dict[str, Any]] = None,
 ):
     """Write raw training rollouts with the corresponding environment metadata."""
     dump_dir_path.mkdir(parents=True, exist_ok=True)
@@ -397,12 +398,17 @@ def dump_train_results(
                 "trajectory_id": trajectory_id.to_string(),
                 "input_prompt": prompt,
                 "rendered_input_prompt": tokenizer.decode(generator_output["prompt_token_ids"][index]),
+                "prompt_token_ids": generator_output["prompt_token_ids"][index],
                 "output_response": response,
+                "response_token_ids": response_ids,
+                "rollout_logprobs": (generator_output.get("rollout_logprobs") or [None] * len(trajectory_ids))[index],
                 "score": generator_output["rewards"][index],
                 "stop_reason": stop_reason,
                 "env_class": env_class,
                 "env_extras": env_extra,
             }
+            if trajectory_metadata is not None:
+                entry.update(trajectory_metadata)
             entry.update(_trajectory_debug_fields(tokenizer, response_ids, loss_mask, stop_reason))
             if env_class == "gsm8k":
                 from skyrl_gym.envs.gsm8k.utils import extract_solution

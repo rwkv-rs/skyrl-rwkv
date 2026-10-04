@@ -479,6 +479,14 @@ class VLLMServerActor(ServerActorProtocol):
                 """Identify the Ray frontend exporting this server's engine metrics."""
                 return Response(content=orjson.dumps(metrics_info), media_type="application/json")
 
+        # vLLM's dev-mode app already installs a route with this path. Remove it
+        # before registering SkyRL's body-based retrying route; otherwise FastAPI
+        # dispatches the first route and the reset_running_requests JSON field is
+        # silently ignored by vLLM's query-parameter handler.
+        app.router.routes[:] = [
+            route for route in app.router.routes if getattr(route, "path", None) != "/reset_prefix_cache"
+        ]
+
         @app.post("/reset_prefix_cache")
         async def _reset_prefix_cache(request: Request):
             """Reset the prefix cache, optionally resetting in-flight requests too."""
@@ -490,9 +498,7 @@ class VLLMServerActor(ServerActorProtocol):
             reset_attempts = 0
             while True:
                 try:
-                    reset_succeeded = await engine.reset_prefix_cache(
-                        reset_running_requests=reset_running_requests
-                    )
+                    reset_succeeded = await engine.reset_prefix_cache(reset_running_requests=reset_running_requests)
                 except (RuntimeError, ValueError) as exc:
                     # Some vLLM revisions raise instead of returning False when
                     # preempted requests still own blocks. Treat that transient

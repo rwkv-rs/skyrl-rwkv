@@ -72,6 +72,13 @@ class GeneratedOutputGroup:
             finish generation, i.e. the time for the slowest trajectory in the group to complete.
             None if generation timing was not captured.
 
+        generation_started_at_s (Optional[float]): Wall-clock start timestamp for generation.
+        generation_completed_at_s (Optional[float]): Wall-clock completion timestamp for generation.
+        generation_weight_version_at_start (Optional[int]): Client-observed weight version at generation start.
+        generation_weight_version_at_completion (Optional[int]): Client-observed weight version at completion.
+        generation_completion_order (Optional[int]): Monotonic order in which groups completed generation.
+        generation_consumption_order (Optional[int]): Monotonic order in which groups left the buffer.
+
         prompts (Optional[List[Any]]): The generator input prompts (in OpenAI message format) for this
             group, one per trajectory (parallel to ``generator_output["response_ids"]``). Retained so
             the trajectory logger can render prompt + response, mirroring the synchronous trainer which
@@ -85,6 +92,12 @@ class GeneratedOutputGroup:
     uid: str
     global_step_when_scheduled: int
     group_completion_time_s: Optional[float] = None
+    generation_started_at_s: Optional[float] = None
+    generation_completed_at_s: Optional[float] = None
+    generation_weight_version_at_start: Optional[int] = None
+    generation_weight_version_at_completion: Optional[int] = None
+    generation_completion_order: Optional[int] = None
+    generation_consumption_order: Optional[int] = None
     prompts: Optional[List[Any]] = None
     generator_input: Optional[GeneratorInput] = None
 
@@ -418,6 +431,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             mini_batch_size=self.mini_batch_size,
             max_staleness_steps=self.max_staleness_steps,
         )
+        self._generation_completion_order = 0
+        self._generation_consumption_order = 0
 
     def add_callback(self, callback):
         raise NotImplementedError("Callbacks are not yet supported by FullyAsyncRayPPOTrainer. ")
@@ -860,6 +875,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 if group is None:
                     epoch_exhausted = True
                     break
+                self._generation_consumption_order += 1
+                group.generation_consumption_order = self._generation_consumption_order
                 try:
                     if self._should_keep_group(group):
                         kept_groups.append(group)
@@ -961,6 +978,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
                 # 3. Generate one rollout group
                 global_step_at_start = self.global_step  # for staleness control
+                generation_started_at_s = time.time()
+                generation_weight_version_at_start = getattr(self.inference_engine_client, "weight_version", None)
 
                 group_start_time = time.monotonic()
                 if "disable_tqdm" in inspect.signature(self.generator.generate).parameters:
@@ -972,6 +991,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 else:
                     cur_generator_output: GeneratorOutput = await self.generator.generate(generator_input)
                 group_completion_time_s = time.monotonic() - group_start_time
+                generation_completed_at_s = time.time()
+                generation_weight_version_at_completion = getattr(self.inference_engine_client, "weight_version", None)
+                self._generation_completion_order += 1
 
                 # 4. Enqueue the completed group and mark accepted to free capacity slot.
                 try:
@@ -981,6 +1003,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             uid=uids[0],
                             global_step_when_scheduled=global_step_at_start,
                             group_completion_time_s=group_completion_time_s,
+                            generation_started_at_s=generation_started_at_s,
+                            generation_completed_at_s=generation_completed_at_s,
+                            generation_weight_version_at_start=generation_weight_version_at_start,
+                            generation_weight_version_at_completion=generation_weight_version_at_completion,
+                            generation_completion_order=self._generation_completion_order,
                             prompts=generator_input["prompts"],
                             generator_input=generator_input,
                         )
@@ -1041,6 +1068,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         group_completion_times: List[float] = []
         intra_group_stds: List[float] = []
         intra_group_cvs: List[float] = []
+        consumed_at_s = time.time()
         for cur_generated_output_group in cur_generation_group_mini_batch:
             cur_staleness = self.global_step - cur_generated_output_group.global_step_when_scheduled
             stalenesses.append(cur_staleness)
@@ -1086,6 +1114,18 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             group.generator_input,
                             group.generator_output,
                             self.global_step,
+                            trajectory_metadata={
+                                "generation_step_when_scheduled": group.global_step_when_scheduled,
+                                "consumed_global_step": self.global_step,
+                                "generation_started_at_s": group.generation_started_at_s,
+                                "generation_completed_at_s": group.generation_completed_at_s,
+                                "consumed_at_s": consumed_at_s,
+                                "generation_weight_version_at_start": group.generation_weight_version_at_start,
+                                "generation_weight_version_at_completion": group.generation_weight_version_at_completion,
+                                "generation_completion_order": group.generation_completion_order,
+                                "generation_consumption_order": group.generation_consumption_order,
+                                "generation_completion_time_s": group.group_completion_time_s,
+                            },
                         )
 
         generator_output = concatenate_generator_outputs(

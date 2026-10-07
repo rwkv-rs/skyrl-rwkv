@@ -66,6 +66,8 @@ class WorkerDispatch:
         # Seconds the last save_weights_for_sampler spent on the transfer itself,
         # excluding the pause/resume bracket. None until the first sync.
         self.last_weight_sync_seconds: Optional[float] = None
+        self.last_pause_generation_seconds: Optional[float] = None
+        self.last_resume_generation_seconds: Optional[float] = None
 
         # Actor groups by name.
         # TODO: Remove these role-specific identifiers. We will move to using model IDs and add support for generic models beyond these.
@@ -722,12 +724,18 @@ class WorkerDispatch:
 
         ``sync_weights_only_transfer`` is the weight transfer alone, reported apart
         from the trainer's ``sync_weights``, which also brackets the generation
-        pause/resume (seconds of coordinator quiesce under vLLM DP). Empty until the
-        first sync.
+        pause/resume. ``sync_weights_pause_generation`` and
+        ``sync_weights_resume_generation`` measure those client calls separately
+        when the dispatch owns the pause/resume bracket. Empty until the first sync.
         """
         if self.last_weight_sync_seconds is None:
             return {}
-        return {"sync_weights_only_transfer": self.last_weight_sync_seconds}
+        metrics = {"sync_weights_only_transfer": self.last_weight_sync_seconds}
+        if self.last_pause_generation_seconds is not None:
+            metrics["sync_weights_pause_generation"] = self.last_pause_generation_seconds
+        if self.last_resume_generation_seconds is not None:
+            metrics["sync_weights_resume_generation"] = self.last_resume_generation_seconds
+        return metrics
 
     async def _prepare_for_weight_sync(self, adapter_only_sync: bool = False) -> None:
         """Prepare colocated trainer/engine residency for sampler weight sync."""
@@ -796,6 +804,8 @@ class WorkerDispatch:
                 "Pass inference_engine_client to WorkerDispatch constructor or call set_inference_engine_client()."
             )
 
+        self.last_pause_generation_seconds = None
+        self.last_resume_generation_seconds = None
         adapter_only_sync = self.colocate_all and self._is_lora_no_merge()
 
         def _broadcast_and_finish() -> None:
@@ -810,6 +820,11 @@ class WorkerDispatch:
             self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
             self._finish_weight_sync(adapter_only_sync=adapter_only_sync)
             self.last_weight_sync_seconds = time.perf_counter() - start
+
+        async def _resume_generation_timed() -> None:
+            start = time.perf_counter()
+            await self._inference_engine_client.resume_generation()
+            self.last_resume_generation_seconds = time.perf_counter() - start
 
         # Sync weights to inference engine
         await self._prepare_for_weight_sync(adapter_only_sync=adapter_only_sync)
@@ -838,9 +853,11 @@ class WorkerDispatch:
                     # resume frozen requests without recompute, unless the sync will
                     # reset the prefix cache anyway (clear_kv_cache_on_weight_sync).
                     offload_kv = not self.cfg.trainer.fully_async.clear_kv_cache_on_weight_sync
+                    start = time.perf_counter()
                     await self._inference_engine_client.pause_generation()
+                    self.last_pause_generation_seconds = time.perf_counter() - start
                     async with cleanup_preserving_primary(
-                        self._inference_engine_client.resume_generation, "resume_generation"
+                        _resume_generation_timed, "resume_generation"
                     ):
                         await self._inference_engine_client.sleep_for_weight_sync(offload_kv=offload_kv)
                         await self._inference_engine_client.wake_for_weight_sync(tags=["weights"])
@@ -864,9 +881,11 @@ class WorkerDispatch:
                     # pauses internally only around the final reload.
                     _broadcast_and_finish()
                 else:
+                    start = time.perf_counter()
                     await self._inference_engine_client.pause_generation()
+                    self.last_pause_generation_seconds = time.perf_counter() - start
                     async with cleanup_preserving_primary(
-                        self._inference_engine_client.resume_generation, "resume_generation"
+                        _resume_generation_timed, "resume_generation"
                     ):
                         _broadcast_and_finish()
 

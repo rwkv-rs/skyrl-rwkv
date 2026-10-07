@@ -6,11 +6,7 @@ import copy
 import json
 import os
 import re
-import subprocess
 import tempfile
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from threading import Event
 from typing import Union
 from unittest.mock import Mock, mock_open, patch
 
@@ -1024,60 +1020,6 @@ def test_build_dataloader_worker_config(
         None if dataloader.multiprocessing_context is None else dataloader.multiprocessing_context.get_start_method()
     )
     assert start_method == expected_start_method
-
-
-def test_rwkv_flashreinforce_workerless_dataloaders(tmp_path):
-    """Execute the launcher, then iterate its real loaders with a background writer alive."""
-    capture = tmp_path / "uv-args"
-    uv = tmp_path / "uv"
-    uv.write_text('#!/bin/sh\n{ printf "CALL\\0"; printf "%s\\0" "$@"; } >> "$CAPTURE_FILE"\n')
-    uv.chmod(0o755)
-    launcher = Path(__file__).resolve().parents[2] / "examples/train/rwkv/run_rwkv_flashreinforce.sh"
-    subprocess.run(
-        [
-            "bash",
-            str(launcher),
-            "trainer.train_batch_size=4",
-            "trainer.policy_mini_batch_size=4",
-            "trainer.eval_batch_size=3",
-        ],
-        cwd=tmp_path,
-        env={**os.environ, "PATH": f"{tmp_path}{os.pathsep}{os.environ['PATH']}", "CAPTURE_FILE": str(capture)},
-        check=True,
-        capture_output=True,
-        timeout=10,
-    )
-    args = capture.read_bytes().split(b"CALL\0")[-1].rstrip(b"\0").decode().split("\0")
-    cfg = SkyRLTrainConfig.from_cli_overrides(args[args.index("-m") + 2 :])
-    assert cfg.data.dataloader.num_workers == 0
-
-    dataset = MultiItemDataset(size=20)
-    release_writer = Event()
-    writer_started = Event()
-
-    def background_write():
-        writer_started.set()
-        release_writer.wait()
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        writer = executor.submit(background_write)
-        try:
-            assert writer_started.wait(timeout=5)
-            for fully_async in (False, True):
-                train_loader = build_dataloader(cfg, dataset, is_train=True, is_fully_async=fully_async)
-                first_train_epoch = [item for batch in train_loader for item in batch]
-                assert sorted(first_train_epoch) == sorted(dataset.data)
-                seeded_loader = build_dataloader(cfg, dataset, is_train=True, is_fully_async=fully_async)
-                assert [item for batch in seeded_loader for item in batch] == first_train_epoch
-                eval_loader = build_dataloader(cfg, dataset, is_train=False)
-                for _ in range(2):
-                    assert [item for batch in eval_loader for item in batch] == dataset.data
-                assert train_loader.multiprocessing_context is None
-                assert eval_loader.multiprocessing_context is None
-            assert not writer.done()
-        finally:
-            release_writer.set()
-        writer.result(timeout=5)
 
 
 def test_validate_generator_output_invalid_rewards():

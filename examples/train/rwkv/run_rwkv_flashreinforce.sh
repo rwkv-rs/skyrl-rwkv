@@ -39,7 +39,6 @@ uv run --no-sync --extra rwkv python examples/train/rwkv/prepare_flashrwkv2.py -
 uv run --no-sync --extra rwkv -m "$TRAINING_ENTRYPOINT" \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
-  data.dataloader.num_workers=0 \
   trainer.algorithm.policy_loss_type=flashreinforce \
   trainer.algorithm.advantage_estimator=flashreinforce \
   trainer.algorithm.loss_reduction=sequence_mean \

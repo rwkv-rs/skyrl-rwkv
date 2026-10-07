@@ -126,7 +126,7 @@ failure feedback. The FlashREINFORCE launcher enables the opt-in strict GSM8K re
 must contain one non-empty thought, an answer after `</think>`, a real EOS token, and no truncation.
 For the asynchronous pipeline, use the existing
 `examples.train.fully_async.main_fully_async` entrypoint, set `trainer.fully_async.enabled=true` and
-`generator.batched=false`; also pass `environment.skyrl_gym.gsm8k.strict_reward=true`. The default gate is `3e-3`; monitor
+`generator.batched=false`; also pass `environment.skyrl_gym.gsm8k_rwkv.strict_reward=true`. The default gate is `3e-3`; monitor
 `policy/loss_metrics/flashreinforce/acceptance_rate` and the rollout/trainer logprob-difference
 metrics before tuning it.
 
@@ -135,7 +135,23 @@ example, on the synchronous RWKV script use `trainer.algorithm.use_kl_loss=false
 `trainer.algorithm.use_kl_in_reward=false`, and `generator.n_samples_per_prompt=4` in addition to
 those two loss/estimator overrides. BPO requires at least two sibling rollouts because its prompt-value
 estimate is a group mean, so it is not mathematically interchangeable with one-rollout
-FlashREINFORCE. Score Centering's exact top-k formula is implemented as a tested utility, but is not
-enabled by default: the current worker loss API only exposes chosen-token logprobs to the registry,
-while exact Score Centering also needs the trainer full-vocabulary logits aligned with the sampler
-top-k support. Using chosen-token logprobs alone would not be Score Centering and could worsen training.
+FlashREINFORCE.
+
+Score Centering is opt-in through `trainer.algorithm.flashreinforce.score_centering=true`.
+The sampler captures raw support logprobs independently of sampling `top_k`, and the Trainer
+replays logits over the same support (128 candidates by default). For the untruncated training
+sampling distribution, use `generator.sampling_params.temperature=1.0`,
+`generator.sampling_params.top_p=1.0`, `generator.sampling_params.top_k=-1`, and
+`generator.sampling_params.additional_kwargs=null`.
+
+## RWKV trajectory logging
+
+`trainer.trajectory_logger=rwkv` writes accumulating W&B tables in `INCREMENTAL` mode: each
+write validates and serializes only new rows. Table processing and subsequent metric writes
+share one background worker to preserve step/commit ordering. Its queue is bounded to 16
+writes with backpressure, and `Tracking.finish()` drains pending writes before finishing
+W&B uploads. Other trajectory loggers retain their existing logging behavior.
+
+Sample formatting remains bounded by `trainer.num_logger_train_samples` (20 in the
+FlashREINFORCE launcher). Detailed rollout JSONL dumps, 50-step evaluation, checkpoints,
+and HF exports are independent of the table writer.

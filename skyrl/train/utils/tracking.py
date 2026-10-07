@@ -18,10 +18,12 @@
 import dataclasses
 import pprint
 import traceback
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from enum import Enum
 from functools import partial
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from loguru import logger
 from omegaconf import DictConfig, OmegaConf
@@ -32,6 +34,7 @@ from skyrl.train.config import SkyRLTrainConfig, get_config_as_dict
 # TODO(tgriggs): Test all backends.
 class Tracking:
     supported_backends = ["wandb", "mlflow", "swanlab", "tensorboard", "console"]
+    _MAX_PENDING_LOGS = 16
 
     def __init__(
         self,
@@ -43,6 +46,8 @@ class Tracking:
     ):
         assert backend in self.supported_backends, f"{backend} is not supported"
         self.backend = backend
+        self._log_executor: Optional[ThreadPoolExecutor] = None
+        self._log_futures: deque[Future] = deque()
 
         if backend == "wandb":
             import wandb
@@ -87,13 +92,24 @@ class Tracking:
         except Exception as e:
             logger.warning(f"Could not update run summary: {e}")
 
+    def _submit_log(self, write: Callable[[], None]) -> None:
+        """Serialize background writes, propagating errors and bounding queued work."""
+        if self._log_executor is None:
+            write()
+            return
+        while self._log_futures and self._log_futures[0].done():
+            self._log_futures.popleft().result()
+        if len(self._log_futures) >= self._MAX_PENDING_LOGS:
+            self._log_futures.popleft().result()
+        self._log_futures.append(self._log_executor.submit(write))
+
     def log(self, data, step, commit=False):
         if self.backend == "wandb":
             for name in data:
                 if name.startswith("vllm/") and name not in self._vllm_history_metrics:
                     self.logger.define_metric(name, summary="none")
                     self._vllm_history_metrics.add(name)
-            self.logger.log(data=data, step=step, commit=commit)
+            self._submit_log(partial(self.logger.log, data=data, step=step, commit=commit))
         else:
             self.logger.log(data=data, step=step)
 
@@ -115,16 +131,22 @@ class Tracking:
         self._finished = True
         if self.backend == "console":
             return
-        # NOTE (sumanthrh): We use a try-except block here while finishing tracking.
-        # This is because wandb often errors out with a BrokenPipeError when closing.
-        # https://github.com/wandb/wandb/issues/6449
         try:
-            if self.backend == "wandb":
-                self.logger.finish(exit_code=exit_code)
-            else:
-                self.logger.finish()
-        except Exception as e:
-            logger.warning(f"Attempted to finish tracking with backend {self.backend} but got error {e}")
+            if self._log_executor is not None:
+                self._log_executor.shutdown(wait=True)
+                self._log_executor = None
+                while self._log_futures:
+                    self._log_futures.popleft().result()
+        finally:
+            # W&B's background upload must finish after all queued writes.
+            # https://github.com/wandb/wandb/issues/6449
+            try:
+                if self.backend == "wandb":
+                    self.logger.finish(exit_code=exit_code)
+                else:
+                    self.logger.finish()
+            except Exception as e:
+                logger.warning(f"Attempted to finish tracking with backend {self.backend} but got error {e}")
 
     def log_exception(self, e: BaseException, step: int = 0) -> None:
         """Log the active exception's traceback to the configured backend.
@@ -155,7 +177,7 @@ class Tracking:
                 # Note: omit `step=` here. Per-step logs use commit=True, so
                 # re-logging at the same step would be dropped. The step value
                 # is also embedded in the table row itself.
-                self.logger.log({"error/tracebacks": error_table})
+                self.log({"error/tracebacks": error_table}, step=None, commit=True)
                 # Tables upload asynchronously. Finish the run so the upload
                 # completes before the caller re-raises and the process dies.
                 try:
@@ -171,6 +193,9 @@ class Tracking:
         columns: List[str],
         samples: List[Tuple[Any, ...]],
         step: int,
+        *,
+        incremental: bool = False,
+        asynchronous: bool = False,
     ) -> None:
         """Append rows to an accumulating wandb table at ``key``.
 
@@ -178,19 +203,38 @@ class Tracking:
         first call) with ``samples`` and logs the new table to wandb at the
         given ``step``. ``columns`` defines the table schema and must stay
         consistent across calls for the same ``key``; each row in ``samples``
-        must have ``len(columns)`` values in the matching order.
+        must have ``len(columns)`` values in the matching order. ``incremental``
+        also stays fixed for each key and logs only newly appended rows.
+
+        ``asynchronous`` enables a single background writer for tables and
+        subsequent metrics, preserving step/commit order. Callers transfer
+        ownership of sample rows; do not mutate them after submission. The
+        queue applies backpressure at 16 writes and ``finish`` drains it.
 
         No-op for non-wandb backends -- only the wandb backend supports
         ``wandb.Table``.
         """
         if self.backend != "wandb":
             return
+        if asynchronous and self._log_executor is None:
+            self._log_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="skyrl-tracking")
+        self._submit_log(partial(self._log_samples_to_table, key, list(columns), list(samples), step, incremental))
+
+    def _log_samples_to_table(self, key, columns, samples, step, incremental) -> None:
         import wandb
 
         # Cache one table per key so different callers (e.g. eval vs train
         # trajectory loggers, error traceback table) don't trample each other.
         if not hasattr(self, "_sample_tables"):
             self._sample_tables: Dict[str, Any] = {}
+        if incremental:
+            if key not in self._sample_tables:
+                self._sample_tables[key] = wandb.Table(columns=columns, log_mode="INCREMENTAL")
+            table = self._sample_tables[key]
+            for row in samples:
+                table.add_data(*row)
+            self.logger.log({key: table}, step=step)
+            return
         if key not in self._sample_tables:
             self._sample_tables[key] = wandb.Table(columns=columns)
         # Workaround for https://github.com/wandb/wandb/issues/2981#issuecomment-1997445737

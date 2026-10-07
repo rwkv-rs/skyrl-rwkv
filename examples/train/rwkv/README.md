@@ -119,6 +119,10 @@ Use the dedicated FlashREINFORCE entry point; do not pass FlashREINFORCE overrid
 MODEL_DIR="$MODEL_DIR" bash examples/train/rwkv/run_rwkv_flashreinforce.sh
 ```
 
+The FlashREINFORCE launcher sets `data.dataloader.num_workers=0` for both training and evaluation.
+Prompts are already loaded into memory, so the native in-process DataLoader handles indexing and
+collation without spawning workers inside the Ray driver. Other launchers retain their defaults.
+
 The synchronous entry point above keeps `trainer.train_batch_size == trainer.policy_mini_batch_size`; each
 fresh batch is consumed by exactly one optimizer step. The launcher keeps generated action tokens
 in the loss mask for truncated rollouts; those rollouts retain zero reward and contribute signed

@@ -110,6 +110,36 @@ class TestSaveWeights:
         dispatch._inference_engine_client.resume_generation.assert_awaited_once()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("offload_kv", [False, True])
+    async def test_pause_resume_timing_excludes_transfer(self, monkeypatch, offload_kv):
+        import skyrl.backends.skyrl_train.workers.worker_dispatch as wd
+
+        dispatch = wd.WorkerDispatch.__new__(wd.WorkerDispatch)
+        dispatch.colocate_all = False
+        dispatch.cfg = _fft_dispatch_cfg()
+        dispatch.cfg.generator.inference_engine.offload_kv_for_weight_sync = offload_kv
+        dispatch.cfg.trainer.fully_async = SimpleNamespace(enabled=True, clear_kv_cache_on_weight_sync=False)
+        dispatch._inference_engine_client = AsyncMock()
+        dispatch._inference_engine_client.increment_weight_version = MagicMock()
+        dispatch._broadcast_to_inference_engines = MagicMock()
+        dispatch._prepare_for_weight_sync = AsyncMock()
+        dispatch._finish_weight_sync = MagicMock()
+        dispatch.ensure_active_adapter = MagicMock()
+        clock = iter([10.0, 11.0, 12.0, 14.0, 15.0, 19.0])
+        monkeypatch.setattr(wd.time, "perf_counter", lambda: next(clock))
+
+        await dispatch.save_weights_for_sampler()
+
+        assert dispatch.get_timing_metrics() == {
+            "sync_weights_pause_generation": 1.0,
+            "sync_weights_only_transfer": 2.0,
+            "sync_weights_resume_generation": 4.0,
+        }
+        dispatch._inference_engine_client.pause_generation.assert_awaited_once()
+        dispatch._broadcast_to_inference_engines.assert_called_once()
+        dispatch._inference_engine_client.resume_generation.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_non_colocated_delta_does_not_pause(self):
         """Delta sync owns pause/resume itself.
 
@@ -134,6 +164,7 @@ class TestSaveWeights:
         # The sync itself must still happen, and still be finalized.
         dispatch._broadcast_to_inference_engines.assert_called_once()
         dispatch._finish_weight_sync.assert_called_once()
+        assert set(dispatch.get_timing_metrics()) == {"sync_weights_only_transfer"}
 
     @pytest.mark.asyncio
     async def test_colocated_uses_wake_up(self):
@@ -154,6 +185,7 @@ class TestSaveWeights:
         dispatch._inference_engine_client.wake_up.assert_awaited()
         dispatch._inference_engine_client.pause_generation.assert_not_awaited()
         dispatch._inference_engine_client.resume_generation.assert_not_awaited()
+        assert set(dispatch.get_timing_metrics()) == {"sync_weights_only_transfer"}
 
     @pytest.mark.asyncio
     async def test_non_colocated_pause_before_broadcast(self):

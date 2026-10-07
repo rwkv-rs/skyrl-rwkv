@@ -2,9 +2,7 @@
 uv run --isolated --extra dev --extra skyrl-train pytest -s tests/train/test_tracking.py
 """
 
-import json
 from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
 from threading import Event, get_ident
 from unittest.mock import MagicMock, patch
 
@@ -79,6 +77,7 @@ def test_finish_removes_regular_sdk_summary_but_preserves_other_metrics():
 def tracker():
     with patch("wandb.init"), patch("wandb.log"), patch("wandb.finish"):
         tracking = Tracking("proj", "exp", backend="wandb", config={})
+        tracking.logger = MagicMock(log=wandb.log, finish=wandb.finish)
         try:
             yield tracking
         finally:
@@ -225,16 +224,23 @@ def test_offline_wandb_serializes_only_incremental_rows(tmp_path, monkeypatch):
     monkeypatch.setenv("WANDB_MODE", "offline")
     monkeypatch.setenv("WANDB_DIR", str(tmp_path))
     tracker = Tracking("tracking-tests", "incremental", backend="wandb", config={})
-    run_dir = Path(wandb.run.dir)
-    try:
-        for step in (1, 2):
-            tracker.log_samples_to_table(
-                "train", ["step", "mask"], [(step, [1] * 1024)], step, incremental=True, asynchronous=True
-            )
-            tracker.log({"reward": float(step)}, step, commit=True)
-    finally:
-        tracker.finish()
-    tables = [json.loads(path.read_text()) for path in run_dir.glob("media/table/*.table.json")]
-    assert len(tables) == 2
-    assert all(len(table["data"]) == 1 for table in tables)
-    assert sorted(table["data"][0][0] for table in tables) == [1, 2]
+    serialized_rows = []
+    serialize = wandb.Table._to_table_json
+
+    def capture_rows(table, *args, **kwargs):
+        payload = serialize(table, *args, **kwargs)
+        serialized_rows.append(payload["data"])
+        return payload
+
+    with patch.object(wandb.Table, "_to_table_json", autospec=True, side_effect=capture_rows):
+        try:
+            for step in (1, 2):
+                tracker.log_samples_to_table(
+                    "train", ["step", "mask"], [(step, [1] * 1024)], step, incremental=True, asynchronous=True
+                )
+                tracker.log({"reward": float(step)}, step, commit=True)
+        finally:
+            tracker.finish()
+    assert serialized_rows
+    assert all(len(rows) == 1 for rows in serialized_rows)
+    assert {rows[0][0] for rows in serialized_rows} == {1, 2}

@@ -151,6 +151,8 @@ write validates and serializes only new rows. Table processing and subsequent me
 share one background worker to preserve step/commit ordering. Its queue is bounded to 16
 writes with backpressure, and `Tracking.finish()` drains pending writes before finishing
 W&B uploads. Other trajectory loggers retain their existing logging behavior.
+The W&B run workspace displays the latest 100 table increments; detailed rollout
+JSONL dumps retain every step.
 
 Sample formatting remains bounded by `trainer.num_logger_train_samples` (20 in the
 FlashREINFORCE launcher). Detailed rollout JSONL dumps, 50-step evaluation, checkpoints,

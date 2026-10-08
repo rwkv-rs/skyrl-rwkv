@@ -27,6 +27,7 @@ from vllm.entrypoints.openai.api_server import (
 from vllm.inputs import TokensPrompt
 from vllm.logprobs import FlatLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.sampling_params import RequestOutputKind
 from vllm.sampling_params import SamplingParams as VLLMSamplingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import random_uuid
@@ -650,7 +651,7 @@ class VLLMServerActor(ServerActorProtocol):
                 sampling_params_dict["logprobs"] = support_top_k
                 # This endpoint consumes only the final output. Avoid materializing
                 # cumulative support-bearing outputs at every decoding step.
-                sampling_params_dict["output_kind"] = 2  # RequestOutputKind.FINAL_ONLY
+                sampling_params_dict["output_kind"] = RequestOutputKind.FINAL_ONLY
             sampling_params = VLLMSamplingParams(**sampling_params_dict)
             # `cache_salt` salts vLLM's prefix cache; vLLM rejects an empty salt, so attach only when set.
             if cache_salt is not None:

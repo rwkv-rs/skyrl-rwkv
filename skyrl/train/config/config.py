@@ -1103,6 +1103,9 @@ class FullyAsyncConfig(BaseConfig):
     Dropped groups are marked consumed (not regenerated on resume), so the per-epoch step count becomes
     an upper bound: if the epoch's prompts run out mid mini-batch, the partial batch is discarded and
     the epoch ends."""
+    save_at_epoch_end: bool = True
+    """Save checkpoints and HF exports at epoch boundaries in addition to their intervals.
+    Disabling this does not change interval-based or final saves."""
     clear_kv_cache_on_weight_sync: bool = False
     """Whether or not to clear the KV cache on weight sync. Defaults to False.
     If False, we reuse KV cache from stale policies during generation

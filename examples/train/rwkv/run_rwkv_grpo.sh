@@ -8,12 +8,12 @@ if [[ -f .env ]]; then
   set +a
 fi
 
-: "${MODEL_DIR:=$HOME/Weights/RWKV/hf/rwkv7-g1j-1.5b-20260831-ctx16384}"
+: "${MODEL_DIR:=$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600}"
 : "${DATA_DIR:=$HOME/data/gsm8k}"
 : "${NUM_GPUS:=8}"
 : "${MICRO_BATCH_SIZE:=2}"
 : "${LOGGER:=wandb}"
-: "${RUN_NAME:=rwkv7-g1j-1.5b-gsm8k-grpo-50step}"
+: "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-gsm8k-grpo-50step}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
 export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
 # FlashRWKV2 uses get_default_build_root() (XDG_CACHE_HOME), not TORCH_EXTENSIONS_DIR.

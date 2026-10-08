@@ -259,11 +259,13 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
             # model's parameters, so there is nothing to reload.
             self.skyrl_begin_lora_update()
             return
-        if self.model.config.model_type == "rwkv":
-            return
         skyrl_before_weight_update()
         with torch.device(self.device):
-            super().start_weight_update()
+            # RWKV loads processed tensors in place, including the transposed
+            # channel-mix value projection. Generic layerwise reload would move
+            # that destination to meta and discard the direct copy on finalize.
+            if getattr(getattr(self.model, "config", None), "model_type", None) != "rwkv":
+                super().start_weight_update()
 
     def receive_weights(self, update_info: Any) -> None:
         if self.skyrl_lora_armed():
@@ -279,18 +281,17 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
             # model's parameters.
             self.skyrl_finish_lora_update()
             return
-        from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
-            clear_rwkv_cudagraphs,
-            finalize_rwkv_runtime_weights,
-        )
+        with torch.device(self.device):
+            if getattr(getattr(self.model, "config", None), "model_type", None) == "rwkv":
+                from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
+                    clear_rwkv_cudagraphs,
+                    finalize_rwkv_runtime_weights,
+                )
 
-        if self.model.config.model_type == "rwkv":
-            with torch.device(self.device):
                 finalize_rwkv_runtime_weights(self.model)
                 clear_rwkv_cudagraphs()
-            return
-        with torch.device(self.device):
-            super().finish_weight_update()
+            else:
+                super().finish_weight_update()
         skyrl_after_weight_update()
         empty_cuda_cache_rocm()
 
@@ -309,6 +310,14 @@ def _build_skyrl_ipc_engine() -> type:
 
     class SkyrlIPCWeightTransferEngine(SkyrlReceiveLifecycleMixin, IPCWeightTransferEngine):
         """vLLM's CUDA IPC receive engine plus SkyRL receive targets."""
+
+        def finish_weight_update(self) -> None:
+            rwkv = getattr(getattr(self.model, "config", None), "model_type", None) == "rwkv"
+            super().finish_weight_update()
+            if rwkv:
+                # RWKV skips native layerwise finalization, but still owns the
+                # packed IPC export reference acquired during receive_weights.
+                self._packed_importer.close()
 
     return SkyrlIPCWeightTransferEngine
 

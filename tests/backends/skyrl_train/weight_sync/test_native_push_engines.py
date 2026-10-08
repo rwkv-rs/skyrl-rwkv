@@ -267,3 +267,71 @@ def test_native_ipc_trainer_preserves_serialized_fp8_mixed_stream(monkeypatch):
     ]
     assert observed["buffer_size_bytes"] == 1024
     assert client.update_infos[0]["tensor_sizes"] == [tensor.nbytes for _, tensor in observed["stream"]]
+
+
+@pytest.mark.parametrize("backend", ["nccl", "ipc"])
+@pytest.mark.parametrize("model_type", ["rwkv", "llama"])
+def test_native_receive_repeated_updates_preserve_processed_weights(monkeypatch, backend, model_type):
+    from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
+    from vllm.model_executor.model_loader.weight_utils import default_weight_loader
+
+    from skyrl.backends.skyrl_train.inference_servers import layerwise_reload
+    from skyrl.backends.skyrl_train.weight_sync import weight_receivers
+
+    class CheckpointModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(model_type=model_type)
+            self.model = torch.nn.Module()
+            self.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+            self.model.layers[0].mlp = torch.nn.Module()
+            self.model.layers[0].mlp.value = torch.nn.Module()
+            self.model.layers[0].mlp.value.weight = torch.nn.Parameter(torch.ones(3, 2, dtype=torch.float16))
+            self.model.norm = torch.nn.Module()
+            self.model.norm.weight = torch.nn.Parameter(torch.ones(2, dtype=torch.float16))
+
+        def load_weights(self, weights):
+            loaded = set()
+            for name, weight in weights:
+                param = self.get_parameter(name)
+                loader = getattr(param, "weight_loader", default_weight_loader)
+                loader(param, weight)
+                loaded.add(name)
+            return loaded
+
+    events = []
+    monkeypatch.setattr(weight_receivers, "skyrl_before_weight_update", lambda: events.append("before"))
+    monkeypatch.setattr(weight_receivers, "skyrl_after_weight_update", lambda: events.append("after"))
+    monkeypatch.setattr(layerwise_reload, "finalize_rwkv_runtime_weights", lambda model: events.append("runtime"))
+    monkeypatch.setattr(layerwise_reload, "clear_rwkv_cudagraphs", lambda: events.append("graphs"))
+    engine_cls = (
+        weight_receivers._build_skyrl_nccl_engine() if backend == "nccl" else weight_receivers._build_skyrl_ipc_engine()
+    )
+    engine = object.__new__(engine_cls)
+    engine.model = CheckpointModel()
+    engine.device = torch.device("cpu")
+    engine.model_config = SimpleNamespace(dtype=torch.float16)
+    if backend == "ipc":
+        engine._packed_importer = SimpleNamespace(close=lambda: events.append("close"))
+    record_metadata_for_reloading(engine.model)
+    name = "model.layers.0.mlp.value.weight"
+    original_ptr = engine.model.get_parameter(name).data_ptr()
+
+    for value in (2.0, 3.0, 4.0):
+        source = torch.full((2, 3) if model_type == "rwkv" else (3, 2), value, dtype=torch.float16)
+        norm = torch.full((2,), value + 1, dtype=torch.float16)
+        engine.start_weight_update()
+        expected_device = "cpu" if model_type == "rwkv" else "meta"
+        assert engine.model.get_parameter(name).device.type == expected_device
+        with engine.skyrl_checkpoint_load():
+            engine.model.load_weights([(name, source), ("model.norm.weight", norm)])
+        engine.finish_weight_update()
+        target = engine.model.get_parameter(name)
+        assert torch.equal(target, source.T if model_type == "rwkv" else source)
+        assert torch.equal(engine.model.model.norm.weight, norm)
+        assert target.data_ptr() == original_ptr
+
+    expected_events = ["before", "runtime", "graphs", "after"] if model_type == "rwkv" else ["before", "after"]
+    if backend == "ipc":
+        expected_events.insert(len(expected_events) if model_type == "rwkv" else 1, "close")
+    assert events == expected_events * 3

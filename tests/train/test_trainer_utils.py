@@ -1093,6 +1093,7 @@ def test_rwkv_flashreinforce_launcher_resources(tmp_path, monkeypatch, through_s
     assert cfg.generator.sampling_params.top_p == cfg.generator.sampling_params.temperature == 1.0
     assert cfg.generator.sampling_params.top_k == -1
     assert cfg.generator.sampling_params.additional_kwargs is None
+    assert cfg.generator.inference_engine.engine_init_kwargs["skip_tokenizer_init"] is True
     assert cfg.generator.eval_sampling_params.top_p == 0.76
     assert cfg.trainer.ckpt_interval == cfg.trainer.hf_save_interval == cfg.trainer.eval_interval == 50
     if separate_resources:

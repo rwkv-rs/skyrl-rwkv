@@ -14,7 +14,7 @@ fi
 : "${NUM_POLICY_GPUS:=$NUM_GPUS}"
 : "${NUM_INFERENCE_GPUS:=$NUM_GPUS}"
 : "${MINI_BATCH_SIZE:=128}"
-: "${MICRO_BATCH_SIZE:=2}"
+: "${MICRO_BATCH_SIZE:=32}"
 : "${LOGGER:=wandb}"
 : "${TRAINING_ENTRYPOINT:=skyrl.train.entrypoints.main_base}"
 : "${RUN_NAME:=rwkv7-g1j-1.5b-20260831-ctx16384-gsm8k-flashreinforce-50step}"
@@ -54,6 +54,8 @@ uv run --no-sync --extra rwkv -m "$TRAINING_ENTRYPOINT" \
   trainer.policy.optimizer_config.max_grad_norm=1.0 \
   trainer.policy.optimizer_config.scheduler=cosine \
   trainer.strategy=fsdp \
+  trainer.policy.fsdp_config.reshard_after_forward=false \
+  trainer.policy.fsdp_config.sync_gradients_each_microbatch=false \
   trainer.flash_attn=false \
   trainer.remove_microbatch_padding=false \
   trainer.policy.sequence_parallel_size=1 \

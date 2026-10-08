@@ -121,7 +121,7 @@ MODEL_DIR="$MODEL_DIR" bash examples/train/rwkv/run_rwkv_flashreinforce.sh
 
 The synchronous entry point above keeps `trainer.train_batch_size == trainer.policy_mini_batch_size`; each
 fresh batch is consumed by exactly one optimizer step. `MINI_BATCH_SIZE` sets both sizes (default 128);
-`MICRO_BATCH_SIZE` controls per-GPU memory use (default 2). `NUM_POLICY_GPUS` and
+`MICRO_BATCH_SIZE` controls per-GPU memory use (default 32 for this RWKV7-1.5B recipe). `NUM_POLICY_GPUS` and
 `NUM_INFERENCE_GPUS` independently select training GPUs and TP1 inference engines, each falling
 back to `NUM_GPUS` (default 8). Unequal counts require `trainer.placement.colocate_all=false`.
 The optimizer is AdamW with LR `1e-6`, cosine decay, weight decay `0.1`, and gradient clip `1.0`.
@@ -158,6 +158,20 @@ at each generation step on the API event loop. Support capture also uses `FINAL_
 while retaining all per-token sampled scores and support rows.
 
 ## FlashREINFORCE resource tuning
+
+The RWKV FlashREINFORCE launcher keeps parameters unsharded after forward and uses
+`trainer.policy.fsdp_config.sync_gradients_each_microbatch=false`. Intermediate microbatches
+accumulate gradients locally and retain full parameters; only the final microbatch synchronizes
+gradients and restores parameter sharding before the optimizer step. The generic FSDP default
+remains synchronization after every microbatch. Native CPU offload is incompatible with deferred
+synchronization. Loss normalization, clipping, and one optimizer update per full batch are unchanged.
+
+On the 96 GiB RTX PRO 6000 host, batch 768 across six training GPUs with microbatch 32 uses four
+accumulation rounds per GPU; the two separate TP1 inference engines retain token-only support capture.
+Before deferred synchronization was added, retaining parameters after forward gave approximately
+16 seconds of policy training versus 105 seconds with microbatch 2. These LR=0 diagnostics do not
+establish convergence or a globally optimal GPU split. Measure useful tokens and admitted trajectories
+per GPU-hour, and retain memory headroom at the maximum 512+1024 token length.
 
 The hyperparameter reference is the Qwen2.5-Math-1.5B experiment in
 [FlashREINFORCE, Appendix A.3, Table 13](https://www.researchgate.net/publication/414274571_FlashREINFORCE_FLASHREINFORCE_CRITIC-FREE_SINGLE-ROLLOUT_ASYNCHRONOUS_RL_FOR_AGENTIC_LANGUAGE_MODELS):

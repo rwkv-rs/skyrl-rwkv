@@ -108,6 +108,7 @@ uv run --no-sync --extra rwkv -m "$TRAINING_ENTRYPOINT" \
   generator.eval_sampling_params.top_k=32 \
   generator.eval_sampling_params.additional_kwargs="{presence_penalty: 1.0, frequency_penalty: 0.1, penalty_decay: 0.988}" \
   generator.inference_engine.engine_init_kwargs.mamba_ssm_cache_dtype=float32 \
+  generator.inference_engine.engine_init_kwargs.skip_tokenizer_init=true \
   environment.env_class=gsm8k \
   environment.skyrl_gym.gsm8k.strict_reward=true \
   "$@"

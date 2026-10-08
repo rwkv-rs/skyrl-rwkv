@@ -150,6 +150,13 @@ sampling distribution, use `generator.sampling_params.temperature=1.0`,
 `generator.sampling_params.top_p=1.0`, `generator.sampling_params.top_k=-1`, and
 `generator.sampling_params.additional_kwargs=null`.
 
+The FlashREINFORCE launcher uses token-in/token-out inference with
+`generator.inference_engine.engine_init_kwargs.skip_tokenizer_init=true`. SkyRL retains the
+local HF tokenizer for prompt templates and response decoding; numeric token IDs, EOS, and
+logprobs are unchanged. This avoids vLLM decoding and UTF-8-correcting every support candidate
+at each generation step on the API event loop. Support capture also uses `FINAL_ONLY` outputs
+while retaining all per-token sampled scores and support rows.
+
 ## FlashREINFORCE resource tuning
 
 The hyperparameter reference is the Qwen2.5-Math-1.5B experiment in

@@ -27,6 +27,7 @@ from vllm.entrypoints.openai.api_server import (
 from vllm.inputs import TokensPrompt
 from vllm.logprobs import FlatLogprobs
 from vllm.lora.request import LoRARequest
+from vllm.sampling_params import RequestOutputKind
 from vllm.sampling_params import SamplingParams as VLLMSamplingParams
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils import random_uuid
@@ -661,6 +662,9 @@ class VLLMServerActor(ServerActorProtocol):
                     )
                 sampling_params_dict["flat_logprobs"] = True
                 sampling_params_dict["logprobs"] = support_top_k
+                # This endpoint consumes only the final output. Avoid materializing
+                # cumulative support-bearing outputs at every decoding step.
+                sampling_params_dict["output_kind"] = RequestOutputKind.FINAL_ONLY
                 # This endpoint returns token ids only, so the API-server process need not detokenize
                 # the k + 1 candidates per token; that work otherwise starves the event loop that also
                 # serves pause/weight-sync. Stop strings still need the decoded text.

@@ -104,7 +104,7 @@ The defaults use a BF16 Trainer, FP16 vLLM-RWKV inference, 8 GPUs, eight TP1 col
 MODEL_DIR="$MODEL_DIR" bash examples/train/rwkv/run_rwkv_grpo.sh
 ```
 
-If micro-batch 2 does not fit, record the OOM and retry with `MICRO_BATCH_SIZE=1`; do not change the global train or policy mini-batch sizes. Successful acceptance requires all 50 optimizer steps, every trainer-to-inference weight update, aligned rollout token/logprob/loss-mask lengths, finite logprob-difference metrics without abnormal jumps, step-50 checkpoint/export/eval artifacts, and an online W&B run containing training, reward, evaluation, system-resource, and logprob-alignment curves.
+Choose `MICRO_BATCH_SIZE` for the available GPU memory while keeping global train and policy mini-batch sizes fixed. Successful acceptance requires all 50 optimizer steps, every trainer-to-inference weight update, aligned rollout token/logprob/loss-mask lengths, finite logprob-difference metrics without abnormal jumps, step-50 checkpoint/export/eval artifacts, and an online W&B run containing training, reward, evaluation, system-resource, and logprob-alignment curves.
 
 ## FlashREINFORCE and algorithm ablations
 
@@ -222,7 +222,7 @@ the router. The SSH launcher forwards this opt-in override. Staleness control is
 capacity-based: still inspect the actual `async/staleness_*` metrics and admission rate.
 Keep the gate and raw 128-candidate Score-Centering support unchanged.
 
-Benchmark micro-batches 2, 4, and 8 with the same global batch, retaining gradient checkpointing
+Benchmark micro-batches at the same global batch, retaining gradient checkpointing
 and monitoring peak memory. Also compare one training GPU plus one inference GPU if it fits;
 two plus one is not asserted to be optimal. Measure `timing/policy_train`,
 `timing/sync_weights_pause_generation`, `timing/sync_weights_only_transfer`,

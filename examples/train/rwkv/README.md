@@ -174,6 +174,7 @@ From the local checkout, use the verified SSH launcher after host memory faults 
 
 ```bash
 NUM_POLICY_GPUS=2 NUM_INFERENCE_GPUS=1 MINI_BATCH_SIZE=512 MICRO_BATCH_SIZE=2 \
+SKYRL_GENERATE_CONCURRENCY_PER_ENGINE=64 \
 TRAINING_ENTRYPOINT=examples.train.fully_async.main_fully_async \
 RUN_NAME=rwkv7-g1j-1.5b-20260831-ctx16384-gsm8k-flashreinforce-sc-2train-1infer-b512 \
 ./temp/run.sh \
@@ -193,7 +194,10 @@ RUN_NAME=rwkv7-g1j-1.5b-20260831-ctx16384-gsm8k-flashreinforce-sc-2train-1infer-
 For batch 128, also change `num_parallel_generation_workers` to 128 and use a distinct run name.
 Generation workers are async request tasks, not GPU replicas; the trainer requires their count
 between `MINI_BATCH_SIZE` and `MINI_BATCH_SIZE * (max_staleness_steps + 1)`. `max_num_seqs=128`
-bounds simultaneously active sequences on the single inference engine. Staleness control is
+bounds simultaneously active sequences on the single inference engine.
+`SKYRL_GENERATE_CONCURRENCY_PER_ENGINE=64` independently caps in-flight HTTP generation requests
+per engine; remaining generation tasks wait on the client's semaphore rather than overwhelming
+the router. The SSH launcher forwards this opt-in override. Staleness control is
 capacity-based: still inspect the actual `async/staleness_*` metrics and admission rate.
 Keep the gate and raw 128-candidate Score-Centering support unchanged.
 

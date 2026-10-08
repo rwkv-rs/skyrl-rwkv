@@ -1036,8 +1036,13 @@ def test_rwkv_flashreinforce_launcher_resources(tmp_path, monkeypatch, through_s
     bin_dir.mkdir()
     capture = tmp_path / "argv"
     for name, body in {
-        "uv": 'printf "%s\\0" "$@" >> "$COMMAND_CAPTURE"\n',
-        "ssh": '[[ "$1" == rwkv-sha-pro6000x8 ]] || exit 1\nexec bash -c "${2#* && }"\n',
+        "uv": 'printf "%s\\0" "GENERATE_CONCURRENCY=${SKYRL_GENERATE_CONCURRENCY_PER_ENGINE:-}" "$@" >> "$COMMAND_CAPTURE"\n',
+        "ssh": (
+            '[[ "$1" == rwkv-sha-pro6000x8 ]] || exit 1\n'
+            "unset NUM_GPUS NUM_POLICY_GPUS NUM_INFERENCE_GPUS MINI_BATCH_SIZE MICRO_BATCH_SIZE "
+            "LOGGER RUN_NAME OUTPUT_ROOT TRAINING_ENTRYPOINT SKYRL_GENERATE_CONCURRENCY_PER_ENGINE\n"
+            'exec bash -c "${2#* && }"\n'
+        ),
     }.items():
         stub = bin_dir / name
         stub.write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + body)
@@ -1046,6 +1051,7 @@ def test_rwkv_flashreinforce_launcher_resources(tmp_path, monkeypatch, through_s
     monkeypatch.setenv("COMMAND_CAPTURE", str(capture))
     monkeypatch.setenv("NUM_GPUS", "4")
     monkeypatch.setenv("MICRO_BATCH_SIZE", "2")
+    monkeypatch.setenv("SKYRL_GENERATE_CONCURRENCY_PER_ENGINE", "64")
     for name in ("NUM_POLICY_GPUS", "NUM_INFERENCE_GPUS", "MINI_BATCH_SIZE", "TRAINING_ENTRYPOINT"):
         monkeypatch.delenv(name, raising=False)
     overrides = []
@@ -1066,6 +1072,7 @@ def test_rwkv_flashreinforce_launcher_resources(tmp_path, monkeypatch, through_s
     script = root / "temp/run.sh" if through_ssh else launcher
     subprocess.run(["bash", str(script), *overrides], cwd=tmp_path, check=True, capture_output=True, timeout=10)
     argv = capture.read_bytes().decode().rstrip("\0").split("\0")
+    assert argv.count("GENERATE_CONCURRENCY=64") == 2
     module_index = argv.index("-m") + 1
     cfg = SkyRLTrainConfig.from_cli_overrides(argv[module_index + 1 :])
     assert argv[module_index] == (

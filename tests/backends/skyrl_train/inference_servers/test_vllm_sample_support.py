@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 pytest.importorskip("vllm")
 
 from vllm.lora.request import LoRARequest
+from vllm.sampling_params import RequestOutputKind
 
 from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     PackedField,
@@ -104,11 +105,11 @@ class FakeEngine:
         yield SimpleNamespace(
             outputs=[
                 SimpleNamespace(
-                    token_ids=[7],
+                    token_ids=[7, 9],
                     finish_reason="stop",
                     logprobs=SimpleNamespace(
-                        token_ids=[7, 7, 8],
-                        logprobs=[-0.1, -0.1, -0.2],
+                        token_ids=[7, 7, 8, 9, 9, 10],
+                        logprobs=[-0.1, -0.1, -0.2, -0.3, -0.3, -0.4],
                     ),
                     routed_experts=None,
                 )
@@ -133,7 +134,8 @@ def test_skyrl_generate_rejects_sample_support_without_a_bounded_support(samplin
     assert engine.sampling_params is None
 
 
-def test_skyrl_generate_returns_packed_sample_support():
+@pytest.mark.parametrize("sampling_top_k", [2, -1])
+def test_skyrl_generate_returns_packed_sample_support(sampling_top_k):
     app = FastAPI()
     engine = FakeEngine()
     VLLMServerActor._add_custom_endpoints(app, engine, SimpleNamespace(enable_lora=False))
@@ -143,16 +145,27 @@ def test_skyrl_generate_returns_packed_sample_support():
             "/skyrl/v1/generate",
             json={
                 "token_ids": [1, 2],
-                "sampling_params": {"temperature": 1.0, "top_k": 2},
+                "sampling_params": {"temperature": 1.0, "top_p": 1.0, "top_k": sampling_top_k},
                 "return_sample_support": True,
+                "sample_support_top_k": 2,
             },
         )
 
     assert response.status_code == 200
     assert engine.sampling_params.flat_logprobs is True
     assert engine.sampling_params.logprobs == 2
-    packed = response.json()["choices"][0][PackedField.ROLLOUT_SAMPLE_SUPPORT]
-    np.testing.assert_array_equal(decode_packed_sample_support(packed), [[7, 8]])
+    assert engine.sampling_params.output_kind == RequestOutputKind.FINAL_ONLY
+    assert engine.sampling_params.temperature == 1.0
+    assert engine.sampling_params.top_p == 1.0
+    assert engine.sampling_params.top_k == sampling_top_k
+    assert engine.sampling_params.presence_penalty == 0.0
+    assert engine.sampling_params.frequency_penalty == 0.0
+    choice = response.json()["choices"][0]
+    assert choice["token_ids"] == [7, 9]
+    assert [row["logprob"] for row in choice["logprobs"]["content"]] == pytest.approx([-0.1, -0.3])
+    np.testing.assert_array_equal(
+        decode_packed_sample_support(choice[PackedField.ROLLOUT_SAMPLE_SUPPORT]), [[7, 8], [9, 10]]
+    )
 
 
 class FakeLoraEngine(FakeEngine):
@@ -208,6 +221,7 @@ def test_skyrl_generate_base_model_skips_lora_with_lora_enabled():
 
     assert response.status_code == 200
     assert engine.lora_request is None
+    assert engine.sampling_params.output_kind == RequestOutputKind.CUMULATIVE
 
 
 def test_skyrl_generate_rejects_unknown_model_with_lora_enabled():

@@ -648,6 +648,9 @@ class VLLMServerActor(ServerActorProtocol):
                     )
                 sampling_params_dict["flat_logprobs"] = True
                 sampling_params_dict["logprobs"] = support_top_k
+                # This endpoint consumes only the final output. Avoid materializing
+                # cumulative support-bearing outputs at every decoding step.
+                sampling_params_dict["output_kind"] = 2  # RequestOutputKind.FINAL_ONLY
             sampling_params = VLLMSamplingParams(**sampling_params_dict)
             # `cache_salt` salts vLLM's prefix cache; vLLM rejects an empty salt, so attach only when set.
             if cache_salt is not None:

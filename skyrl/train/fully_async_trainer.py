@@ -583,14 +583,14 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                                     f"sample_full_batch: epoch {epoch} exhausted with a partial mini-batch of "
                                     f"{len(cur_generation_group_mini_batch)} group(s); discarding and ending the epoch."
                                 )
-                            # Save the end-of-epoch checkpoint the normal is_epoch_end path would have, since
-                            # we break before reaching it.
-                            if self.cfg.trainer.ckpt_interval > 0:
-                                with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
-                                    await asyncio.to_thread(self.save_checkpoints)
-                            if self.cfg.trainer.hf_save_interval > 0:
-                                with self._phase_gauge.timed_phase("save_hf_model", self.all_timings):
-                                    await asyncio.to_thread(self.save_models)
+                            # The epoch ended before the normal checkpointing path.
+                            if self.cfg.trainer.fully_async.save_at_epoch_end:
+                                if self.cfg.trainer.ckpt_interval > 0:
+                                    with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
+                                        await asyncio.to_thread(self.save_checkpoints)
+                                if self.cfg.trainer.hf_save_interval > 0:
+                                    with self._phase_gauge.timed_phase("save_hf_model", self.all_timings):
+                                        await asyncio.to_thread(self.save_models)
                             break
 
                         if self.sample_full_batch:
@@ -655,15 +655,16 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                     self.tracker.log(self.all_metrics, step=self.global_step, commit=False)
                     self.all_metrics = {}
 
-                    # 7. Checkpointing. At interval and at the last step of each epoch.
+                    # 7. Checkpointing. At interval and optionally at the last step of each epoch.
                     is_epoch_end = trained_steps_this_epoch == self.num_steps_per_epoch
+                    save_at_epoch_end = self.cfg.trainer.fully_async.save_at_epoch_end and is_epoch_end
                     if self.cfg.trainer.ckpt_interval > 0:
-                        if is_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0:
+                        if save_at_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0:
                             async with self._step_deadline():
                                 with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
                                     await asyncio.to_thread(self.save_checkpoints)
                     if self.cfg.trainer.hf_save_interval > 0:
-                        if is_epoch_end or self.global_step % self.cfg.trainer.hf_save_interval == 0:
+                        if save_at_epoch_end or self.global_step % self.cfg.trainer.hf_save_interval == 0:
                             async with self._step_deadline():
                                 with self._phase_gauge.timed_phase("save_hf_model", self.all_timings):
                                     await asyncio.to_thread(self.save_models)

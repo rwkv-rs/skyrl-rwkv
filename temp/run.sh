@@ -3,7 +3,7 @@
 set -euo pipefail
 
 remote='cd ~/Projects/MachineLearning/skyrl-rwkv && '
-for name in MODEL_DIR DATA_DIR NUM_GPUS MICRO_BATCH_SIZE LOGGER RUN_NAME OUTPUT_ROOT TRAINING_ENTRYPOINT; do
+for name in MODEL_DIR DATA_DIR NUM_GPUS NUM_POLICY_GPUS NUM_INFERENCE_GPUS MINI_BATCH_SIZE MICRO_BATCH_SIZE LOGGER RUN_NAME OUTPUT_ROOT TRAINING_ENTRYPOINT; do
   if [[ ${!name+x} ]]; then
     printf -v value '%q' "${!name}"
     remote+="$name=$value "

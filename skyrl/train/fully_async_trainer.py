@@ -594,11 +594,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                                 )
                             # Save the end-of-epoch checkpoint the normal is_epoch_end path would have, since
                             # we break before reaching it.
-                            if self.cfg.trainer.ckpt_interval > 0:
+                            if self.cfg.trainer.fully_async.save_at_epoch_end and self.cfg.trainer.ckpt_interval > 0:
                                 with self._phase_gauge.timed_phase("save_checkpoints", self.all_timings):
                                     ckpt_path = await asyncio.to_thread(self.save_checkpoints)
                                 self._fire("on_save", ckpt_path=ckpt_path)
-                            if self.cfg.trainer.hf_save_interval > 0:
+                            if self.cfg.trainer.fully_async.save_at_epoch_end and self.cfg.trainer.hf_save_interval > 0:
                                 with self._phase_gauge.timed_phase("save_hf_model", self.all_timings):
                                     await asyncio.to_thread(self.save_models)
                             break
@@ -675,8 +675,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
                     # 7. Checkpointing. At interval, at the last step of each epoch, and when a callback asks.
                     is_epoch_end = trained_steps_this_epoch == self.num_steps_per_epoch
+                    save_at_epoch_end = self.cfg.trainer.fully_async.save_at_epoch_end and is_epoch_end
                     ckpt_interval_save = self.cfg.trainer.ckpt_interval > 0 and (
-                        is_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0
+                        save_at_epoch_end or self.global_step % self.cfg.trainer.ckpt_interval == 0
                     )
                     if force_save or ckpt_interval_save:
                         async with self._step_deadline():
@@ -684,7 +685,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                                 ckpt_path = await asyncio.to_thread(self.save_checkpoints)
                         self._fire("on_save", ckpt_path=ckpt_path)
                     if self.cfg.trainer.hf_save_interval > 0:
-                        if is_epoch_end or self.global_step % self.cfg.trainer.hf_save_interval == 0:
+                        if save_at_epoch_end or self.global_step % self.cfg.trainer.hf_save_interval == 0:
                             async with self._step_deadline():
                                 with self._phase_gauge.timed_phase("save_hf_model", self.all_timings):
                                     await asyncio.to_thread(self.save_models)

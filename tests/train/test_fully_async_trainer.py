@@ -6,7 +6,7 @@ UID tracking, and the consumer's exhaustion-aware buffer drain.
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from torchdata.stateful_dataloader import StatefulDataLoader
@@ -18,6 +18,73 @@ from skyrl.train.fully_async_trainer import (
     _AsyncStalenessManager,
 )
 from skyrl.train.utils.async_utils import BackgroundFailure
+from tests.train.util import example_dummy_config
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("save_at_epoch_end", [False, True])
+@pytest.mark.parametrize("exhaust_early", [False, True])
+async def test_train_epoch_end_saving(monkeypatch, save_at_epoch_end, exhaust_early):
+    """Exercise the real loop: optional epoch saves, periodic saves, and final draining."""
+    cfg = example_dummy_config()
+    cfg.trainer.epochs = 2
+    cfg.trainer.policy_mini_batch_size = 2
+    cfg.trainer.algorithm.policy_loss_type = "flashreinforce"
+    cfg.trainer.algorithm.zero_variance_filter = exhaust_early
+    cfg.trainer.placement.colocate_all = False
+    cfg.trainer.fully_async.enabled = True
+    cfg.trainer.fully_async.num_parallel_generation_workers = 2
+    cfg.trainer.fully_async.sample_full_batch = exhaust_early
+    if not save_at_epoch_end:
+        cfg.trainer.fully_async.save_at_epoch_end = False
+    cfg.trainer.eval_interval = 0
+    cfg.trainer.ckpt_interval = cfg.trainer.hf_save_interval = 3
+    cfg.trainer.update_ref_every_epoch = False
+    cfg.trainer.enable_ray_gpu_monitor = False
+    cfg.generator.inference_engine.enable_ray_prometheus_stats = False
+    loader = StatefulDataLoader(list(range(4)), batch_size=1)
+    monkeypatch.setattr("skyrl.train.fully_async_trainer.build_dataloader", lambda *args, **kwargs: loader)
+    trainer = FullyAsyncRayPPOTrainer(
+        cfg=cfg,
+        tracker=MagicMock(),
+        tokenizer=MagicMock(),
+        train_dataset=None,
+        inference_engine_client=None,
+        generator=None,
+    )
+    trainer.dispatch = MagicMock()
+    trainer.dispatch.save_weights_for_sampler = AsyncMock()
+    trainer.dispatch.get_timing_metrics.return_value = {}
+    monkeypatch.setattr(trainer, "init_weight_sync_state", lambda: None)
+    monkeypatch.setattr(trainer, "_run_generate_for_a_group_loop", AsyncMock())
+    monkeypatch.setattr(trainer, "convert_generation_group_mini_batch_to_training_input", lambda *args: None)
+    monkeypatch.setattr(trainer, "_run_training", AsyncMock(return_value={"loss": 0.0}))
+
+    async def collect(*args):
+        trained = trainer.async_train_dataloader.num_trained()
+        exhausted = exhaust_early and trained == 2
+        uids = [str(trained)] if exhausted else [str(trained), str(trained + 1)]
+        groups = []
+        for uid in uids:
+            await trainer._staleness_manager.acquire_submission_slot()
+            await trainer._staleness_manager.on_rollout_accepted()
+            groups.append(
+                GeneratedOutputGroup(generator_output={}, uid=uid, global_step_when_scheduled=trainer.global_step)
+            )
+        return groups, [], exhausted
+
+    monkeypatch.setattr(trainer, "_collect_generation_mini_batch", collect)
+    checkpoint_steps, export_steps = [], []
+    monkeypatch.setattr(trainer, "save_checkpoints", lambda: checkpoint_steps.append(trainer.global_step))
+    monkeypatch.setattr(trainer, "save_models", lambda: export_steps.append(trainer.global_step))
+    await asyncio.wait_for(trainer.train(), timeout=10)
+    expected = (
+        ([2, 3, 3] if save_at_epoch_end else [3]) if exhaust_early else ([2, 3, 4, 5] if save_at_epoch_end else [3, 5])
+    )
+    assert checkpoint_steps == export_steps == expected
+    assert trainer._run_training.await_count == (2 if exhaust_early else 4)
+    trainer.dispatch.finalize_pending_saves.assert_called_once_with("policy")
+    trainer.tracker.finish.assert_called_once()
 
 
 def _make_async_dataloader(num_prompts: int, mini_batch_size: int) -> _AsyncDataloader:

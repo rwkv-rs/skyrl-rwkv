@@ -120,7 +120,13 @@ MODEL_DIR="$MODEL_DIR" bash examples/train/rwkv/run_rwkv_flashreinforce.sh
 ```
 
 The synchronous entry point above keeps `trainer.train_batch_size == trainer.policy_mini_batch_size`; each
-fresh batch is consumed by exactly one optimizer step. The launcher keeps generated action tokens
+fresh batch is consumed by exactly one optimizer step. `MINI_BATCH_SIZE` sets both sizes (default 128);
+`MICRO_BATCH_SIZE` controls per-GPU memory use (default 2). `NUM_POLICY_GPUS` and
+`NUM_INFERENCE_GPUS` independently select training GPUs and TP1 inference engines, each falling
+back to `NUM_GPUS` (default 8). Unequal counts require `trainer.placement.colocate_all=false`.
+The optimizer is AdamW with LR `1e-6`, cosine decay, weight decay `0.1`, and gradient clip `1.0`.
+Training sampling is temperature `1.0`, top-p `1.0`, top-k `-1`, without penalties; evaluation
+sampling is unchanged. The launcher keeps generated action tokens
 in the loss mask for truncated rollouts; those rollouts retain zero reward and contribute signed
 failure feedback. The FlashREINFORCE launcher enables the opt-in strict GSM8K reward: the response
 must contain one non-empty thought, an answer after `</think>`, a real EOS token, and no truncation.
@@ -143,6 +149,65 @@ replays logits over the same support (128 candidates by default). For the untrun
 sampling distribution, use `generator.sampling_params.temperature=1.0`,
 `generator.sampling_params.top_p=1.0`, `generator.sampling_params.top_k=-1`, and
 `generator.sampling_params.additional_kwargs=null`.
+
+## FlashREINFORCE resource tuning
+
+The hyperparameter reference is the Qwen2.5-Math-1.5B experiment in
+[FlashREINFORCE, Appendix A.3, Table 13](https://www.researchgate.net/publication/414274571_FlashREINFORCE_FLASHREINFORCE_CRITIC-FREE_SINGLE-ROLLOUT_ASYNCHRONOUS_RL_FOR_AGENTIC_LANGUAGE_MODELS):
+128 distinct prompts, one rollout per prompt, one full-batch update without reuse, AdamW
+LR `1e-6`, cosine decay, weight decay `0.1`, gradient clip `1.0`, and gate `3e-3`.
+The RWKV/GSM8K token budgets and evaluation sampling remain unchanged. Batch 512 below is a
+resource-tuning candidate, not a paper-reproduction setting; do not linearly scale its LR.
+[Score Centering, Appendix B.1](https://arxiv.org/html/2609.20807v1#A2.SS1) instead uses SGD
+LR `0.01` and eight completions per prompt for GRPO experiments. Its correction does not
+require importing that optimizer or sibling-rollout count into FlashREINFORCE.
+
+The following candidate separates two FSDP training GPUs from one TP1 inference GPU. It
+reserves three rather than eight GPUs, but fit, throughput, and training quality still require
+a healthy-host benchmark. Start with `MINI_BATCH_SIZE=128` for the paper-sized baseline, then
+512; compare admitted trajectories per GPU-hour and reward versus total rollouts, not just
+seconds per optimizer step. In the 512 configuration, micro-batch 2 on two training ranks means
+128 forward/backward accumulation rounds per update. A larger global batch amortizes weight
+sync but does not imply faster steps or allow a larger micro-batch automatically.
+
+From the local checkout, use the verified SSH launcher after host memory faults are repaired:
+
+```bash
+NUM_POLICY_GPUS=2 NUM_INFERENCE_GPUS=1 MINI_BATCH_SIZE=512 MICRO_BATCH_SIZE=2 \
+TRAINING_ENTRYPOINT=examples.train.fully_async.main_fully_async \
+RUN_NAME=rwkv7-g1j-1.5b-20260831-ctx16384-gsm8k-flashreinforce-sc-2train-1infer-b512 \
+./temp/run.sh \
+  trainer.placement.colocate_all=false \
+  trainer.placement.colocate_policy_ref=false \
+  trainer.fully_async.enabled=true \
+  trainer.fully_async.max_staleness_steps=1 \
+  trainer.fully_async.num_parallel_generation_workers=512 \
+  trainer.fully_async.save_at_epoch_end=false \
+  trainer.algorithm.flashreinforce.score_centering=true \
+  trainer.algorithm.flashreinforce.sequence_kl_threshold=0.003 \
+  trainer.max_training_steps=1000 trainer.epochs=1000 \
+  generator.inference_engine.max_num_seqs=128 \
+  > /tmp/results_rwkv_flashreinforce_sc_2train_1infer_b512.log 2>&1
+```
+
+For batch 128, also change `num_parallel_generation_workers` to 128 and use a distinct run name.
+Generation workers are async request tasks, not GPU replicas; the trainer requires their count
+between `MINI_BATCH_SIZE` and `MINI_BATCH_SIZE * (max_staleness_steps + 1)`. `max_num_seqs=128`
+bounds simultaneously active sequences on the single inference engine. Staleness control is
+capacity-based: still inspect the actual `async/staleness_*` metrics and admission rate.
+Keep the gate and raw 128-candidate Score-Centering support unchanged.
+
+Benchmark micro-batches 2, 4, and 8 with the same global batch, retaining gradient checkpointing
+and monitoring peak memory. Also compare one training GPU plus one inference GPU if it fits;
+two plus one is not asserted to be optimal. Measure `timing/policy_train`,
+`timing/sync_weights_pause_generation`, `timing/sync_weights_only_transfer`,
+`timing/sync_weights_resume_generation`, and buffer wait alongside GPU utilization.
+
+`trainer.fully_async.save_at_epoch_end=false` keeps 50-step evaluation/checkpoint/export
+intervals and the final save, while disabling additional epoch-boundary saves. Its default is
+`true`, preserving other fully-async callers. The earlier saves at steps 116, 232, and 348
+were epoch boundaries (`floor(7473 / 64) = 116`); batch 512 would shorten epochs to 14 updates
+and otherwise create substantially more weight files. Existing retention settings are unchanged.
 
 ## RWKV trajectory logging
 

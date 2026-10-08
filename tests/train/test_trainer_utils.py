@@ -1027,8 +1027,9 @@ def test_build_dataloader_worker_config(
 @pytest.mark.parametrize("through_ssh", [False, True])
 @pytest.mark.parametrize("separate_resources", [False, True])
 @pytest.mark.parametrize("micro_batch_size", [None, 2])
+@pytest.mark.parametrize("model_dir", [None, "/weights/custom"])
 def test_rwkv_flashreinforce_launcher_resources(
-    tmp_path, monkeypatch, through_ssh, separate_resources, micro_batch_size
+    tmp_path, monkeypatch, through_ssh, separate_resources, micro_batch_size, model_dir
 ):
     """Execute the real launchers with fake uv/SSH, then parse their actual CLI overrides."""
     root = Path(__file__).resolve().parents[2]
@@ -1042,7 +1043,7 @@ def test_rwkv_flashreinforce_launcher_resources(
         "uv": 'printf "%s\\0" "GENERATE_CONCURRENCY=${SKYRL_GENERATE_CONCURRENCY_PER_ENGINE:-}" "$@" >> "$COMMAND_CAPTURE"\n',
         "ssh": (
             '[[ "$1" == rwkv-sha-pro6000x8 ]] || exit 1\n'
-            "unset NUM_GPUS NUM_POLICY_GPUS NUM_INFERENCE_GPUS MINI_BATCH_SIZE MICRO_BATCH_SIZE "
+            "unset MODEL_DIR NUM_GPUS NUM_POLICY_GPUS NUM_INFERENCE_GPUS MINI_BATCH_SIZE MICRO_BATCH_SIZE "
             "LOGGER RUN_NAME OUTPUT_ROOT TRAINING_ENTRYPOINT SKYRL_GENERATE_CONCURRENCY_PER_ENGINE\n"
             'exec bash -c "${2#* && }"\n'
         ),
@@ -1052,6 +1053,12 @@ def test_rwkv_flashreinforce_launcher_resources(
         stub.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     monkeypatch.setenv("COMMAND_CAPTURE", str(capture))
+    if model_dir is None:
+        monkeypatch.delenv("MODEL_DIR", raising=False)
+    else:
+        monkeypatch.setenv("MODEL_DIR", model_dir)
+    monkeypatch.delenv("RUN_NAME", raising=False)
+    monkeypatch.delenv("OUTPUT_ROOT", raising=False)
     monkeypatch.setenv("NUM_GPUS", "4")
     if micro_batch_size is None:
         monkeypatch.delenv("MICRO_BATCH_SIZE", raising=False)
@@ -1084,6 +1091,10 @@ def test_rwkv_flashreinforce_launcher_resources(
     assert argv[module_index] == (
         "examples.train.fully_async.main_fully_async" if separate_resources else "skyrl.train.entrypoints.main_base"
     )
+    assert cfg.trainer.policy.model.path == (
+        model_dir or str(Path.home() / "Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600")
+    )
+    assert cfg.trainer.run_name == "rwkv7-g1k-1.5b-20260930-ctx25600-gsm8k-flashreinforce-50step"
     assert cfg.trainer.placement.policy_num_gpus_per_node == (2 if separate_resources else 4)
     assert cfg.generator.inference_engine.num_engines == (1 if separate_resources else 4)
     assert cfg.trainer.train_batch_size == cfg.trainer.policy_mini_batch_size == (512 if separate_resources else 128)
@@ -1113,6 +1124,36 @@ def test_rwkv_flashreinforce_launcher_resources(
         assert cfg.trainer.fully_async.max_staleness_steps == 1
         assert cfg.generator.inference_engine.max_num_seqs == 128
         assert cfg.trainer.algorithm.flashreinforce.score_centering
+
+
+@pytest.mark.parametrize("model_dir", [None, "/weights/custom"])
+def test_rwkv_grpo_launcher_default_model(tmp_path, monkeypatch, model_dir):
+    root = Path(__file__).resolve().parents[2]
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    capture = tmp_path / "argv"
+    uv = bin_dir / "uv"
+    uv.write_text('#!/usr/bin/env bash\nset -euo pipefail\nprintf "%s\\0" "$@" >> "$COMMAND_CAPTURE"\n')
+    uv.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+    monkeypatch.setenv("COMMAND_CAPTURE", str(capture))
+    for name in ("MODEL_DIR", "RUN_NAME", "OUTPUT_ROOT"):
+        monkeypatch.delenv(name, raising=False)
+    if model_dir is not None:
+        monkeypatch.setenv("MODEL_DIR", model_dir)
+    subprocess.run(
+        ["bash", str(root / "examples/train/rwkv/run_rwkv_grpo.sh")],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    argv = capture.read_bytes().decode().rstrip("\0").split("\0")
+    cfg = SkyRLTrainConfig.from_cli_overrides(argv[argv.index("-m") + 2 :])
+    assert cfg.trainer.policy.model.path == (
+        model_dir or str(Path.home() / "Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600")
+    )
+    assert cfg.trainer.run_name == "rwkv7-g1k-1.5b-20260930-ctx25600-gsm8k-grpo-50step"
 
 
 def test_validate_generator_output_invalid_rewards():

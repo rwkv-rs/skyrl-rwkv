@@ -5,8 +5,14 @@ This recipe runs the native SkyRL FSDP Trainer, vLLM InferenceEngines, weight sy
 ## Artifact contract
 
 - Repository: `rwkv-rs/rwkv7-g1-st`
-- Subfolder: `rwkv7-g1j-1.5b-20260831-ctx16384`
-- Revision: `e1a670a5523742b5cfe8cb6759c1eb8f1d88b637`
+- Subfolder / default weight: `rwkv7-g1k-1.5b-20260930-ctx25600`
+- Revision: `b672701cccf4bddcc66f65c8c9a468b776c9836a`
+- Source repository: `BlinkDL/rwkv7-g1`
+- Source revision: `cd67fb95fa9e2ce8757f8d21d713e74a9c788118`
+- Source file: `rwkv7-g1k-1.5b-20260930-ctx25600.pth`
+- Source SHA256: `dfc1fc450641d5e00c5f412b5530a17b2a734ac02bde04d98c57608f5daaf773`
+- HF converter: `rwkv-rs/transformers-rwkv`, commit `25674160e9786b191aa3642045f3615c05502af3`
+- Tokenizer: `rwkv-rs/rwkv7-g1-st`, revision `fd122cc7244c28db19beceb398aa033c35576b71`
 - Architecture: `rwkv7`
 - `model_type`: `rwkv`
 - `wkv_mode`: `fp32io16`
@@ -22,10 +28,14 @@ The launcher uses the persistent `$HOME/.cache/skyrl-rwkv/torch_extensions` cach
 
 ## Download and verify the model
 
+The authoritative HF repository already contains the converted BF16 G1k checkpoint. No local
+conversion is needed. Both training launchers default to this exact release; `MODEL_DIR` remains
+an explicit override. Keep the downloaded `PROVENANCE.md` and shard checksums with the experiment.
+
 ```bash
 MODEL_REPO=rwkv-rs/rwkv7-g1-st
-MODEL_REVISION=e1a670a5523742b5cfe8cb6759c1eb8f1d88b637
-MODEL_SUBFOLDER=rwkv7-g1j-1.5b-20260831-ctx16384
+MODEL_REVISION=b672701cccf4bddcc66f65c8c9a468b776c9836a
+MODEL_SUBFOLDER=rwkv7-g1k-1.5b-20260930-ctx25600
 MODEL_ROOT="$HOME/Weights/RWKV/hf"
 
 hf download "$MODEL_REPO" \
@@ -45,7 +55,7 @@ Prepare the native FlashRWKV2 extension once, in the same project environment an
 MAX_JOBS=2 bash examples/train/rwkv/run_rwkv_grpo.sh --prepare-flashrwkv2
 ```
 
-The local model directory is `$HOME/Weights/RWKV/hf/$MODEL_SUBFOLDER`; keep the pinned revision and resulting Safetensors checksums with the run report. The Trainer and every vLLM engine must receive the same `MODEL_DIR`.
+The local model directory is `$HOME/Weights/RWKV/hf/$MODEL_SUBFOLDER`; keep the pinned source/converter revisions and resulting Safetensors checksums with the run report. The Trainer and every vLLM engine must receive the same `MODEL_DIR`.
 
 ## Verify the three prompt styles
 
@@ -197,7 +207,7 @@ From the local checkout, use the verified SSH launcher after host memory faults 
 NUM_POLICY_GPUS=2 NUM_INFERENCE_GPUS=1 MINI_BATCH_SIZE=512 MICRO_BATCH_SIZE=2 \
 SKYRL_GENERATE_CONCURRENCY_PER_ENGINE=64 \
 TRAINING_ENTRYPOINT=examples.train.fully_async.main_fully_async \
-RUN_NAME=rwkv7-g1j-1.5b-20260831-ctx16384-gsm8k-flashreinforce-sc-2train-1infer-b512 \
+RUN_NAME=rwkv7-g1k-1.5b-20260930-ctx25600-gsm8k-flashreinforce-sc-2train-1infer-b512 \
 ./temp/run.sh \
   trainer.placement.colocate_all=false \
   trainer.placement.colocate_policy_ref=false \

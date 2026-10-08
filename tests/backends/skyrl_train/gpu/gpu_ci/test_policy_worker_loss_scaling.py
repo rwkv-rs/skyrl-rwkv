@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import math
+import socket
+from types import SimpleNamespace
 from typing import Callable, Literal
 
 import pytest
@@ -218,3 +220,102 @@ def test_policy_loss_fsdp_megatron_consistent(ray_init_fixture, micro_batch_size
             rel=2e-2,
             abs=2e-1,
         )
+
+
+def _fsdp_accumulation_rank(rank, world_size, port):
+    """Compare native FSDP gradients, clipping, and repeated AdamW updates."""
+    from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
+
+    from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
+        create_device_mesh,
+        fsdp2_clip_grad_norm_,
+    )
+    from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase
+
+    torch.cuda.set_device(rank)
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.distributed.init_process_group(
+        "nccl", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size
+    )
+    try:
+        generator = torch.Generator().manual_seed(1234 + rank)
+        inputs = torch.randn(5, 8, generator=generator, device="cpu").cuda()
+        targets = torch.randn(5, 4, generator=generator, device="cpu").cuda()
+        for fsdp_size in (world_size, 1):
+            mesh = create_device_mesh(world_size, fsdp_size)
+            for dtype in (torch.float32, torch.bfloat16):
+                reference = None
+                for micro_size, sync_each, padding in (
+                    (5, True, False),
+                    (2, True, False),
+                    (2, False, False),
+                    (2, False, True),
+                ):
+                    torch.manual_seed(42)
+                    model = torch.nn.Sequential(torch.nn.Linear(8, 16), torch.nn.Tanh(), torch.nn.Linear(16, 4)).cuda()
+                    kwargs = {
+                        "mesh": mesh,
+                        "mp_policy": MixedPrecisionPolicy(param_dtype=dtype, reduce_dtype=torch.float32),
+                        "reshard_after_forward": False,
+                    }
+                    fully_shard(model[0], **kwargs)
+                    fully_shard(model[2], **kwargs)
+                    fully_shard(model, **kwargs)
+                    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.1)
+                    worker = SimpleNamespace(
+                        cfg=SimpleNamespace(
+                            policy=SimpleNamespace(
+                                fsdp_config=SimpleNamespace(sync_gradients_each_microbatch=sync_each)
+                            )
+                        ),
+                        model=SimpleNamespace(model=model),
+                    )
+                    results = []
+                    for _ in range(2):
+                        batches = [
+                            (inputs[i : i + micro_size], targets[i : i + micro_size]) for i in range(0, 5, micro_size)
+                        ]
+                        if padding:
+                            batches.append((inputs[:1], None))
+                        loss_sum = torch.zeros((), device="cuda")
+                        for index, (x, y) in enumerate(batches):
+                            with FSDPPolicyWorkerBase._microbatch_context(worker, is_last=index == len(batches) - 1):
+                                output = model(x).float()
+                                loss = (
+                                    (output - y).square().sum() / targets.numel() if y is not None else output.sum() * 0
+                                )
+                                loss.backward()
+                                loss_sum += loss.detach()
+                        torch.distributed.all_reduce(loss_sum)
+                        loss_sum /= world_size
+                        gradients = [p.grad.full_tensor().detach().cpu().clone() for p in model.parameters()]
+                        norm = fsdp2_clip_grad_norm_(model.parameters(), 0.3).full_tensor().detach().cpu().clone()
+                        optimizer.step()
+                        weights = [p.full_tensor().detach().cpu().clone() for p in model.parameters()]
+                        results.append([loss_sum.cpu(), norm, *gradients, *weights])
+                        optimizer.zero_grad()
+                    if reference is None:
+                        reference = results
+                    else:
+                        for expected_step, actual_step in zip(reference, results, strict=True):
+                            for expected, actual in zip(expected_step, actual_step, strict=True):
+                                torch.testing.assert_close(
+                                    actual,
+                                    expected,
+                                    rtol=5e-3 if dtype == torch.bfloat16 else 1e-5,
+                                    atol=2e-4 if dtype == torch.bfloat16 else 1e-6,
+                                )
+                    del optimizer, model, worker
+        torch.distributed.barrier()
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_native_fsdp_accumulation_gradients_and_optimizer():
+    """Unbalanced final/padding microbatches match full-batch FSDP and HSDP updates."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Requires two CUDA GPUs")
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    torch.multiprocessing.spawn(_fsdp_accumulation_rank, args=(2, port), nprocs=2, join=True)

@@ -9,6 +9,7 @@ import torch
 from pytest import approx
 
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase
 from skyrl.backends.skyrl_train.workers.worker import PolicyWorkerBase
 from skyrl.train.config import SkyRLTrainConfig
 
@@ -18,8 +19,8 @@ class _NoopDeviceMesh:
         return None
 
 
-def _make_policy_worker(cfg, rank=0, dp_size=1, strategy=None, model=None, scheduler=None):
-    worker = PolicyWorkerBase(
+def _make_policy_worker(cfg, rank=0, dp_size=1, strategy=None, model=None, scheduler=None, worker_cls=PolicyWorkerBase):
+    worker = worker_cls(
         cfg=cfg.trainer,
         world_size=dp_size,
         rank=rank,
@@ -185,3 +186,60 @@ def test_policy_forward_backward_loss_scaling_with_mocked_ranks(loss_fn):
             assert sum_payload["final_loss"] == approx(expected_local_metric[rank])
             assert result.metrics["policy_loss"] == approx(expected_global_metric)
             assert result.metrics["final_loss"] == approx(expected_global_metric)
+
+
+@pytest.mark.parametrize("sync_each", [True, False])
+@pytest.mark.parametrize("micro_batch_size", [1, 2, 8])
+@pytest.mark.parametrize("loss_fn", ["cross_entropy", "dual_clip"])
+def test_fsdp_accumulation_preserves_gradients_and_final_microbatch(sync_each, micro_batch_size, loss_fn):
+    cfg = _make_loss_scaling_cfg(loss_fn, micro_batch_size)
+    cfg.trainer.policy.fsdp_config.sync_gradients_each_microbatch = sync_each
+    batch, _ = _make_loss_scaling_batch([1, 2, 3, 4, 5], loss_fn)
+    parameter = torch.nn.Parameter(torch.zeros(5))
+    strategy = MagicMock()
+    strategy.backward.side_effect = lambda loss, model, optimizer: loss.backward()
+    strategy.all_reduce.side_effect = lambda metrics, **kwargs: dict(metrics)
+    model = MagicMock()
+
+    def forward(sequences, num_actions, **kwargs):
+        return parameter[sequences[:, 0]].unsqueeze(-1), {"entropy": torch.zeros((len(sequences), num_actions + 1))}
+
+    model.side_effect = forward
+    worker = _make_policy_worker(cfg, strategy=strategy, model=model, worker_cls=FSDPPolicyWorkerBase)
+    with _patch_worker_cuda_for_cpu():
+        output = worker.forward_backward(batch, loss_fn=loss_fn)
+        # A second call must start with the default communication state again.
+        worker.forward_backward(batch, loss_fn=loss_fn)
+
+    expected = -torch.ones(5) / 5 if loss_fn == "cross_entropy" else torch.arange(1, 6, dtype=torch.float32)
+    torch.testing.assert_close(parameter.grad, 2 * expected)
+    assert len(output.loss_fn_outputs) == 5
+    num_microbatches = (5 + micro_batch_size - 1) // micro_batch_size
+    expected_flags = (
+        [value for i in range(num_microbatches) for value in (i == num_microbatches - 1, True)] * 2
+        if not sync_each
+        else []
+    )
+    for method in ("set_requires_gradient_sync", "set_reshard_after_backward", "set_is_last_backward"):
+        assert [args[0] for args, _ in getattr(model.model, method).call_args_list] == expected_flags
+
+
+def test_fsdp_accumulation_restores_flags_after_exception():
+    cfg = _make_loss_scaling_cfg("cross_entropy", 2)
+    cfg.trainer.policy.fsdp_config.sync_gradients_each_microbatch = False
+    model = MagicMock()
+    worker = _make_policy_worker(cfg, model=model, worker_cls=FSDPPolicyWorkerBase)
+    with pytest.raises(RuntimeError, match="probe"):
+        with worker._microbatch_context(is_last=False):
+            raise RuntimeError("probe")
+    for method in ("set_requires_gradient_sync", "set_reshard_after_backward", "set_is_last_backward"):
+        assert [args[0] for args, _ in getattr(model.model, method).call_args_list] == [False, True]
+
+
+def test_fsdp_accumulation_rejects_native_cpu_offload():
+    cfg = _make_loss_scaling_cfg("cross_entropy", 2)
+    cfg.trainer.policy.fsdp_config.sync_gradients_each_microbatch = False
+    cfg.trainer.policy.fsdp_config.cpu_offload = True
+    worker = _make_policy_worker(cfg, worker_cls=FSDPPolicyWorkerBase)
+    with pytest.raises(ValueError, match="requires cpu_offload=False"):
+        worker.init_model("unused")

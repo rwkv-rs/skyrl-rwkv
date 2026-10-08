@@ -1018,16 +1018,17 @@ class PolicyWorkerBase(Worker):
         all_metrics = defaultdict(list)
         loss_fn_output_batches = []  # per-microbatch; restored to input order below
 
-        for microbatch in microbatch_iterator:
+        for microbatch_index, microbatch in enumerate(microbatch_iterator):
             experience = BaseBatchIterator.batch_to_experience(microbatch)
             microbatch_weight = len(microbatch) / len(data)
-            metrics = self._forward_backward_micro(
-                experience,
-                microbatch_weight,
-                loss_fn=loss_fn,
-                loss_fn_config=loss_fn_config,
-                return_per_token_outputs=return_per_token_outputs,
-            )
+            with self._microbatch_context(is_last=microbatch_index == len(microbatch_iterator) - 1):
+                metrics = self._forward_backward_micro(
+                    experience,
+                    microbatch_weight,
+                    loss_fn=loss_fn,
+                    loss_fn_config=loss_fn_config,
+                    return_per_token_outputs=return_per_token_outputs,
+                )
 
             # Extract loss_fn_outputs before reduce_metrics (it's not a scalar metric)
             loss_fn_output_batches.append(metrics.pop("loss_fn_outputs", []))
@@ -1062,6 +1063,11 @@ class PolicyWorkerBase(Worker):
         result = all_reduce_metrics(result, self.strategy, group=dp_group, sum_loss_metrics=True)
 
         return WorkerOutput(loss_fn_outputs=all_loss_fn_outputs, metrics=result)
+
+    @contextmanager
+    def _microbatch_context(self, *, is_last: bool):
+        """Control backend communication around one forward/backward microbatch."""
+        yield
 
     def _forward_backward_micro(
         self,

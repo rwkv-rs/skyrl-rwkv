@@ -248,6 +248,12 @@ class FSDPConfig(BaseConfig):
     ``-1`` shards across all workers in the group. Example: with 8 workers across 2 nodes (4 each)
     and ``fsdp_size=4``, training state is fully sharded across the 4 ranks within each node and
     replicated (data-parallel) across nodes."""
+    sync_gradients_each_microbatch: bool = True
+    """Synchronize gradients after every microbatch (the default).
+    When False, accumulate locally and synchronize only on the final microbatch, retaining
+    unsharded parameters between backward passes. Requires cpu_offload=False. Combine with
+    reshard_after_forward=False to avoid repeated parameter all-gathers during accumulation.
+    """
     mixed_precision: Optional[MixedPrecisionConfig] = None
     # specify wrap policy as a dict with `transformer_layer_cls_to_wrap` key for custom module based wrapping
     wrap_policy: dict = field(default_factory=dict)

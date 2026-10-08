@@ -1,5 +1,6 @@
 import io
 import os
+from contextlib import contextmanager
 from typing import TYPE_CHECKING, Optional
 
 import ray
@@ -44,6 +45,8 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
     def init_model(self, model_path, num_training_steps: int = None):
         assert self.cfg.strategy == "fsdp"
+        if self.cfg.policy.fsdp_config.cpu_offload and not self.cfg.policy.fsdp_config.sync_gradients_each_microbatch:
+            raise ValueError("Deferred FSDP gradient synchronization requires cpu_offload=False.")
         strategy = FSDPStrategy(
             fsdp_config=self.cfg.policy.fsdp_config,
             # Inference-only workers skip the optimizer entirely: passing None makes
@@ -112,6 +115,23 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
         # Created only on profiled ranks.
         self.profiler = build_profiler_from_policy_cfg(self.cfg)
+
+    @contextmanager
+    def _microbatch_context(self, *, is_last: bool):
+        if self.cfg.policy.fsdp_config.sync_gradients_each_microbatch:
+            yield
+            return
+
+        model = self.model.model
+        model.set_is_last_backward(is_last)
+        model.set_requires_gradient_sync(is_last)
+        model.set_reshard_after_backward(is_last)
+        try:
+            yield
+        finally:
+            model.set_is_last_backward(True)
+            model.set_requires_gradient_sync(True)
+            model.set_reshard_after_backward(True)
 
     def _build_weight_source(self, dtype: "torch.dtype", backend: str):
         """``WeightSource`` over the FSDP-sharded policy model.

@@ -1026,7 +1026,10 @@ def test_build_dataloader_worker_config(
 
 @pytest.mark.parametrize("through_ssh", [False, True])
 @pytest.mark.parametrize("separate_resources", [False, True])
-def test_rwkv_flashreinforce_launcher_resources(tmp_path, monkeypatch, through_ssh, separate_resources):
+@pytest.mark.parametrize("micro_batch_size", [None, 2])
+def test_rwkv_flashreinforce_launcher_resources(
+    tmp_path, monkeypatch, through_ssh, separate_resources, micro_batch_size
+):
     """Execute the real launchers with fake uv/SSH, then parse their actual CLI overrides."""
     root = Path(__file__).resolve().parents[2]
     launcher = tmp_path / "examples/train/rwkv/run_rwkv_flashreinforce.sh"
@@ -1050,7 +1053,10 @@ def test_rwkv_flashreinforce_launcher_resources(tmp_path, monkeypatch, through_s
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
     monkeypatch.setenv("COMMAND_CAPTURE", str(capture))
     monkeypatch.setenv("NUM_GPUS", "4")
-    monkeypatch.setenv("MICRO_BATCH_SIZE", "2")
+    if micro_batch_size is None:
+        monkeypatch.delenv("MICRO_BATCH_SIZE", raising=False)
+    else:
+        monkeypatch.setenv("MICRO_BATCH_SIZE", str(micro_batch_size))
     monkeypatch.setenv("SKYRL_GENERATE_CONCURRENCY_PER_ENGINE", "64")
     for name in ("NUM_POLICY_GPUS", "NUM_INFERENCE_GPUS", "MINI_BATCH_SIZE", "TRAINING_ENTRYPOINT"):
         monkeypatch.delenv(name, raising=False)
@@ -1081,7 +1087,13 @@ def test_rwkv_flashreinforce_launcher_resources(tmp_path, monkeypatch, through_s
     assert cfg.trainer.placement.policy_num_gpus_per_node == (2 if separate_resources else 4)
     assert cfg.generator.inference_engine.num_engines == (1 if separate_resources else 4)
     assert cfg.trainer.train_batch_size == cfg.trainer.policy_mini_batch_size == (512 if separate_resources else 128)
-    assert cfg.trainer.micro_train_batch_size_per_gpu == cfg.trainer.micro_forward_batch_size_per_gpu == 2
+    assert (
+        cfg.trainer.micro_train_batch_size_per_gpu
+        == cfg.trainer.micro_forward_batch_size_per_gpu
+        == (32 if micro_batch_size is None else micro_batch_size)
+    )
+    assert cfg.trainer.policy.fsdp_config.reshard_after_forward is False
+    assert cfg.trainer.policy.fsdp_config.sync_gradients_each_microbatch is False
     assert cfg.trainer.update_epochs_per_batch == cfg.generator.n_samples_per_prompt == 1
     assert cfg.trainer.fully_async.save_at_epoch_end is (not separate_resources)
     assert cfg.trainer.placement.colocate_all is (not separate_resources)

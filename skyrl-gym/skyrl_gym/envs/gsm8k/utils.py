@@ -111,6 +111,7 @@ def _extract_after_think(solution_str: str) -> Optional[Tuple[str, str]]:
 
 def _normalize_math_answer(answer: str) -> str:
     """Remove thousands separators in scalar positions, not tuples or sets."""
+    answer = re.sub(r"\{\s*,\s*\}", ",", answer)
     number = r"[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?"
     for prefix in (r"^", r"\\(?:[dt]?frac|sqrt)\{", r"\\[dt]?frac\{[^{}]*\}\{"):
         answer = re.sub(

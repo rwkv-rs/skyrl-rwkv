@@ -41,6 +41,8 @@ uv run --isolated --no-project .venv/bin/python examples/train/rwkv/rollout.py \
 ```
 
 By default, every CUDA-visible GPU gets one TP1 engine with `max_num_seqs=1024`.
+Before feeding data, each owned engine must pass a deterministic strict-Math/EOS smoke check;
+a failing engine stops the invocation before the full request queue is created.
 The HTTP window is twice the running-sequence capacity so completed sequences are immediately
 replaced: **16,384 in-flight generations across eight engines**, with at most 8,192 sequences
 running on the GPUs. `CUDA_VISIBLE_DEVICES` restricts placement; `--base-url` reuses comma-separated
@@ -78,8 +80,22 @@ Each run gets a timestamped model-specific output directory containing:
   `correct_samples.jsonl`, `wrong_samples.jsonl`, and `unanswered_samples.jsonl`, written on exit.
 - `vllm_gpu_*.log` and `vllm.pids`: logs and identities of engines owned by this run.
 
-Existing result files are not overwritten. Completion, failure, and SIGTERM shut down only engines
-started by this invocation; externally supplied engines remain running.
+Existing result files are not overwritten. To resume an interrupted run:
+
+```bash
+uv run --isolated --no-project .venv/bin/python examples/train/rwkv/rollout.py \
+  --output outputs/<existing-run> --resume > /tmp/results_ultradata_resume.log 2>&1
+```
+
+Resume restores counts, histograms, reasons, and saved examples, then skips completed UUIDs before
+tokenization. Unfinished questions are regenerated with all 64 samples; each completed question is
+appended exactly once. The model, question limit, context/generation budgets, and sampling settings
+must match the saved run. Generation counters include work from earlier attempts, while domain
+rollout counts contain only completed question groups. Resume retains only completed UUIDs, not
+prompts, golden cases, or a per-question score map.
+
+Completion, failure, and SIGTERM shut down only engines started by this invocation;
+externally supplied engines remain running.
 
 ## Download and verify the model
 

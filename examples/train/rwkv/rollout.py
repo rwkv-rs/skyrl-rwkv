@@ -153,7 +153,15 @@ def run_code(raw: str, gold: dict[str, Any]) -> tuple[bool, str]:
         return False, "execution_error"
 
 
-def rows(root: Path, limit: int, tokenizer, max_model_len: int, max_tokens: int, domain: str | None = None):
+def rows(
+    root: Path,
+    limit: int,
+    tokenizer,
+    max_model_len: int,
+    max_tokens: int,
+    domain: str | None = None,
+    completed=frozenset(),
+):
     """Stream every shard; keep golden test cases on disk until grading."""
     for index, name in enumerate(DOMAINS):
         if domain is not None and domain != name:
@@ -167,21 +175,23 @@ def rows(root: Path, limit: int, tokenizer, max_model_len: int, max_tokens: int,
                 offset = 0
                 for line in handle:
                     row = orjson.loads(line)
-                    row.pop("ground_truth")
-                    row["_source"] = (str(path), offset)
+                    source = (str(path), offset)
                     offset += len(line)
-                    encoded = tokenizer.apply_chat_template(
-                        [{"role": "user", "content": row["query"]}],
-                        tokenize=True,
-                        add_generation_prompt=True,
-                        rwkv_prompt_template="bot",
-                        rwkv_generation_prompt="open_think" if name == "Math" else "fake_think",
-                    )
-                    row["_prompt_ids"] = encoded["input_ids"] if isinstance(encoded, Mapping) else encoded
-                    row["prompt_tokens"] = len(row["_prompt_ids"])
-                    row["_prompt_too_long"] = row["prompt_tokens"] + max_tokens > max_model_len
-                    yield row
                     selected += 1
+                    if row["uuid"] not in completed:
+                        row.pop("ground_truth")
+                        row["_source"] = source
+                        encoded = tokenizer.apply_chat_template(
+                            [{"role": "user", "content": row["query"]}],
+                            tokenize=True,
+                            add_generation_prompt=True,
+                            rwkv_prompt_template="bot",
+                            rwkv_generation_prompt="open_think" if name == "Math" else "fake_think",
+                        )
+                        row["_prompt_ids"] = encoded["input_ids"] if isinstance(encoded, Mapping) else encoded
+                        row["prompt_tokens"] = len(row["_prompt_ids"])
+                        row["_prompt_too_long"] = row["prompt_tokens"] + max_tokens > max_model_len
+                        yield row
                     if target is not None and selected >= target:
                         break
             if target is not None and selected >= target:
@@ -406,11 +416,15 @@ async def run(args):
     import aiohttp
     from transformers import AutoTokenizer
 
+    if args.resume and args.output is None:
+        raise ValueError("--resume requires --output")
     if args.output is None:
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         args.output = Path("outputs") / f"ultradata_{Path(args.model).name}_{stamp}"
     args.output.mkdir(parents=True, exist_ok=True)
-    if (args.output / "summary.json").exists() or (args.output / "correct_counts_by_question.jsonl").exists():
+    if not args.resume and (
+        (args.output / "summary.json").exists() or (args.output / "correct_counts_by_question.jsonl").exists()
+    ):
         raise FileExistsError(f"Results already exist: {args.output}; use a new --output directory")
     _, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
     resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
@@ -421,6 +435,8 @@ async def run(args):
     candidates = {status: defaultdict(list) for status in STATUSES}
     sample_ids = set()
     progress = Counter()
+    completed = set()
+    elapsed_before_resume = 0.0
     processes, pool = [], None
     config = {
         "model": args.model,
@@ -432,7 +448,32 @@ async def run(args):
         "status": "starting",
         "progress": progress,
     }
-    started = time.monotonic()
+    if args.resume:
+        saved = orjson.loads((args.output / "summary.json").read_bytes())["config"]
+        for key in ("model", "limit", "rollouts_per_question", "max_tokens", "max_model_len", *SAMPLING_PARAMS):
+            if saved[key] != config[key]:
+                raise ValueError(f"Cannot resume with changed {key}: {saved[key]!r} -> {config[key]!r}")
+        with (args.output / "correct_counts_by_question.jsonl").open("rb") as handle:
+            for line in handle:
+                record = orjson.loads(line)
+                completed.add(record["uuid"])
+                question = groups[record["domain"]]
+                question["num_questions"] += 1
+                question["counts"].update(record["counts"])
+                question["reasons"].update(record["reasons"])
+                question["histogram"][record["counts"].get("correct", 0)] += 1
+        for status in STATUSES:
+            with (args.output / f"{status}_samples.jsonl").open("rb") as handle:
+                for line in handle:
+                    sample = orjson.loads(line)
+                    candidates[status][sample["domain"]].append(sample)
+                    sample_ids.add(sample["uuid"])
+        progress.update(saved["progress"])
+        progress["scored_questions"] = len(completed)
+        elapsed_before_resume = saved["elapsed_seconds"]
+        config["resumed_questions"] = len(completed)
+    started = time.monotonic() - elapsed_before_resume
+    (args.output / "rollout.pid").write_text(f"{os.getpid()}\n")
     loop = asyncio.get_running_loop()
     task = asyncio.current_task()
     loop.add_signal_handler(signal.SIGTERM, task.cancel)
@@ -449,6 +490,44 @@ async def run(args):
         score_workers = args.score_workers or max(1, len(os.sched_getaffinity(0)) // 2 - 2 * len(urls))
         tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=False)
         tokenizer.model_max_length = args.max_model_len
+        if processes:
+            prompt = tokenizer.apply_chat_template(
+                [{"role": "user", "content": r"Compute 2 + 2. Put your final answer in \boxed{...}."}],
+                tokenize=True,
+                add_generation_prompt=True,
+                rwkv_prompt_template="bot",
+                rwkv_generation_prompt="open_think",
+            )
+            prompt_ids = prompt["input_ids"] if isinstance(prompt, Mapping) else prompt
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as session:
+
+                async def validate(url):
+                    async with session.post(
+                        f"{url}/v1/completions",
+                        json={
+                            "model": args.model,
+                            "prompt": prompt_ids,
+                            "max_tokens": 512,
+                            **SAMPLING_PARAMS,
+                            "temperature": 0.0,
+                            "return_token_ids": True,
+                        },
+                    ) as response:
+                        response.raise_for_status()
+                        choice = (await response.json())["choices"][0]
+                    ids = choice.get("token_ids") or []
+                    reward, details = compute_strict_score(
+                        tokenizer.decode(ids, skip_special_tokens=True),
+                        "4",
+                        ended_eod=bool(ids and ids[-1] == tokenizer.eos_token_id),
+                        truncated=choice.get("finish_reason") in {"length", "max_tokens"},
+                    )
+                    if reward != 1.0:
+                        raise RuntimeError(f"Engine acceptance failed: {url}: {details}")
+                    print(f"Engine acceptance passed: {url}, tokens={len(ids)}, EOS={ids[-1]}", flush=True)
+
+                await asyncio.gather(*(validate(url) for url in urls))
+            config["engine_validation"] = "passed"
         config.update(
             endpoints=urls, concurrency=concurrency, max_num_seqs=args.max_num_seqs, score_workers=score_workers
         )
@@ -461,7 +540,7 @@ async def run(args):
         pool = ProcessPoolExecutor(max_workers=score_workers, mp_context=multiprocessing.get_context("spawn"))
 
         async def produce(domain):
-            source = rows(args.data_root, args.limit, tokenizer, args.max_model_len, args.max_tokens, domain)
+            source = rows(args.data_root, args.limit, tokenizer, args.max_model_len, args.max_tokens, domain, completed)
             while (row := await asyncio.to_thread(next, source, None)) is not None:
                 await data_queue.put(row)
                 progress["read_questions"] += 1
@@ -481,7 +560,6 @@ async def run(args):
                         "max_tokens": args.max_tokens,
                         **SAMPLING_PARAMS,
                         "stream": False,
-                        "detokenize": False,
                         "return_token_ids": True,
                     }
                 )
@@ -532,7 +610,7 @@ async def run(args):
                     if not question["remaining"]:
                         await score_queue.put((question["row"], question["choices"]))
 
-            with (args.output / "correct_counts_by_question.jsonl").open("xb") as counts_file:
+            with (args.output / "correct_counts_by_question.jsonl").open("ab" if args.resume else "xb") as counts_file:
 
                 async def grade():
                     while (item := await score_queue.get()) is not None:
@@ -644,6 +722,7 @@ async def run(args):
 parser = argparse.ArgumentParser(description="Full UltraData evaluation on every visible GPU")
 parser.add_argument("--data-root", type=Path, default=Path.home() / "data/UltraData-RL-2609/files")
 parser.add_argument("--output", type=Path, help="Output directory (default: timestamped model-specific directory)")
+parser.add_argument("--resume", action="store_true", help="Resume completed question counts from --output")
 parser.add_argument(
     "--base-url", help="Comma-separated external engines; otherwise launch one TP1 engine per visible GPU"
 )

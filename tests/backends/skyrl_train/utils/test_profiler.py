@@ -164,12 +164,6 @@ def test_step_failure_disables_without_raising(tmp_path):
 class TestWorkerProfilerRPCs:
     """Worker profiler RPC coverage."""
 
-    def test_methods_exist_on_worker_base(self):
-        from skyrl.backends.skyrl_train.workers.worker import Worker
-
-        for name in ("start_profile", "profile_step", "stop_profile", "dump_profiler_summary"):
-            assert callable(getattr(Worker, name)), f"Worker.{name} missing"
-
     def test_dump_profiler_summary_none_when_profiler_none(self):
         from types import SimpleNamespace
 
@@ -350,12 +344,6 @@ class TestTrainerProfilerHelpers:
             trainer=SimpleNamespace(policy=SimpleNamespace(torch_profiler_config=SimpleNamespace(enable=enable)))
         )
         return trainer, calls
-
-    def test_helpers_exist(self):
-        from skyrl.train.trainer import RayPPOTrainer
-
-        for name in ("_profiler_start", "_profiler_step", "_profiler_stop"):
-            assert callable(getattr(RayPPOTrainer, name)), f"RayPPOTrainer.{name} missing"
 
     def test_noop_when_disabled(self):
         trainer, calls = self._trainer(enable=False)

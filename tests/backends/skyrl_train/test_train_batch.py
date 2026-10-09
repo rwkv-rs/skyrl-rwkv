@@ -570,10 +570,7 @@ def test_tensor_batch_none_tensor_list():
 # ---------------------------------------------------------------------------
 
 
-# The canonical set of TrainingInput fields. Adding a new field to the TrainingInput TypedDict
-# without updating `pad_training_input_batch()` and this set will make
-# `test_pad_batch_typeddict_matches_expected_fields` fail, forcing the author to decide how the
-# new field should be padded.
+# The full-field padding test checks this fixture against TrainingInput and exercises every field.
 EXPECTED_TRAINING_INPUT_FIELDS = {
     "sequences",
     "attention_mask",
@@ -642,18 +639,6 @@ def _make_full_training_batch(batch_size: int = 4, seq_len: int = 5) -> Training
     return batch
 
 
-def test_pad_batch_typeddict_matches_expected_fields():
-    """
-    Guard: if TrainingInput gains a new field, bump EXPECTED_TRAINING_INPUT_FIELDS and make sure it is
-    well handled by pad_training_input_batch().
-    """
-    typed_dict_fields = set(TrainingInput.__annotations__.keys())
-    assert typed_dict_fields == EXPECTED_TRAINING_INPUT_FIELDS, (
-        "TrainingInput fields changed. Update EXPECTED_TRAINING_INPUT_FIELDS AND make sure "
-        "pad_training_input_batch() handles the new field."
-    )
-
-
 def test_pad_batch_all_fields():
     """Comprehensive test: pad_training_input_batch pads every field correctly.
 
@@ -667,7 +652,7 @@ def test_pad_batch_all_fields():
 
     # Sanity: the test fixture must exercise every TrainingInput field.
     assert (
-        set(batch.keys()) == EXPECTED_TRAINING_INPUT_FIELDS
+        set(batch.keys()) == EXPECTED_TRAINING_INPUT_FIELDS == set(TrainingInput.__annotations__)
     ), "Test fixture is missing TrainingInput fields; update _make_full_training_batch."
 
     # Snapshot input metadata before padding to verify immutability.

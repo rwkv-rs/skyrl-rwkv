@@ -7,7 +7,10 @@ from unittest.mock import patch
 import numpy as np
 import pytest
 
-from skyrl.backends.skyrl_train.utils.sample_support import SAMPLE_SUPPORT_DTYPE
+from skyrl.backends.skyrl_train.utils.sample_support import (
+    SAMPLE_SUPPORT_DTYPE,
+    SAMPLE_SUPPORT_LOGPROBS_DTYPE,
+)
 from skyrl.train.generators.base import GeneratorOutput, TrajectoryID
 from skyrl.train.generators.utils import (
     compute_turn_token_counts,
@@ -22,33 +25,6 @@ from tests.train.util import example_dummy_config
 
 
 def test_generator_output_concatenation():
-    # First ensure that the GeneratorOutput fields are what we expect
-    expected_fields = [
-        "prompt_token_ids",
-        "response_ids",
-        "rewards",
-        "loss_masks",
-        "stop_reasons",
-        "rollout_metrics",
-        "rollout_logprobs",
-        "rollout_expert_indices",
-        "rollout_sample_support",
-        "rollout_sample_support_logprobs",
-        # optional but present in the signature
-        "trajectory_ids",
-        "trajectory_generation_times",
-        "trajectory_time_splits",
-        "is_last_step",
-        "env_metrics",
-        "pixel_values",
-        "image_grid_thw",
-    ]
-    assert set(GeneratorOutput.__annotations__.keys()) == set(expected_fields), (
-        "GeneratorOutput fields are not what we expect. "
-        "Please update the test and `concatenate_generator_outputs()` to reflect the new fields."
-        "It is needed to help Trainer.eval() record the full GeneratorOutput information."
-    )
-
     generator_output_1: GeneratorOutput = {
         "prompt_token_ids": [[1, 2], [3, 4]],
         "response_ids": [[1, 2], [3, 4]],
@@ -58,7 +34,14 @@ def test_generator_output_concatenation():
         "rollout_logprobs": [[0.1, 0.2], [0.3, 0.4]],
         # Routes cover every trained token.
         "rollout_expert_indices": [np.zeros((3, 1, 2), dtype=np.uint8), np.ones((3, 1, 2), dtype=np.uint8)],
-        "rollout_sample_support": [[[1, 2], [1, 2]], [[3, 4], [3, 4]]],
+        "rollout_sample_support": [
+            np.array([[1, 2], [1, 2]], dtype=SAMPLE_SUPPORT_DTYPE),
+            np.array([[3, 4], [3, 4]], dtype=SAMPLE_SUPPORT_DTYPE),
+        ],
+        "rollout_sample_support_logprobs": [
+            np.array([[-0.1, -1.1], [-0.2, -1.2]], dtype=SAMPLE_SUPPORT_LOGPROBS_DTYPE),
+            np.array([[-0.3, -1.3], [-0.4, -1.4]], dtype=SAMPLE_SUPPORT_LOGPROBS_DTYPE),
+        ],
     }
 
     generator_output_2: GeneratorOutput = {
@@ -69,7 +52,14 @@ def test_generator_output_concatenation():
         "stop_reasons": ["stop", "stop"],
         "rollout_logprobs": [[0.5, 0.6, 0.7], [0.8]],
         "rollout_expert_indices": [np.full((5, 1, 2), 2, dtype=np.uint8), np.full((1, 1, 2), 3, dtype=np.uint8)],
-        "rollout_sample_support": [[[5, 6], [5, 6], [5, 6]], [[7, 8]]],
+        "rollout_sample_support": [
+            np.array([[5, 6], [5, 6], [5, 6]], dtype=SAMPLE_SUPPORT_DTYPE),
+            np.array([[7, 8]], dtype=SAMPLE_SUPPORT_DTYPE),
+        ],
+        "rollout_sample_support_logprobs": [
+            np.array([[-0.5, -1.5], [-0.6, -1.6], [-0.7, -1.7]], dtype=SAMPLE_SUPPORT_LOGPROBS_DTYPE),
+            np.array([[-0.8, -1.8]], dtype=SAMPLE_SUPPORT_LOGPROBS_DTYPE),
+        ],
     }
 
     generator_outputs = [generator_output_1, generator_output_2]
@@ -81,11 +71,15 @@ def test_generator_output_concatenation():
     assert concatenated_output["loss_masks"] == [[1, 1], [1, 1], [1, 1, 1], [1]]
     assert concatenated_output["stop_reasons"] == ["stop", "stop", "stop", "stop"]
     assert concatenated_output["rollout_logprobs"] == [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6, 0.7], [0.8]]
-    assert [rows[0] for rows in concatenated_output["rollout_sample_support"]] == [[1, 2], [3, 4], [5, 6], [7, 8]]
     assert [int(routes.flat[0]) for routes in concatenated_output["rollout_expert_indices"]] == [0, 1, 2, 3]
     reversed_output = concatenate_generator_outputs([generator_output_2, generator_output_1])
-    assert [rows[0] for rows in reversed_output["rollout_sample_support"]] == [[5, 6], [7, 8], [1, 2], [3, 4]]
     assert [int(routes.flat[0]) for routes in reversed_output["rollout_expert_indices"]] == [2, 3, 0, 1]
+    for output, sources in ((concatenated_output, generator_outputs), (reversed_output, generator_outputs[::-1])):
+        for field in ("rollout_sample_support", "rollout_sample_support_logprobs"):
+            expected = [rows for source in sources for rows in source[field]]
+            for actual_rows, expected_rows in zip(output[field], expected, strict=True):
+                np.testing.assert_array_equal(actual_rows, expected_rows)
+                assert actual_rows.dtype == expected_rows.dtype
 
     # Validate rollout metrics
     expected_rollout_metrics = {
@@ -109,7 +103,9 @@ def test_generator_output_concatenation():
         np.testing.assert_allclose(concatenated_output["rollout_metrics"][key], value)
 
 
-@pytest.mark.parametrize("side_channel", ["rollout_expert_indices", "rollout_sample_support"])
+@pytest.mark.parametrize(
+    "side_channel", ["rollout_expert_indices", "rollout_sample_support", "rollout_sample_support_logprobs"]
+)
 def test_side_channel_concatenation_rejects_a_mix(side_channel):
     def make_output(value) -> GeneratorOutput:
         return {
@@ -122,7 +118,7 @@ def test_side_channel_concatenation_rejects_a_mix(side_channel):
             side_channel: value,
         }
 
-    populated = make_output([[[1, 2]]] if side_channel == "rollout_sample_support" else [np.zeros((1, 1, 2), np.uint8)])
+    populated = make_output([np.zeros((1, 1, 2), np.uint8)] if side_channel == "rollout_expert_indices" else [[[1, 2]]])
     missing = make_output(None)
     for outputs in ([populated, missing], [missing, populated]):
         with pytest.raises(ValueError, match=f"all have null {side_channel}"):

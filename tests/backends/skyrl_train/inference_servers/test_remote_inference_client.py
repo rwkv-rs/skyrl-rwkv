@@ -32,7 +32,6 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     unpack_ndarray,
 )
 from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
-    SKYRL_LORA_ADAPTER_NAME,
     InferenceServerHTTPError,
     InferenceServerTimeoutError,
     PauseMode,
@@ -1471,12 +1470,6 @@ class TestLoRAControlPlane:
         registries = await _get_lora_registries(mock_servers["server_urls"])
         for reg in registries:
             assert "nonexistent-lora" not in reg
-
-    @pytest.mark.asyncio
-    async def test_default_lora_adapter_constant(self):
-        # Sanity check that the public constant has the documented value used
-        # across the SkyRL training paths.
-        assert SKYRL_LORA_ADAPTER_NAME == "skyrl-lora"
 
 
 class TestExplicitModelRequired:

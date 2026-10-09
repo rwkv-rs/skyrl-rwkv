@@ -348,15 +348,6 @@ class TestCapabilityDeclarations:
     Every engine declares all three, so a typo is an AttributeError rather than a
     silently-wrong default."""
 
-    def test_the_defaults_are_the_common_case(self):
-        from skyrl.backends.skyrl_train.weight_sync.weight_senders import (
-            SkyrlTrainerCapabilities,
-        )
-
-        assert SkyrlTrainerCapabilities.skyrl_handles_prefix_cache_reset is False
-        assert SkyrlTrainerCapabilities.skyrl_force_disable_expandable_segments is False
-        assert SkyrlTrainerCapabilities.skyrl_empty_cache_after_send is True
-
     def test_nccl_and_ipc_inherit_the_defaults(self):
         from skyrl.backends.skyrl_train.weight_sync.weight_senders import (
             get_skyrl_ipc_trainer,

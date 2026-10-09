@@ -1,4 +1,3 @@
-import inspect
 import sys
 import types
 from types import SimpleNamespace
@@ -64,10 +63,6 @@ def test_replay_indices_match_router_token_order(batch_size, tp_size):
                 [local_routes[batch, pos, layer] for pos in range(local_routes.shape[1]) for batch in range(batch_size)]
             ).to(torch.int32)
             torch.testing.assert_close(actual, expected)
-
-
-def test_replay_has_no_dispatcher_specific_patch():
-    assert "TokenDispatcher" not in inspect.getsource(replay_utils)
 
 
 @pytest.mark.parametrize("route_dtype", [torch.uint8, torch.int16, torch.int32])

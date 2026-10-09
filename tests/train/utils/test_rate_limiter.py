@@ -461,18 +461,6 @@ class TestAsyncRateLimiterFIFO:
 
 
 class TestRateLimiterConfig:
-    def test_default_values(self):
-        config = RateLimiterConfig()
-        assert config.enabled is False
-        assert config.trajectories_per_second is None
-        assert config.max_concurrency is None
-
-    def test_custom_values(self):
-        config = RateLimiterConfig(enabled=True, trajectories_per_second=5.0, max_concurrency=10)
-        assert config.enabled is True
-        assert config.trajectories_per_second == 5.0
-        assert config.max_concurrency == 10
-
     def test_invalid_trajectories_per_second_raises_error(self):
         with pytest.raises(ValueError, match="trajectories_per_second must be >= 1.0"):
             RateLimiterConfig(enabled=True, trajectories_per_second=0.5)

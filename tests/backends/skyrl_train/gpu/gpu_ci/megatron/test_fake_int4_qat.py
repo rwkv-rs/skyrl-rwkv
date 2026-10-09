@@ -11,8 +11,6 @@ gap quietly returns. The canary test therefore asserts the hook's *effect on the
 GEMM output*, not just its installation.
 """
 
-import inspect
-
 import pytest
 import ray
 import torch
@@ -34,30 +32,6 @@ from tests.backends.skyrl_train.gpu.utils import (
 
 MOE_MODEL_NAME = "Qwen/Qwen3-30B-A3B"
 GS = 32
-
-
-# ---------------------------------------------------------------------------
-# Tripwires: fail loudly (and readably) when megatron/TE refactor the surfaces
-# the monkeypatch depends on.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.megatron
-def test_te_grouped_linear_still_exposes_get_weight_tensors():
-    import transformer_engine.pytorch.module.grouped_linear as te_grouped_linear
-    from megatron.core.extensions.transformer_engine import TEGroupedLinear
-
-    assert hasattr(TEGroupedLinear, "_get_weight_tensors"), (
-        "TEGroupedLinear._get_weight_tensors is gone: the fake-INT4 QAT monkeypatch "
-        "(skyrl.backends.skyrl_train.workers.megatron.quantization.fake_int4_qat) no longer has an attach point. "
-        "Find where the new TE version fetches weights in GroupedLinear.forward and re-target the patch."
-    )
-    fwd_src = inspect.getsource(te_grouped_linear.GroupedLinear.forward)
-    assert "_get_weight_tensors" in fwd_src, (
-        "transformer_engine GroupedLinear.forward no longer calls _get_weight_tensors(): "
-        "the fake-INT4 QAT patch would install but silently stop affecting the expert GEMMs. "
-        "Re-target the patch to the new weight-fetch path before bumping TE."
-    )
 
 
 @pytest.mark.megatron

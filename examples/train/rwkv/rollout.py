@@ -13,6 +13,8 @@ from itertools import product
 from pathlib import Path
 from typing import Any
 
+from skyrl_gym.envs.gsm8k.utils import compute_strict_score
+
 
 def answer_text(raw: str) -> str:
     text = raw.split("</think>", 1)[1] if "</think>" in raw else raw
@@ -254,6 +256,7 @@ async def run(args):
                         "rwkv_generation_prompt": "open_think" if row["domain"] == "Math" else "fake_think",
                     },
                     "stream": False,
+                    "return_token_ids": row["domain"] == "Math",
                 },
             )
             for row, _, url in pending
@@ -262,40 +265,58 @@ async def run(args):
         results = []
         for response in responses:
             if isinstance(response, Exception):
-                results.append(("", type(response).__name__, None))
+                results.append(("", type(response).__name__, None, []))
                 continue
             try:
                 async with response:
                     if response.status >= 400:
-                        results.append(("", f"http_{response.status}", None))
+                        results.append(("", f"http_{response.status}", None, []))
                     else:
                         choice = (await response.json())["choices"][0]
-                        results.append((choice["message"].get("content", ""), None, choice.get("finish_reason")))
+                        results.append(
+                            (
+                                choice["message"].get("content", ""),
+                                None,
+                                choice.get("finish_reason"),
+                                choice.get("token_ids") or [],
+                            )
+                        )
             except Exception as exc:
-                results.append(("", type(exc).__name__, None))
+                results.append(("", type(exc).__name__, None, []))
 
     groups = defaultdict(dict)
-    for (row, index, _), (response, error, finish) in zip(pending, results, strict=True):
-        if error or finish == "length":
-            status, reason = "unanswered", error or "length"
+    for (row, index, _), (response, error, finish, response_ids) in zip(pending, results, strict=True):
+        if error:
+            status, reason = "unanswered", error
+        elif row["domain"] == "Math":
+            truncated = finish in {"length", "max_tokens"}
+            reward, details = compute_strict_score(
+                response,
+                row["ground_truth"],
+                ended_eod=bool(
+                    not truncated
+                    and response_ids
+                    and tokenizer.eos_token_id is not None
+                    and response_ids[-1] == tokenizer.eos_token_id
+                ),
+                truncated=truncated,
+            )
+            if details["truncated"]:
+                status, reason = "unanswered", finish
+            elif not response.strip():
+                status, reason = "unanswered", "empty_response"
+            elif not details["ended_eod"]:
+                status, reason = "unanswered", "missing_eos"
+            elif not details["structural_format_valid"]:
+                status, reason = "unanswered", "invalid_format"
+            elif not details["answer_parseable"]:
+                status, reason = "unanswered", "parse_error"
+            else:
+                status, reason = ("correct" if reward else "wrong"), "math_verify"
+        elif finish == "length":
+            status, reason = "unanswered", "length"
         elif not response.strip():
             status, reason = "unanswered", "empty_response"
-        elif row["domain"] == "Math":
-            from math_verify import parse, verify
-
-            prediction = answer_text(response)
-            try:
-                expected = parse(f"$\\boxed{{{row['ground_truth']}}}$")
-                candidates = [parse(prediction)]
-                lines = [line for line in prediction.replace("＝", "=").splitlines() if "=" in line]
-                if lines and "\\boxed" not in prediction and "answer" not in prediction.lower():
-                    candidates.insert(0, parse(lines[-1]))
-                ok = any(
-                    expected and candidate and verify(expected, candidate, strict=False) for candidate in candidates
-                )
-                status, reason = ("correct" if ok else "wrong" if any(candidates) else "unanswered"), "math_verify"
-            except Exception:
-                status, reason = "unanswered", "parse_error"
         elif row["domain"] == "Code":
             ok, reason = run_code(response, row["ground_truth"])
             status = "correct" if ok else "wrong" if reason == "wrong_output" else "unanswered"

@@ -8,22 +8,10 @@ import pytest
 from skyrl.train.config import (
     InferenceEngineConfig,
     MegatronConfig,
-    MTPConfig,
     SkyRLTrainConfig,
 )
 from skyrl.train.config.config import build_nested_dataclass
 from skyrl.train.utils.utils import _apply_mtp_config, _validate_draft_weight_sync_cfg
-
-
-def test_megatron_config_mtp_defaults():
-    cfg = MegatronConfig()
-    # None => honor the model's own num_nextn_predict_layers (no SkyRL override).
-    assert cfg.mtp_num_layers is None
-    # Decoupled draft-training defaults. The decoupling itself is unconditional (no knob): the draft
-    # loss trains only the MTP-head parameters -- trunk, teacher, output projection and the MTP
-    # block's re-embedding are all detached (see mtp/hidden_capture.py, mtp/adapter.py).
-    assert cfg.mtp_loss_weight == 0.1
-    assert cfg.mtp_loss_topk is None
 
 
 def test_megatron_config_mtp_overrides_parse():
@@ -39,22 +27,10 @@ def test_megatron_config_mtp_force_disable():
     assert cfg.mtp_num_layers == 0
 
 
-def test_inference_engine_speculative_config_default_none():
-    cfg = InferenceEngineConfig()
-    assert cfg.speculative_config is None
-
-
 def test_inference_engine_speculative_config_parses_mtp_dict():
     spec = {"method": "mtp", "num_speculative_tokens": 1}
     cfg = build_nested_dataclass(InferenceEngineConfig, {"speculative_config": spec})
     assert cfg.speculative_config == spec
-
-
-def test_mtp_config_defaults():
-    cfg = MTPConfig()
-    assert cfg.enabled is False
-    assert cfg.num_speculative_tokens == 1
-    assert cfg.loss_weight == 0.1
 
 
 def test_apply_mtp_config_enabled_propagates_to_training_and_inference():

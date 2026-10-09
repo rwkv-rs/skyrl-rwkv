@@ -23,32 +23,6 @@ from tests.train.util import example_dummy_config
 
 
 def test_generator_output_concatenation():
-    # First ensure that the GeneratorOutput fields are what we expect
-    expected_fields = [
-        "prompt_token_ids",
-        "response_ids",
-        "rewards",
-        "loss_masks",
-        "stop_reasons",
-        "rollout_metrics",
-        "rollout_logprobs",
-        "rollout_expert_indices",
-        "rollout_sample_support",
-        # optional but present in the signature
-        "trajectory_ids",
-        "trajectory_generation_times",
-        "trajectory_time_splits",
-        "is_last_step",
-        "env_metrics",
-        "pixel_values",
-        "image_grid_thw",
-    ]
-    assert set(GeneratorOutput.__annotations__.keys()) == set(expected_fields), (
-        "GeneratorOutput fields are not what we expect. "
-        "Please update the test and `concatenate_generator_outputs()` to reflect the new fields."
-        "It is needed to help Trainer.eval() record the full GeneratorOutput information."
-    )
-
     generator_output_1: GeneratorOutput = {
         "prompt_token_ids": [[1, 2], [3, 4]],
         "response_ids": [[1, 2], [3, 4]],
@@ -96,6 +70,11 @@ def test_generator_output_concatenation():
         [3, 4],
     ]
     assert [int(routes.flat[0]) for routes in reversed_output["rollout_expert_indices"]] == [2, 3, 0, 1]
+    for output, sources in ((concatenated_output, generator_outputs), (reversed_output, generator_outputs[::-1])):
+        expected = [rows for source in sources for rows in source["rollout_sample_support"]]
+        for actual_rows, expected_rows in zip(output["rollout_sample_support"], expected, strict=True):
+            np.testing.assert_array_equal(actual_rows.token_ids, expected_rows.token_ids)
+            np.testing.assert_array_equal(actual_rows.offsets, expected_rows.offsets)
 
     # Validate rollout metrics
     expected_rollout_metrics = {

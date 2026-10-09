@@ -93,6 +93,10 @@ def test_explicit_limit_is_balanced_across_domains(tmp_path, tokenizer):
             dataset_row(tmp_path, domain, f"{domain}_{index}", str(index), "0")
     selected = list(rollout.rows(tmp_path, 6, tokenizer, 100, 5))
     assert Counter(row["domain"] for row in selected) == {"Math": 2, "Code": 2, "Long_Context": 1, "Knowledge": 1}
+    completed = {f"{domain}_0" for domain in rollout.DOMAINS}
+    remaining = list(rollout.rows(tmp_path, 6, tokenizer, 100, 5, completed=completed))
+    assert [row["uuid"] for row in remaining] == ["Math_1", "Code_1"]
+    assert len(tokenizer.prompts) == 8
 
 
 def test_code_verdict_cache_counts_all_samples(tmp_path, tokenizer, monkeypatch):
@@ -228,7 +232,7 @@ def test_math_rollout_matches_strict_gsm8k_reward(tmp_path, tokenizer):
     assert summary["Math"]["unanswered_rollouts"] == 40
     assert summary["Knowledge"]["correct_rollouts"] == 64
     assert len(requests) == 128
-    assert all(payload["return_token_ids"] and not payload["detokenize"] for payload in requests)
+    assert all(payload["return_token_ids"] for payload in requests)
     assert {(query, kwargs["rwkv_generation_prompt"]) for query, kwargs in tokenizer.prompts} == {
         ("Math", "open_think"),
         ("Knowledge", "fake_think"),
@@ -277,27 +281,32 @@ def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(
             runners.append(runner)
         observer = asyncio.create_task(observe())
         try:
-            await rollout.run(
-                rollout.parser.parse_args(
-                    [
-                        "--model",
-                        "test-rwkv",
-                        "--data-root",
-                        str(tmp_path),
-                        "--output",
-                        str(output),
-                        "--base-url",
-                        ",".join(urls),
-                        "--max-num-seqs",
-                        "1",
-                        "--score-workers",
-                        "1",
-                        "--timeout",
-                        "20",
-                    ]
-                )
+            args = rollout.parser.parse_args(
+                [
+                    "--model",
+                    "test-rwkv",
+                    "--data-root",
+                    str(tmp_path),
+                    "--output",
+                    str(output),
+                    "--base-url",
+                    ",".join(urls),
+                    "--max-num-seqs",
+                    "1",
+                    "--score-workers",
+                    "1",
+                    "--timeout",
+                    "20",
+                ]
             )
+            await rollout.run(args)
             await observer
+            dataset_row(tmp_path, "Knowledge", "Knowledge_4", "q4", "42", part="part2.jsonl")
+            args.resume = True
+            await rollout.run(args)
+            args.max_tokens = 10
+            with pytest.raises(ValueError, match="changed max_tokens"):
+                await rollout.run(args)
         finally:
             observer.cancel()
             for runner in runners:
@@ -309,11 +318,16 @@ def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(
     assert summary["config"]["concurrency"] == 4
     assert summary["config"]["status"] == "completed"
     assert summary["config"]["queues"]["inflight"] == [0, 0]
-    assert summary["Knowledge"]["num_questions"] == 4
-    assert summary["Knowledge"]["correct_rollouts"] == 256
-    assert sum(requests.values()) == 256 and all(requests[index] > 0 for index in range(2))
+    assert summary["Knowledge"]["num_questions"] == 5
+    assert summary["Knowledge"]["correct_rollouts"] == 320
+    assert summary["Knowledge"]["correct_count_histogram"] == {"64": 5}
+    assert summary["config"]["resumed_questions"] == 4
+    assert summary["config"]["progress"]["scored_questions"] == 5
+    assert sum(requests.values()) == 320 and all(requests[index] > 0 for index in range(2))
+    assert len(tokenizer.prompts) == 5
     records = [json.loads(line) for line in (output / "correct_counts_by_question.jsonl").read_text().splitlines()]
-    assert {record["uuid"] for record in records} == {f"Knowledge_{index}" for index in range(4)}
+    assert len(records) == 5
+    assert {record["uuid"] for record in records} == {f"Knowledge_{index}" for index in range(5)}
     assert all(record["counts"] == {"correct": 64} for record in records)
 
 
@@ -400,3 +414,74 @@ def test_partial_startup_failure_cleans_only_owned_process_groups(tmp_path, toke
     assert [process.device for process in processes] == ["2", "5"]
     assert killed == [(90001, signal.SIGTERM)]
     assert json.loads((tmp_path / "output/summary.json").read_text())["config"]["status"] == "interrupted"
+
+
+@pytest.mark.parametrize("valid_eos", [True, False])
+def test_owned_engine_acceptance_precedes_dataset_generation(tmp_path, tokenizer, monkeypatch, valid_eos):
+    from aiohttp import web
+
+    dataset_row(tmp_path, "Knowledge", "Knowledge_1", "q", "4")
+    requests, killed = [], []
+    process = SimpleNamespace(pid=91001, returncode=None)
+
+    async def wait():
+        process.returncode = 0
+        return 0
+
+    process.wait = wait
+    monkeypatch.setattr(rollout.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+
+    async def run():
+        async def complete(request):
+            payload = await request.json()
+            requests.append(payload)
+            text = r">reasoning </think> \boxed{4}"
+            ids = list(text.encode()) + [0 if valid_eos else 1]
+            return web.json_response({"choices": [{"token_ids": ids, "finish_reason": "stop"}]})
+
+        app = web.Application()
+        app.router.add_post("/v1/completions", complete)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        host, port = runner.addresses[0]
+
+        async def start_servers(args, processes):
+            processes.append(process)
+            return [f"http://{host}:{port}"]
+
+        monkeypatch.setattr(rollout, "start_servers", start_servers)
+        args = rollout.parser.parse_args(
+            [
+                "--model",
+                "test-rwkv",
+                "--data-root",
+                str(tmp_path),
+                "--output",
+                str(tmp_path / "output"),
+                "--max-num-seqs",
+                "1",
+                "--score-workers",
+                "1",
+            ]
+        )
+        try:
+            if valid_eos:
+                await rollout.run(args)
+            else:
+                with pytest.raises(RuntimeError, match="Engine acceptance failed"):
+                    await rollout.run(args)
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    summary = json.loads((tmp_path / "output/summary.json").read_text())
+    assert killed == [(91001, signal.SIGTERM)]
+    assert process.returncode == 0
+    assert len(requests) == (65 if valid_eos else 1)
+    assert summary["Knowledge"]["num_questions"] == int(valid_eos)
+    if valid_eos:
+        assert summary["config"]["engine_validation"] == "passed"
+        assert summary["Knowledge"]["correct_rollouts"] == 64
+    else:
+        assert not (tmp_path / "output/correct_counts_by_question.jsonl").exists()

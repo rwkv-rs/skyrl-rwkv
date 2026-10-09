@@ -56,14 +56,16 @@ def _iter_boxed(text: str):
             yield parsed[0], match.start()
 
 
-def _normalize_answer(answer: Any) -> Optional[str]:
+def _normalize_answer(answer: Any, *, remove_commas: bool = True) -> Optional[str]:
     if answer is None:
         return None
-    normalized = str(answer).strip().replace(",", "").replace("$", "")
+    normalized = str(answer).strip().replace("$", "")
+    if remove_commas:
+        normalized = normalized.replace(",", "")
     return normalized or None
 
 
-def extract_solution(solution_str, method="strict"):
+def extract_solution(solution_str, method="strict", *, remove_commas=True):
     assert method in ["strict", "flexible"]
 
     if method == "strict":
@@ -71,10 +73,12 @@ def extract_solution(solution_str, method="strict"):
         # retaining the original GSM8K ``####`` format as a fallback.
         boxed = list(_iter_boxed(solution_str))
         if boxed:
-            final_answer = _normalize_answer(boxed[-1][0])
+            final_answer = _normalize_answer(boxed[-1][0], remove_commas=remove_commas)
         else:
             solution = re.search(r"####\s+(-?[0-9][0-9.,]*)", solution_str)
-            final_answer = _normalize_answer(solution.group(1)) if solution is not None else None
+            final_answer = (
+                _normalize_answer(solution.group(1), remove_commas=remove_commas) if solution is not None else None
+            )
     elif method == "flexible":
         answer = re.findall(r"(-?[0-9.,]+)", solution_str)
         final_answer = None
@@ -105,6 +109,18 @@ def _extract_after_think(solution_str: str) -> Optional[Tuple[str, str]]:
     return thought, answer_region
 
 
+def _normalize_math_answer(answer: str) -> str:
+    """Remove thousands separators in scalar positions, not tuples or sets."""
+    number = r"[+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?"
+    for prefix in (r"^", r"\\(?:[dt]?frac|sqrt)\{", r"\\[dt]?frac\{[^{}]*\}\{"):
+        answer = re.sub(
+            rf"({prefix})({number})(?![\d,])",
+            lambda match: match[1] + match[2].replace(",", ""),
+            answer,
+        )
+    return answer
+
+
 def compute_strict_score(
     solution_str: str,
     ground_truth: str,
@@ -120,8 +136,10 @@ def compute_strict_score(
     parsed = _extract_after_think(solution_str)
     thought = parsed[0] if parsed is not None else ""
     answer_region = parsed[1] if parsed is not None else ""
-    extracted_answer = extract_solution(answer_region, method="strict") if parsed is not None else None
-    normalized_ground_truth = _normalize_answer(ground_truth)
+    extracted_answer = (
+        extract_solution(answer_region, method="strict", remove_commas=False) if parsed is not None else None
+    )
+    normalized_ground_truth = _normalize_answer(ground_truth, remove_commas=False)
     structural_format_valid = bool(parsed is not None and extracted_answer is not None)
     answer_parseable = False
     is_correct = False
@@ -129,8 +147,8 @@ def compute_strict_score(
         from math_verify import parse, verify
 
         try:
-            expected = parse(f"$\\boxed{{{normalized_ground_truth}}}$")
-            candidate = parse(f"$\\boxed{{{extracted_answer}}}$")
+            expected = parse(f"$\\boxed{{{_normalize_math_answer(normalized_ground_truth)}}}$")
+            candidate = parse(f"$\\boxed{{{_normalize_math_answer(extracted_answer)}}}$")
             answer_parseable = bool(expected and candidate)
             is_correct = bool(answer_parseable and verify(expected, candidate, strict=False))
         except Exception:

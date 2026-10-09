@@ -27,6 +27,7 @@ from skyrl_gym.envs.gsm8k.utils import compute_strict_score
 DOMAINS = ("Math", "Code", "Long_Context", "Knowledge")
 STATUSES = ("correct", "wrong", "unanswered")
 ROLLOUTS_PER_QUESTION = 64
+SCORING_VERSION = 2
 SAMPLING_PARAMS = {
     "temperature": 0.96,
     "top_p": 0.76,
@@ -442,6 +443,7 @@ async def run(args):
         "model": args.model,
         "limit": args.limit,
         "rollouts_per_question": ROLLOUTS_PER_QUESTION,
+        "scoring_version": SCORING_VERSION,
         "max_tokens": args.max_tokens,
         "max_model_len": args.max_model_len,
         **SAMPLING_PARAMS,
@@ -450,9 +452,17 @@ async def run(args):
     }
     if args.resume:
         saved = orjson.loads((args.output / "summary.json").read_bytes())["config"]
-        for key in ("model", "limit", "rollouts_per_question", "max_tokens", "max_model_len", *SAMPLING_PARAMS):
-            if saved[key] != config[key]:
-                raise ValueError(f"Cannot resume with changed {key}: {saved[key]!r} -> {config[key]!r}")
+        for key in (
+            "scoring_version",
+            "model",
+            "limit",
+            "rollouts_per_question",
+            "max_tokens",
+            "max_model_len",
+            *SAMPLING_PARAMS,
+        ):
+            if saved.get(key) != config[key]:
+                raise ValueError(f"Cannot resume with changed {key}: {saved.get(key)!r} -> {config[key]!r}")
         with (args.output / "correct_counts_by_question.jsonl").open("rb") as handle:
             for line in handle:
                 record = orjson.loads(line)

@@ -1,16 +1,52 @@
-import argparse
 import asyncio
-import importlib.util
 import json
+import signal
 import sys
+from collections import Counter, defaultdict
 from itertools import cycle
 from pathlib import Path
 from types import SimpleNamespace
 
-SCRIPT = Path(__file__).parents[4] / "examples/train/rwkv/rollout.py"
-spec = importlib.util.spec_from_file_location("rollout", SCRIPT)
-rollout = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(rollout)
+import pytest
+
+sys.path.insert(0, str(Path(__file__).parents[4]))
+from examples.train.rwkv import rollout
+
+
+class Tokenizer:
+    eos_token_id = 0
+
+    def __init__(self):
+        self.prompts = []
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.prompts.append((messages[0]["content"], kwargs))
+        return {"input_ids": list(messages[0]["content"].encode())}
+
+    def decode(self, ids, *, skip_special_tokens):
+        assert skip_special_tokens
+        return bytes(token for token in ids if token != 0).decode()
+
+
+@pytest.fixture
+def tokenizer(monkeypatch):
+    value = Tokenizer()
+    monkeypatch.setitem(
+        sys.modules,
+        "transformers",
+        SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=lambda *args, **kwargs: value)),
+    )
+    return value
+
+
+def dataset_row(root, domain, uuid, query, gold, part="part.jsonl"):
+    directory = root / domain
+    directory.mkdir(exist_ok=True)
+    with (directory / part).open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps({"uuid": uuid, "query": query, "ground_truth": gold, "domain": domain}, ensure_ascii=False)
+            + "\n"
+        )
 
 
 def test_rwkv_fake_think_answer_extraction():
@@ -33,48 +69,74 @@ def test_code_python_and_cpp_execution():
     assert rollout.run_code(cpp, tests) == (True, "ok")
 
 
-def test_long_context_selection_uses_token_budget(tmp_path: Path):
-    class Tokenizer:
-        def apply_chat_template(self, messages, **kwargs):
-            return {"input_ids": list(range(len(messages[0]["content"])))}
+def test_full_data_stream_preserves_oversized_rows_and_byte_offsets(tmp_path, tokenizer):
+    dataset_row(tmp_path, "Long_Context", "Long_Context_1", "123456", "5")
+    dataset_row(tmp_path, "Long_Context", "Long_Context_2", "二", "2")
+    dataset_row(tmp_path, "Long_Context", "Long_Context_3", "3", "3", part="part2.jsonl")
+    selected = list(rollout.rows(tmp_path, 0, tokenizer, 10, 5))
+    assert [row["uuid"] for row in selected] == ["Long_Context_1", "Long_Context_2", "Long_Context_3"]
+    assert [row["_prompt_too_long"] for row in selected] == [True, False, False]
+    for row in selected:
+        assert "ground_truth" not in row
+        path, offset = row["_source"]
+        with open(path, "rb") as handle:
+            handle.seek(offset)
+            assert json.loads(handle.readline())["uuid"] == row["uuid"]
+    counts, reasons, _ = rollout.score_question(selected[0], [{"text": ""}] * 64, 0)
+    assert counts == {"unanswered": 64}
+    assert reasons == {"prompt_too_long": 64}
 
-    domain = tmp_path / "Long_Context"
-    domain.mkdir()
-    path = domain / "part.jsonl"
-    path.write_text(
-        '{"uuid":"Long_Context_1","query":"123456","ground_truth":"5","domain":"Long_Context"}\n'
-        '{"uuid":"Long_Context_2","query":"12","ground_truth":"2","domain":"Long_Context"}\n'
-    )
-    rows = list(rollout.rows(tmp_path, 4, Tokenizer(), 10, 5))
-    assert [row["uuid"] for row in rows] == ["Long_Context_2"]
+
+def test_explicit_limit_is_balanced_across_domains(tmp_path, tokenizer):
+    for domain in rollout.DOMAINS:
+        for index in range(3):
+            dataset_row(tmp_path, domain, f"{domain}_{index}", str(index), "0")
+    selected = list(rollout.rows(tmp_path, 6, tokenizer, 100, 5))
+    assert Counter(row["domain"] for row in selected) == {"Math": 2, "Code": 2, "Long_Context": 1, "Knowledge": 1}
 
 
-def test_write_output_keeps_question_ids_disjoint(tmp_path: Path):
-    from collections import Counter
+def test_code_verdict_cache_counts_all_samples(tmp_path, tokenizer, monkeypatch):
+    dataset_row(tmp_path, "Code", "Code_1", "print 3", {"inputs": [""], "outputs": ["3\n"]})
+    row = next(rollout.rows(tmp_path, 0, tokenizer, 100, 5))
+    calls = []
 
+    def run_code(raw, gold):
+        calls.append((raw, gold))
+        return True, "ok"
+
+    monkeypatch.setattr(rollout, "run_code", run_code)
+    choices = [{"text": f">thought {index}</think> print(3)", "finish_reason": "stop"} for index in range(64)]
+    counts, _, samples = rollout.score_question(row, choices, 0)
+    assert counts == {"correct": 64}
+    assert len(calls) == 1
+    assert samples["correct"]["sample_index"] == 0
+    assert rollout.score_question(row, choices, 0, collect_samples=False)[2] == {}
+
+
+def test_write_output_keeps_question_ids_disjoint(tmp_path):
     groups = {
-        "Math": {
-            "Math_1": {
-                "row": {"uuid": "Math_1", "query": "q", "ground_truth": "1"},
-                "counts": Counter(correct=1, wrong=0, unanswered=0),
-                "samples": {"correct": {"response": "1", "sample_index": 0, "reason": "math_verify"}},
-            },
-        },
-        "Code": {
-            "Code_1": {
-                "row": {"uuid": "Code_1", "query": "q", "ground_truth": {"inputs": [""], "outputs": [""]}},
-                "counts": Counter(correct=0, wrong=1, unanswered=0),
-                "samples": {"wrong": {"response": "", "sample_index": 0, "reason": "wrong_output"}},
-            },
-        },
+        domain: {
+            "num_questions": 1,
+            "counts": Counter(correct=64),
+            "histogram": Counter({64: 1}),
+            "reasons": Counter(ok=64),
+        }
+        for domain in ("Math", "Code")
     }
-    rollout.write_output(tmp_path, groups, 8192, 2)
-    files = [tmp_path / f"{status}_samples.jsonl" for status in ("correct", "wrong", "unanswered")]
-    ids = [line.split('"uuid": "')[1].split('"')[0] for file in files for line in file.read_text().splitlines()]
-    assert len(ids) == len(set(ids))
+    candidates = {status: defaultdict(list) for status in rollout.STATUSES}
+    candidates["correct"]["Math"] = [{"uuid": "Math_1", "response": "1"}]
+    candidates["wrong"]["Code"] = [{"uuid": "Code_1", "response": "0"}]
+    candidates["unanswered"]["Math"] = [{"uuid": "Math_1", "response": ""}]
+    rollout.write_output(tmp_path, groups, candidates, {"limit": 0}, plot=True)
+    files = [tmp_path / f"{status}_samples.jsonl" for status in rollout.STATUSES]
+    ids = [json.loads(line)["uuid"] for file in files for line in file.read_text().splitlines()]
+    assert len(ids) == len(set(ids)) == 2
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["Math"]["correct_count_histogram"] == {"64": 1}
+    assert summary["Math"]["correct_counts_by_question_file"] == "correct_counts_by_question.jsonl"
 
 
-def test_math_rollout_matches_strict_gsm8k_reward(tmp_path: Path, monkeypatch):
+def test_math_rollout_matches_strict_gsm8k_reward(tmp_path, tokenizer):
     from aiohttp import web
 
     import skyrl_gym
@@ -100,9 +162,7 @@ def test_math_rollout_matches_strict_gsm8k_reward(tmp_path: Path, monkeypatch):
     ]
     for response, token_ids, finish, expected in cases:
         env = skyrl_gym.make(
-            "gsm8k",
-            env_config={"strict_reward": True},
-            extras={"reward_spec": {"ground_truth": "42"}},
+            "gsm8k", env_config={"strict_reward": True}, extras={"reward_spec": {"ground_truth": "42"}}
         )
         env.set_generation_metadata(
             action=response,
@@ -111,18 +171,8 @@ def test_math_rollout_matches_strict_gsm8k_reward(tmp_path: Path, monkeypatch):
             stop_reason=finish,
         )
         assert env.step(response)["reward"] == float(expected == "correct")
-
-    tokenizer = SimpleNamespace(eos_token_id=0)
-    monkeypatch.setitem(
-        sys.modules,
-        "transformers",
-        SimpleNamespace(AutoTokenizer=SimpleNamespace(from_pretrained=lambda *args, **kwargs: tokenizer)),
-    )
     for domain in ("Math", "Knowledge"):
-        directory = tmp_path / domain
-        directory.mkdir()
-        row = {"uuid": f"{domain}_1", "query": domain, "domain": domain, "ground_truth": "42"}
-        (directory / "part.jsonl").write_text(json.dumps(row) + "\n")
+        dataset_row(tmp_path, domain, f"{domain}_1", domain, "42")
 
     choices = cycle(cases)
     requests = []
@@ -130,26 +180,16 @@ def test_math_rollout_matches_strict_gsm8k_reward(tmp_path: Path, monkeypatch):
     async def complete(request):
         payload = await request.json()
         requests.append(payload)
-        if payload["messages"][0]["content"] == "Math":
+        if payload["prompt"] == list(b"Math"):
             response, token_ids, finish, _ = next(choices)
+            ids = list(response.encode()) + [token_ids[-1]] if token_ids else token_ids
         else:
-            response, token_ids, finish = "Final answer: 42", None, "stop"
-        return web.json_response(
-            {
-                "choices": [
-                    {
-                        "message": {"content": response},
-                        "token_ids": token_ids,
-                        "finish_reason": finish,
-                        "stop_reason": 0,
-                    }
-                ]
-            }
-        )
+            ids, finish = list(b"Final answer: 42") + [0], "stop"
+        return web.json_response({"choices": [{"text": "", "token_ids": ids, "finish_reason": finish}]})
 
     async def run():
         app = web.Application()
-        app.router.add_post("/v1/chat/completions", complete)
+        app.router.add_post("/v1/completions", complete)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, "127.0.0.1", 0)
@@ -157,16 +197,25 @@ def test_math_rollout_matches_strict_gsm8k_reward(tmp_path: Path, monkeypatch):
         host, port = runner.addresses[0]
         try:
             await rollout.run(
-                argparse.Namespace(
-                    model="test-rwkv",
-                    data_root=tmp_path,
-                    output=tmp_path / "output",
-                    base_url=f"http://{host}:{port}",
-                    limit=4,
-                    concurrency=8,
-                    max_model_len=16384,
-                    max_tokens=8192,
-                    timeout=10,
+                rollout.parser.parse_args(
+                    [
+                        "--model",
+                        "test-rwkv",
+                        "--data-root",
+                        str(tmp_path),
+                        "--output",
+                        str(tmp_path / "output"),
+                        "--base-url",
+                        f"http://{host}:{port}",
+                        "--limit",
+                        "4",
+                        "--concurrency",
+                        "8",
+                        "--score-workers",
+                        "1",
+                        "--timeout",
+                        "10",
+                    ]
                 )
             )
         finally:
@@ -179,7 +228,175 @@ def test_math_rollout_matches_strict_gsm8k_reward(tmp_path: Path, monkeypatch):
     assert summary["Math"]["unanswered_rollouts"] == 40
     assert summary["Knowledge"]["correct_rollouts"] == 64
     assert len(requests) == 128
-    for payload in requests:
-        is_math = payload["messages"][0]["content"] == "Math"
-        assert payload["return_token_ids"] is is_math
-        assert payload["chat_template_kwargs"]["rwkv_generation_prompt"] == ("open_think" if is_math else "fake_think")
+    assert all(payload["return_token_ids"] and not payload["detokenize"] for payload in requests)
+    assert {(query, kwargs["rwkv_generation_prompt"]) for query, kwargs in tokenizer.prompts} == {
+        ("Math", "open_think"),
+        ("Knowledge", "fake_think"),
+    }
+
+
+def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(tmp_path, tokenizer):
+    from aiohttp import web
+
+    for index in range(4):
+        dataset_row(tmp_path, "Knowledge", f"Knowledge_{index}", f"q{index}", "42", part=f"part{index // 2}.jsonl")
+    output = tmp_path / "output"
+    requests = Counter()
+
+    async def run():
+        persisted = asyncio.Event()
+
+        async def observe():
+            path = output / "correct_counts_by_question.jsonl"
+            while not path.exists() or not path.stat().st_size:
+                await asyncio.sleep(0.01)
+            persisted.set()
+
+        def complete(engine):
+            async def handle(request):
+                payload = await request.json()
+                requests[engine] += 1
+                if payload["prompt"] == list(b"q3"):
+                    await asyncio.wait_for(persisted.wait(), timeout=10)
+                await asyncio.sleep(0.01)
+                return web.json_response(
+                    {"choices": [{"token_ids": list(b"Final answer: 42") + [0], "finish_reason": "stop"}]}
+                )
+
+            return handle
+
+        runners, urls = [], []
+        for index in range(2):
+            app = web.Application()
+            app.router.add_post("/v1/completions", complete(index))
+            runner = web.AppRunner(app)
+            await runner.setup()
+            await web.TCPSite(runner, "127.0.0.1", 0).start()
+            host, port = runner.addresses[0]
+            urls.append(f"http://{host}:{port}")
+            runners.append(runner)
+        observer = asyncio.create_task(observe())
+        try:
+            await rollout.run(
+                rollout.parser.parse_args(
+                    [
+                        "--model",
+                        "test-rwkv",
+                        "--data-root",
+                        str(tmp_path),
+                        "--output",
+                        str(output),
+                        "--base-url",
+                        ",".join(urls),
+                        "--max-num-seqs",
+                        "1",
+                        "--score-workers",
+                        "1",
+                        "--timeout",
+                        "20",
+                    ]
+                )
+            )
+            await observer
+        finally:
+            observer.cancel()
+            for runner in runners:
+                await runner.cleanup()
+
+    asyncio.run(run())
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["config"]["limit"] == 0
+    assert summary["config"]["concurrency"] == 4
+    assert summary["config"]["status"] == "completed"
+    assert summary["config"]["queues"]["inflight"] == [0, 0]
+    assert summary["Knowledge"]["num_questions"] == 4
+    assert summary["Knowledge"]["correct_rollouts"] == 256
+    assert sum(requests.values()) == 256 and all(requests[index] > 0 for index in range(2))
+    records = [json.loads(line) for line in (output / "correct_counts_by_question.jsonl").read_text().splitlines()]
+    assert {record["uuid"] for record in records} == {f"Knowledge_{index}" for index in range(4)}
+    assert all(record["counts"] == {"correct": 64} for record in records)
+
+
+def test_http_failure_stops_pipeline_and_keeps_external_server(tmp_path, tokenizer):
+    from aiohttp import ClientSession, web
+
+    dataset_row(tmp_path, "Knowledge", "Knowledge_1", "q", "42")
+
+    async def run():
+        app = web.Application()
+
+        async def complete(request):
+            return web.Response(status=503, text="engine unavailable")
+
+        async def health(request):
+            return web.Response(text="ok")
+
+        app.router.add_post("/v1/completions", complete)
+        app.router.add_get("/health", health)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+        host, port = runner.addresses[0]
+        url = f"http://{host}:{port}"
+        try:
+            with pytest.raises(ExceptionGroup) as error:
+                await rollout.run(
+                    rollout.parser.parse_args(
+                        [
+                            "--model",
+                            "test-rwkv",
+                            "--data-root",
+                            str(tmp_path),
+                            "--output",
+                            str(tmp_path / "output"),
+                            "--base-url",
+                            url,
+                            "--concurrency",
+                            "2",
+                            "--score-workers",
+                            "1",
+                        ]
+                    )
+                )
+            assert any("HTTP 503" in str(exc) for exc in error.value.exceptions)
+            async with ClientSession() as session, session.get(f"{url}/health") as response:
+                assert await response.text() == "ok"
+        finally:
+            await runner.cleanup()
+
+    asyncio.run(run())
+    summary = json.loads((tmp_path / "output/summary.json").read_text())
+    assert summary["config"]["status"] == "interrupted"
+    assert summary["Knowledge"]["num_questions"] == 0
+
+
+def test_partial_startup_failure_cleans_only_owned_process_groups(tmp_path, tokenizer, monkeypatch):
+    processes, killed = [], []
+
+    class Process:
+        def __init__(self, command, *, env, stdout, stderr, start_new_session):
+            self.pid = 90000 + len(processes)
+            self.device = env["CUDA_VISIBLE_DEVICES"]
+            if command[-1] == "--check":
+                self.returncode = 0
+            else:
+                self.returncode = 1 if not processes else None
+                processes.append(self)
+            assert start_new_session
+
+        async def wait(self):
+            self.returncode = self.returncode or 0
+            return self.returncode
+
+    async def create_subprocess_exec(*command, **kwargs):
+        return Process(command, **kwargs)
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 2)))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,5")
+    monkeypatch.setattr(rollout.asyncio, "create_subprocess_exec", create_subprocess_exec)
+    monkeypatch.setattr(rollout.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
+    with pytest.raises(RuntimeError, match="vLLM exited"):
+        asyncio.run(rollout.run(rollout.parser.parse_args(["--output", str(tmp_path / "output")])))
+    assert [process.device for process in processes] == ["2", "5"]
+    assert killed == [(90001, signal.SIGTERM)]
+    assert json.loads((tmp_path / "output/summary.json").read_text())["config"]["status"] == "interrupted"

@@ -26,6 +26,61 @@ uv sync --extra rwkv
 
 The launcher uses the persistent `$HOME/.cache/skyrl-rwkv/torch_extensions` cache and refuses to start if the FlashRWKV2 artifact is absent or stale. Set `MAX_JOBS=2` (or another low value) for the one-time build to limit Ninja memory use. Training workers only load the verified cached artifact.
 
+## Full UltraData rollout
+
+`rollout.py` defaults to **every row in every JSONL shard**, with 64 samples per question,
+using `rwkv7-g1k-1.5b-20260930-ctx25600`. It reads
+`$HOME/data/UltraData-RL-2609/files/{Math,Code,Long_Context,Knowledge}`. A positive
+`--limit` is an explicit, domain-balanced smoke-test limit; the default `--limit 0` is unlimited.
+
+After preparing this project's RWKV `.venv` and FlashRWKV2 cache:
+
+```bash
+uv run --isolated --no-project .venv/bin/python examples/train/rwkv/rollout.py \
+  > /tmp/results_ultradata_rollout.log 2>&1
+```
+
+By default, every CUDA-visible GPU gets one TP1 engine with `max_num_seqs=1024`.
+The HTTP window is twice the running-sequence capacity so completed sequences are immediately
+replaced: **16,384 in-flight generations across eight engines**, with at most 8,192 sequences
+running on the GPUs. `CUDA_VISIBLE_DEVICES` restricts placement; `--base-url` reuses comma-separated
+external engines instead of starting local ones. `--concurrency`, `--max-num-seqs`, and
+`--score-workers` are explicit overrides.
+
+Prompts are rendered and tokenized once per question. Serialized token-input requests are reused
+for its 64 samples, which are assigned to the least-loaded engine together for prefix reuse.
+The engines use `--skip-tokenizer-init`, `generation_config=vllm`, FP16 weights, FP32 recurrent
+states, prefix caching, and 8,192-token chunked prefill. Token-only completions are decoded locally;
+Math retains the exact final generated token for strict EOS checking. Evaluation sampling remains
+temperature 0.96, top-p 0.76, top-k 32, presence penalty 1.0, frequency penalty 0.1, and penalty decay 0.988.
+
+The default serving budget is **1,048,576 tokens**, including up to 8,192 generated tokens.
+RWKV has no fixed positional embedding table, so chunked recurrent inference supports inputs
+beyond the checkpoint's 25,600-token training context. This serving budget is not a claim of
+long-context accuracy. Prompts are never truncated. A row beyond an explicitly configured budget
+is recorded as `prompt_too_long`, rather than silently excluded from the dataset.
+
+Reading, inference, CPU grading, and result writing run continuously through bounded queues;
+the script never materializes the full dataset or all generation tasks. Graders reread golden
+Code cases from their source byte offsets rather than retaining or repeatedly transferring them.
+Repeated final programs within a question reuse their verdict while all 64 samples still count.
+The automatic CPU budget leaves two cores per engine and uses spawned grading processes
+(48 on the 128-logical-CPU, eight-GPU test host).
+
+Each run gets a timestamped model-specific output directory containing:
+
+- `correct_counts_by_question.jsonl`: incrementally flushed UUID, domain, prompt length, verdict counts,
+  and reason counts for **every completed question**. `summary.json` references this file instead
+  of keeping an unbounded UUID map in memory.
+- `summary.json`: atomically refreshed every 30 seconds with domain metrics, 0–64 histograms,
+  generation/token counters, queue depths, endpoints, and the exact runtime configuration.
+- `pass_rate_histogram.svg` and up to 20 UUID-disjoint examples in each of
+  `correct_samples.jsonl`, `wrong_samples.jsonl`, and `unanswered_samples.jsonl`, written on exit.
+- `vllm_gpu_*.log` and `vllm.pids`: logs and identities of engines owned by this run.
+
+Existing result files are not overwritten. Completion, failure, and SIGTERM shut down only engines
+started by this invocation; externally supplied engines remain running.
+
 ## Download and verify the model
 
 The authoritative HF repository already contains the converted BF16 G1k checkpoint. No local

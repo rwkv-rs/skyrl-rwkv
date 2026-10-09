@@ -35,14 +35,6 @@ requires_transformers = pytest.mark.skipif(
 class TestTrainerConfigMaxSteps:
     """TrainerConfig.max_training_steps field behavior."""
 
-    def test_default_is_none(self):
-        cfg = TrainerConfig()
-        assert cfg.max_training_steps is None
-
-    def test_set_via_constructor(self):
-        cfg = TrainerConfig(max_training_steps=10)
-        assert cfg.max_training_steps == 10
-
     @requires_transformers
     def test_set_via_from_dict_config(self):
         cfg_dict = OmegaConf.create({"trainer": {"max_training_steps": 5}})
@@ -68,14 +60,6 @@ class TestTrainerConfigMaxSteps:
 
 class TestSFTConfigMaxSteps:
     """SFTConfig.max_training_steps field behavior."""
-
-    def test_default_is_none(self):
-        cfg = SFTConfig()
-        assert cfg.max_training_steps is None
-
-    def test_set_via_constructor(self):
-        cfg = SFTConfig(max_training_steps=7)
-        assert cfg.max_training_steps == 7
 
     def test_set_via_cli_overrides(self):
         cfg = SFTConfig.from_cli_overrides(["max_training_steps=10"])

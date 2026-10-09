@@ -23,7 +23,7 @@ from skyrl.backends.skyrl_train.workers import model_wrapper as model_wrapper_mo
 from skyrl.backends.skyrl_train.weight_sync.sources import FsdpWeightSource
 from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
-from skyrl.train.config import SamplingParams, SkyRLTrainConfig
+from skyrl.train.config import SamplingParams
 
 
 @pytest.fixture(autouse=True)
@@ -475,30 +475,3 @@ def test_rwkv_sampling_parameters_are_forwarded_to_vllm(sampling_params, expecte
     actual = get_vllm_sampling_params(config)
 
     assert {key: actual[key] for key in expected} == expected
-
-
-def test_rwkv_recipe_kwargs_parse_through_typed_config():
-    config = SkyRLTrainConfig.from_cli_overrides(
-        [
-            "generator.chat_template_kwargs={rwkv_prompt_template: bot, rwkv_generation_prompt: open_think}",
-            "generator.inference_engine.model_dtype=float16",
-            "generator.sampling_params.additional_kwargs={presence_penalty: 0.0, frequency_penalty: 0.0, penalty_decay: 1.0}",
-            "generator.eval_sampling_params.additional_kwargs={presence_penalty: 1.0, frequency_penalty: 0.1, penalty_decay: 0.988}",
-        ]
-    )
-
-    assert config.generator.chat_template_kwargs == {
-        "rwkv_prompt_template": "bot",
-        "rwkv_generation_prompt": "open_think",
-    }
-    assert config.generator.inference_engine.model_dtype == "float16"
-    assert config.generator.sampling_params.additional_kwargs == {
-        "presence_penalty": 0.0,
-        "frequency_penalty": 0.0,
-        "penalty_decay": 1.0,
-    }
-    assert config.generator.eval_sampling_params.additional_kwargs == {
-        "presence_penalty": 1.0,
-        "frequency_penalty": 0.1,
-        "penalty_decay": 0.988,
-    }

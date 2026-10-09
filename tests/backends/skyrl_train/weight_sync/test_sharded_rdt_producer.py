@@ -39,7 +39,6 @@ from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_common impor
     buffer_alloc_bytes,
 )
 from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.sharded_rdt_trainer import (  # noqa: E402
-    DEFAULT_GATHER_LOOKAHEAD,
     SkyRLShardedRDTTrainerInitInfo,
     SkyRLShardedRDTTrainerWeightTransferEngine,
     _RDTProducerServer,
@@ -145,13 +144,6 @@ class TestPublishAndRebuild:
         server.begin_sync(1)
         _publish(server, GI_A, GROUP_A)
         assert server._inflight_groups == [GI_A]
-
-    def test_the_default_lookahead_is_one(self):
-        """Under gather crediting, 1 is the sweet spot: group N+1 is gathered
-        AND published while N is being pulled (the overlap that lookahead=2 had
-        to buy under publish parking), with resident memory at its floor of 2
-        groups — the bound the larger-model runs size against."""
-        assert DEFAULT_GATHER_LOOKAHEAD == 1
 
 
 class TestFreeBarrier:

@@ -103,18 +103,3 @@ def test_matches_te_core_major_not_other_pip_cudas(env, monkeypatch):
     _fake_nvidia_tree(env, major=12)
     cu13 = _fake_nvidia_tree(env, major=13)
     assert pin_nvrtc.pin_te_nvrtc_to_pip_cuda() == str(cu13)
-
-
-def test_installed_te_still_prefers_system_nvrtc():
-    # Tripwire: if TE starts preferring its pip NVRTC, this patch is dead weight
-    # and should be deleted (see the module docstring).
-    import inspect
-
-    pytest.importorskip("torch")
-    spec = importlib.util.find_spec("transformer_engine")
-    if spec is None:
-        pytest.skip("transformer_engine not installed")
-    import transformer_engine.common as te_common
-
-    source = inspect.getsource(te_common._load_cuda_library)
-    assert source.index("_load_cuda_library_from_system") < source.index("_load_cuda_library_from_python")

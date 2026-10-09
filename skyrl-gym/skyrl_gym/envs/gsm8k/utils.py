@@ -122,8 +122,19 @@ def compute_strict_score(
     answer_region = parsed[1] if parsed is not None else ""
     extracted_answer = extract_solution(answer_region, method="strict") if parsed is not None else None
     normalized_ground_truth = _normalize_answer(ground_truth)
-    is_correct = extracted_answer is not None and extracted_answer == normalized_ground_truth
     structural_format_valid = bool(parsed is not None and extracted_answer is not None)
+    answer_parseable = False
+    is_correct = False
+    if structural_format_valid and normalized_ground_truth is not None:
+        from math_verify import parse, verify
+
+        try:
+            expected = parse(f"$\\boxed{{{normalized_ground_truth}}}$")
+            candidate = parse(f"$\\boxed{{{extracted_answer}}}$")
+            answer_parseable = bool(expected and candidate)
+            is_correct = bool(answer_parseable and verify(expected, candidate, strict=False))
+        except Exception:
+            answer_parseable = False
     strict_reward = float(is_correct and structural_format_valid and ended_eod and not truncated)
 
     details = {
@@ -134,6 +145,7 @@ def compute_strict_score(
         "thought_nonempty": bool(thought.strip()),
         "answer_after_think": extracted_answer is not None,
         "structural_format_valid": structural_format_valid,
+        "answer_parseable": answer_parseable,
         "ended_eod": bool(ended_eod),
         "truncated": bool(truncated),
         "is_correct": bool(is_correct),

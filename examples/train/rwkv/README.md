@@ -139,7 +139,12 @@ Training sampling is temperature `1.0`, top-p `1.0`, top-k `-1`, without penalti
 sampling is unchanged. The launcher keeps generated action tokens
 in the loss mask for truncated rollouts; those rollouts retain zero reward and contribute signed
 failure feedback. The FlashREINFORCE launcher enables the opt-in strict GSM8K reward: the response
-must contain one non-empty thought, an answer after `</think>`, a real EOS token, and no truncation.
+must contain one non-empty thought, exactly one `</think>`, a final `\boxed{...}` answer
+(or a GSM8K `####` answer) after it, a real EOS token, and no truncation. The extracted answer
+is checked with `math_verify.verify(..., strict=False)` for mathematical equivalence, not string equality.
+`examples/train/rwkv/rollout.py` uses the same `gsm8k_rwkv.utils.compute_strict_score` for its Math domain
+and requests generated token IDs to verify the actual final EOS token. Other domains and non-strict
+GSM8K rewards retain their existing scoring.
 For the asynchronous pipeline, use the existing
 `examples.train.fully_async.main_fully_async` entrypoint, set `trainer.fully_async.enabled=true` and
 `generator.batched=false`; also pass `environment.skyrl_gym.gsm8k_rwkv.strict_reward=true`. The default gate is `3e-3`; monitor

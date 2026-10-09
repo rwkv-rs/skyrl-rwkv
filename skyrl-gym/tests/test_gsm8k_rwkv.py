@@ -85,6 +85,39 @@ def test_strict_rwkv_reward_only_verifies_the_strictly_extracted_answer(response
     assert env.step(response)["reward"] == expected
 
 
+@pytest.mark.parametrize(
+    "answer, ground_truth, expected",
+    [
+        ("(3, 4)", "(3,4)", 1.0),
+        ("34", "(3,4)", 0.0),
+        ("(4, 3)", "(3,4)", 0.0),
+        ("(5, 21, 421)", "(5,21,421)", 1.0),
+        ("521421", "(5,21,421)", 0.0),
+        (r"\left(\frac{1}{2},\frac{3}{4}\right)", "(0.5,0.75)", 1.0),
+        (r"\{2, 1\}", r"\{1,2\}", 1.0),
+        ("12", r"\{1,2\}", 0.0),
+        (r"100000000\pi", r"100,000,000\pi", 1.0),
+        (r"100,000,000\pi", r"100000000\pi", 1.0),
+        (r"\frac{1,000}{2}", "500", 1.0),
+        (r"\frac{1}{1,000}", "0.001", 1.0),
+        (r"\sqrt{1,000,000}", "1000", 1.0),
+        ("(123,456)", "(123, 456)", 1.0),
+        ("123456", "(123,456)", 0.0),
+        (r"\{123,456\}", r"\{456,123\}", 1.0),
+        ("123456", r"\{123,456\}", 0.0),
+    ],
+)
+def test_strict_rwkv_reward_preserves_mathematical_commas(answer, ground_truth, expected):
+    env = _make_env(ground_truth)
+    response = f">reasoning </think> \\boxed{{{answer}}}"
+    env.set_generation_metadata(action=response, ended_eod=True, truncated=False, stop_reason="stop")
+    result = env.step(response)
+    assert result["metadata"]["extracted_answer"] == answer
+    assert result["metadata"]["ground_truth_answer"] == ground_truth
+    assert result["metadata"]["answer_parseable"] is True
+    assert result["reward"] == expected
+
+
 def test_strict_rwkv_reward_handles_math_parse_errors(monkeypatch):
     def fail_parse(*args, **kwargs):
         raise ValueError("invalid mathematical expression")
@@ -98,7 +131,9 @@ def test_strict_rwkv_reward_handles_math_parse_errors(monkeypatch):
     assert result["metadata"]["answer_parseable"] is False
 
 
-@pytest.mark.parametrize("answer, expected", [("42", 1.0), ("42.0", 0.0)])
-def test_nonstrict_rwkv_reward_keeps_string_matching(answer, expected):
-    env = _make_env(strict_reward=False)
+@pytest.mark.parametrize(
+    "answer, ground_truth, expected", [("42", "42", 1.0), ("42.0", "42", 0.0), ("1,000", "1000", 1.0)]
+)
+def test_nonstrict_rwkv_reward_keeps_string_matching(answer, ground_truth, expected):
+    env = _make_env(ground_truth, strict_reward=False)
     assert env.step(f"\\boxed{{{answer}}}")["reward"] == expected

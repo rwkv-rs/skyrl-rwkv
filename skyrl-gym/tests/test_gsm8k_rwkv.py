@@ -105,6 +105,9 @@ def test_strict_rwkv_reward_only_verifies_the_strictly_extracted_answer(response
         ("123456", "(123,456)", 0.0),
         (r"\{123,456\}", r"\{456,123\}", 1.0),
         ("123456", r"\{123,456\}", 0.0),
+        (r"100{,}000{,}000\pi", r"100000000\pi", 1.0),
+        (r"\{123{,}456\}", r"\{123,456\}", 1.0),
+        (r"\frac{1{,}000}{2}", "500", 1.0),
     ],
 )
 def test_strict_rwkv_reward_preserves_mathematical_commas(answer, ground_truth, expected):

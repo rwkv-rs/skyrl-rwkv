@@ -239,6 +239,20 @@ def test_math_rollout_matches_strict_gsm8k_reward(tmp_path, tokenizer):
     }
 
 
+def test_math_rollout_preserves_coordinate_commas(tmp_path, tokenizer):
+    dataset_row(tmp_path, "Math", "Math_00399", "Find the coordinates.", "(3,4)")
+    row = next(rollout.rows(tmp_path, 0, tokenizer, 100, 5))
+    choices = [
+        {"text": f">reasoning </think> \\boxed{{{answer}}}", "token_ids": [0], "finish_reason": "stop"}
+        for answer in ("(3, 4)", "34", "(4, 3)")
+    ]
+    counts, reasons, samples = rollout.score_question(row, choices, 0)
+    assert counts == {"correct": 1, "wrong": 2}
+    assert reasons == {"math_verify": 3}
+    assert samples["correct"]["sample_index"] == 0
+    assert samples["wrong"]["sample_index"] == 1
+
+
 def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(tmp_path, tokenizer):
     from aiohttp import web
 
@@ -307,6 +321,20 @@ def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(
             args.max_tokens = 10
             with pytest.raises(ValueError, match="changed max_tokens"):
                 await rollout.run(args)
+            args.max_tokens = 8192
+            saved = json.loads((output / "summary.json").read_text())
+            before = (output / "correct_counts_by_question.jsonl").read_bytes()
+            for version in (None, 1):
+                legacy = json.loads(json.dumps(saved))
+                if version is None:
+                    del legacy["config"]["scoring_version"]
+                else:
+                    legacy["config"]["scoring_version"] = version
+                (output / "summary.json").write_text(json.dumps(legacy))
+                with pytest.raises(ValueError, match="changed scoring_version"):
+                    await rollout.run(args)
+                assert (output / "correct_counts_by_question.jsonl").read_bytes() == before
+            (output / "summary.json").write_text(json.dumps(saved))
         finally:
             observer.cancel()
             for runner in runners:

@@ -56,6 +56,11 @@ states, prefix caching, and 8,192-token chunked prefill. Token-only completions 
 Math retains the exact final generated token for strict EOS checking. Evaluation sampling remains
 temperature 0.96, top-p 0.76, top-k 32, presence penalty 1.0, frequency penalty 0.1, and penalty decay 0.988.
 
+Math uses the shared strict scorer and mathematical equivalence, preserving commas in coordinates
+and sets while normalizing thousands separators only in scalar expressions. Knowledge and Long_Context use
+normalized final-answer text/option matching, not semantic judging of free-form paraphrases.
+Code executes the extracted program against the golden stdin/stdout cases.
+
 The default serving budget is **1,048,576 tokens**, including up to 8,192 generated tokens.
 RWKV has no fixed positional embedding table, so chunked recurrent inference supports inputs
 beyond the checkpoint's 25,600-token training context. This serving budget is not a claim of
@@ -90,7 +95,9 @@ uv run --isolated --no-project .venv/bin/python examples/train/rwkv/rollout.py \
 Resume restores counts, histograms, reasons, and saved examples, then skips completed UUIDs before
 tokenization. Unfinished questions are regenerated with all 64 samples; each completed question is
 appended exactly once. The model, question limit, context/generation budgets, and sampling settings
-must match the saved run. Generation counters include work from earlier attempts, while domain
+must match the saved run, including `scoring_version`. Version 2 preserves mathematical commas;
+older results must use a new output directory rather than mixing scores across versions.
+Generation counters include work from earlier attempts, while domain
 rollout counts contain only completed question groups. Resume retains only completed UUIDs, not
 prompts, golden cases, or a per-question score map.
 

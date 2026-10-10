@@ -1,0 +1,187 @@
+"""Build model-specific, exact-token SFT data with projection-inspired sampling.
+
+Prototypes: aakaran/finetuning-with-sampling boost_math.py and the native
+SkyRL pretokenized SFT contract. No trainer or policy-loss changes are needed.
+"""
+
+import argparse
+import hashlib
+import os
+import time
+from pathlib import Path
+
+from examples.train.sampling_sft.data import (
+    append_jsonl,
+    expert_rows,
+    open_output,
+    validation_question,
+)
+from skyrl.train.utils.projection_sampling import (
+    proj_samp_vLLM,
+    vLLMAutoregressiveSampler,
+)
+
+
+def boost_record(p, row, args):
+    if not isinstance(row.get("solution"), str) or not row["solution"].strip():
+        raise ValueError(f"Missing expert solution for {row['uuid']}")
+    seed = int.from_bytes(hashlib.sha256(f"{args.seed}:{row['uuid']}".encode()).digest()[:4], "big")
+    start = time.monotonic()
+    result = proj_samp_vLLM(
+        p,
+        row["prompt"],
+        row["solution"],
+        mcmc_steps=args.mcmc_steps,
+        max_new_tokens=args.max_new_tokens,
+        block_num=args.block_num,
+        seed=seed,
+    )
+    prompt_ids = p.format_prompt(row["prompt"])
+    response_ids = result["response_ids"]
+    complete = result["finish_reason"] == "stop"
+    return {
+        "uuid": row["uuid"],
+        "domain": row.get("domain", ""),
+        "prompt": row["prompt"],
+        "solution": row["solution"],
+        "ground_truth": row.get("ground_truth"),
+        "question_id": row.get("question_id", row["uuid"]),
+        "gen": p.tokenizer.decode(response_ids, skip_special_tokens=True),
+        # Keep truncated records for audit/resume, but make them non-trainable.
+        "input_ids": prompt_ids + response_ids if complete else [],
+        "loss_mask": [0] * len(prompt_ids) + [1] * len(response_ids) if complete else [],
+        **result,
+        "runtime_sec": time.monotonic() - start,
+    }
+
+
+def run(args):
+    from transformers import AutoConfig
+
+    model_config = AutoConfig.from_pretrained(args.model, revision=args.revision, trust_remote_code=True)
+    is_rwkv = model_config.model_type == "rwkv"
+    os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+    template = {}
+    if is_rwkv:
+        cache = Path.home() / ".cache/skyrl-rwkv"
+        os.environ.setdefault("XDG_CACHE_HOME", str(cache))
+        os.environ.setdefault("TORCH_EXTENSIONS_DIR", str(cache / "torch_extensions"))
+        os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
+        template = {
+            "rwkv_prompt_template": args.rwkv_prompt_template,
+            "rwkv_generation_prompt": args.rwkv_generation_prompt,
+        }
+    config = {
+        "version": 1,
+        "algorithm": "greedy_mean_logprob_suffix_search",
+        "input": str(Path(args.input).resolve()),
+        "model": args.model,
+        "revision": args.revision,
+        "model_type": args.model_type,
+        "chat_template_kwargs": template,
+        "max_new_tokens": args.max_new_tokens,
+        "block_num": args.block_num,
+        "mcmc_steps": args.mcmc_steps,
+        "repetition_penalty": args.repetition_penalty,
+        "max_model_len": args.max_model_len,
+        "seed": args.seed,
+        "partition": args.partition,
+        "validation_fraction": args.validation_fraction,
+        "subset": args.subset,
+        "num_shards": args.num_shards,
+        "shard_index": args.shard_index,
+    }
+    with open_output(args.output, config, args.resume) as (handle, completed):
+        # Validate resume metadata before allocating a GPU model.
+        from vllm import LLM
+
+        if is_rwkv:
+            from examples.train.rwkv.prepare_flashrwkv2 import check
+
+            check()
+        llm = LLM(
+            model=args.model,
+            revision=args.revision,
+            trust_remote_code=True,
+            dtype="float16" if is_rwkv else "auto",
+            hf_overrides={"wkv_mode": "fp32io16"} if is_rwkv else {},
+            mamba_ssm_cache_dtype="float32" if is_rwkv else "auto",
+            generation_config="vllm",
+            logprobs_mode="raw_logprobs",
+            tensor_parallel_size=args.tensor_parallel_size,
+            max_model_len=args.max_model_len,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enable_prefix_caching=True,
+            enable_chunked_prefill=True,
+            max_num_batched_tokens=8192,
+            enforce_eager=True,
+            seed=args.seed,
+        )
+        p = vLLMAutoregressiveSampler(
+            llm,
+            model_type=args.model_type,
+            chat_template_kwargs=template,
+            repetition_penalty=args.repetition_penalty,
+        )
+        selected = written = truncated = 0
+        for index, row in enumerate(expert_rows(args.input, subset=args.subset)):
+            if index % args.num_shards != args.shard_index:
+                continue
+            validation = validation_question(row.get("question_id", row["uuid"]), args.seed, args.validation_fraction)
+            if args.partition != "all" and validation != (args.partition == "validation"):
+                continue
+            if args.limit and selected >= args.limit:
+                break
+            selected += 1
+            if row["uuid"] in completed:
+                continue
+            record = boost_record(p, row, args)
+            append_jsonl(handle, record)
+            completed.add(row["uuid"])
+            written += 1
+            truncated += record["finish_reason"] != "stop"
+            print(f"written={written} truncated={truncated} uuid={row['uuid']}", flush=True)
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input", required=True, help="Expert JSONL file or directory (uuid/prompt/solution)")
+    parser.add_argument("--output", required=True, help="Exact-token JSONL for native pretokenized SFT")
+    parser.add_argument("--model", required=True, help="Exact learner checkpoint path or Hugging Face model ID")
+    parser.add_argument("--revision", help="Hugging Face model revision")
+    parser.add_argument("--model-type", choices=["base", "chat"], default="chat")
+    parser.add_argument("--rwkv-prompt-template", choices=["bot", "assistant", "function_calling"], default="bot")
+    parser.add_argument("--rwkv-generation-prompt", choices=["open_think", "fake_think"], default="open_think")
+    parser.add_argument("--max-new-tokens", type=int, default=1856)
+    parser.add_argument("--block-num", type=int, default=32, help="Block count, not tokens per block")
+    parser.add_argument(
+        "--mcmc-steps", type=int, default=10, help="Greedy proposals per block; 0 gives the rewrite baseline"
+    )
+    parser.add_argument("--repetition-penalty", type=float, default=1.1)
+    parser.add_argument("--max-model-len", type=int, default=32768)
+    parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument("--partition", choices=["all", "train", "validation"], default="train")
+    parser.add_argument("--subset", help="Source subset, e.g. cot for Nemotron-SFT-Math-v4")
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--validation-fraction", type=float, default=0.05)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--limit", type=int, default=0, help="0: all rows in this partition")
+    parser.add_argument("--resume", action="store_true")
+    args = parser.parse_args(argv)
+    if args.max_new_tokens < 1 or args.block_num < 1 or args.max_new_tokens % args.block_num or args.mcmc_steps < 0:
+        parser.error("Require positive max-new-tokens/block-num, exact divisibility and mcmc-steps >= 0")
+    if not 0 < args.validation_fraction < 1 or args.limit < 0 or args.seed < 0:
+        parser.error("Require 0 < validation-fraction < 1, limit >= 0 and seed >= 0")
+    if args.max_model_len < 2 or args.tensor_parallel_size < 1 or not 0 < args.gpu_memory_utilization <= 1:
+        parser.error("Require max-model-len >= 2, tensor-parallel-size >= 1 and 0 < gpu-memory-utilization <= 1")
+    if args.repetition_penalty <= 0:
+        parser.error("Require repetition-penalty > 0")
+    if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:
+        parser.error("Require num-shards >= 1 and 0 <= shard-index < num-shards")
+    return args
+
+
+if __name__ == "__main__":
+    run(parse_args())

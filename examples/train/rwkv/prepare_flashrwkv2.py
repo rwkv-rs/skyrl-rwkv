@@ -14,11 +14,24 @@ from flashrwkv2 import compile as c
 from flashrwkv2.compile import load_extension
 
 
+def validate_vllm_revision() -> str:
+    """Require the installed Git revision to match the RWKV project pin."""
+    pinned_commit = tomllib.loads(Path("pyproject.toml").read_text())["tool"]["uv"]["sources"]["vllm"]["rev"]
+    direct_url = importlib.metadata.distribution("vllm").read_text("direct_url.json")
+    installed_commit = json.loads(direct_url).get("vcs_info", {}).get("commit_id") if direct_url else None
+    if installed_commit != pinned_commit:
+        raise SystemExit(
+            f"vLLM RWKV revision mismatch: installed={installed_commit!r}, pinned={pinned_commit!r}; "
+            "run uv sync --extra rwkv before preparing or checking native artifacts"
+        )
+    return installed_commit
+
+
 def prepare() -> None:
+    commit = validate_vllm_revision()
     _load_flashrwkv2()
     result = load_extension()
     assert Path(result.library).is_file()
-    commit = tomllib.loads(Path("pyproject.toml").read_text())["tool"]["uv"]["sources"]["vllm"]["rev"]
     driver = subprocess.check_output(
         ["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"],
         text=True,
@@ -40,6 +53,7 @@ def prepare() -> None:
 
 
 def check() -> None:
+    validate_vllm_revision()
     _load_flashrwkv2()
     payload = c._cache_payload(torch, c.source_root(), c._capability(torch), c._toolchain(torch))
     key = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -60,7 +74,8 @@ def check() -> None:
     print("FlashRWKV2 build: cached / no compilation")
 
 
-if sys.argv[1:] == ["--check"]:
-    check()
-else:
-    prepare()
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--check"]:
+        check()
+    else:
+        prepare()

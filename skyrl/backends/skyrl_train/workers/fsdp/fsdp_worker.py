@@ -36,7 +36,6 @@ if TYPE_CHECKING:
     from skyrl.train.config import InferenceEngineConfig
 
 
-
 class FSDPPolicyWorkerBase(PolicyWorkerBase):
     async def init_weight_sync_state(self, inference_engine_client, inference_engine_cfg: "InferenceEngineConfig"):
         if inference_engine_cfg.fp8_weight_sync_mode is not None:
@@ -90,6 +89,12 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             language_model_only=self.cfg.policy.language_model_only,
             logprobs_chunk_size=self.cfg.logprobs_chunk_size,
         )
+        if (
+            wrapped_model.is_rwkv
+            and self.cfg.fully_async.enabled
+            and not self.cfg.fully_async.clear_kv_cache_on_weight_sync
+        ):
+            raise ValueError("RWKV fully-async training requires fully_async.clear_kv_cache_on_weight_sync=True")
         self._seq_parallel_monkey_patch(model=wrapped_model.model)
 
         if self.cfg.gradient_checkpointing:

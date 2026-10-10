@@ -244,3 +244,64 @@ def test_offline_wandb_serializes_only_incremental_rows(tmp_path, monkeypatch):
     assert serialized_rows
     assert all(len(rows) == 1 for rows in serialized_rows)
     assert {rows[0][0] for rows in serialized_rows} == {1, 2}
+
+
+@pytest.mark.parametrize("model_type", ["rwkv", "llama"])
+def test_rwkv_trajectory_logger_is_selected_by_model_config(monkeypatch, model_type):
+    from types import SimpleNamespace
+
+    import ray
+    from transformers import AutoConfig
+
+    monkeypatch.setattr(ray, "is_initialized", lambda: False)
+    from skyrl.train.entrypoints.main_base import BasePPOExp
+    from skyrl.train.utils.trajectory_logging import TrajectoryLogger
+
+    load = MagicMock(return_value=SimpleNamespace(model_type=model_type))
+    monkeypatch.setattr(AutoConfig, "from_pretrained", load)
+    experiment = object.__new__(BasePPOExp)
+    experiment.cfg = SimpleNamespace(
+        trainer=SimpleNamespace(policy=SimpleNamespace(model=SimpleNamespace(path="checkpoint")))
+    )
+    trajectory_logger = experiment.get_trajectory_logger()
+    load.assert_called_once_with("checkpoint", trust_remote_code=True)
+    assert type(trajectory_logger) is (RWKVTrajectoryLogger if model_type == "rwkv" else TrajectoryLogger)
+    assert isinstance(trajectory_logger, TrajectoryLogger)
+    if model_type != "rwkv":
+        assert trajectory_logger.columns == ("step", "idx", "reward", "num_turns", "trajectory")
+
+
+def test_rwkv_trajectory_diagnostics_reuse_native_rendering_and_selection():
+    from skyrl.train.utils.trajectory_logging import TrajectoryLogger
+
+    trajectory_logger = RWKVTrajectoryLogger()
+    assert RWKVTrajectoryLogger.format_trajectory is TrajectoryLogger.format_trajectory
+    assert RWKVTrajectoryLogger.select_sample_indices is TrajectoryLogger.select_sample_indices
+    assert RWKVTrajectoryLogger.count_assistant_turns is TrajectoryLogger.count_assistant_turns
+    tracker = MagicMock(backend="wandb")
+    tokenizer = MagicMock(eos_token_id=0)
+    tokenizer.decode.return_value = "answer"
+    trajectory_logger.log(
+        tracker=tracker,
+        num_samples=2,
+        prompts=["q", "r"],
+        generator_output={
+            "response_ids": [[42, 0], [43, 44]],
+            "rewards": [1.0, 0.0],
+            "loss_masks": [[1, 1], [1, 0]],
+            "stop_reasons": ["stop", "length"],
+        },
+        tokenizer=tokenizer,
+        global_step=3,
+        wandb_key="train",
+        include_idx=False,
+    )
+    output = tracker.log_samples_to_table.call_args.kwargs
+    assert output["incremental"] and output["asynchronous"]
+    assert "idx" not in output["columns"]
+    rows = [dict(zip(output["columns"], row)) for row in output["samples"]]
+    assert rows[0]["assistant_spans"] == [[0, 2]]
+    assert rows[0]["assistant_token_count"] == 2
+    assert rows[0]["ended_with_eos"] and not rows[0]["truncated"]
+    assert rows[1]["loss_mask"] == [1, 0]
+    assert rows[1]["truncated"] and not rows[1]["ended_with_eos"]

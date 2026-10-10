@@ -83,7 +83,7 @@ Please Read ./CLAUDE.md first.
 
 ## Core Objectives
 SkyRL is a mainstream reinforcement learning library in the LLM community. This repository needs to integrate the RWKV model through SkyRL's native Trainer, Generator, InferenceEngine, and Environment interfaces.
-Correspondence Principle: For every file/type/function/variable, a similar implementation must be found to serve as a prototype. If that prototype carries a model name, replace it with `RWKV` or another case variant; otherwise keep the same name.
+Code principle: For every file/type/function/variable, a similar implementation must be found as a prototype. If that prototype carries a model name, replace it with `RWKV` or another case variant; otherwise keep the same name. Using branch statements without affecting existing functionality.
 Non-Interference Principle: RWKV and FlashREINFORCE changes must not break SkyRL's native pipeline or alter the training behavior of other models.
 Process principle: Before starting any work on new functionality, first read the official documentation: https://docs.skyrl.ai/docs/
 
@@ -155,7 +155,7 @@ param_size: parameter size; only 0.1b, 0.4b, 1.5b (often used in RL), 2.9b, 7.2b
 ## Correctness Checks
 1. Whether the three sets of Prompt Templates provided in transformers-rwkv and the corresponding rwkv7-g1-st weight repository can be correctly applied
 2. Use wkv_mode=fp32io16 by default
-3. During rollout, use decoding parameters temp 1, top_p 0.95, top_k -1, with penalty disabled; during eval, use decoding parameters temp 0.96, top_p 0.76, top_k 32, presence_penalty 1.0, frequency_penalty 0.1, penalty_decay 0.988
+3. During rollout, use decoding parameters temp 1, top_p 1, top_k -1, with penalty disabled; during eval, use decoding parameters temp 0.96, top_p 0.76, top_k 32, presence_penalty 1.0, frequency_penalty 0.1, penalty_decay 0.988
 4. The tokens, logprobs, and loss masks of the rollout policy and trainer policy should be strictly aligned
 5. After each optimizer step, the weights of the trainer policy and inference policy should be correctly synchronized
 6. The model reward should show a training trend similar to that of a Qwen3.5 model with a similar parameter count

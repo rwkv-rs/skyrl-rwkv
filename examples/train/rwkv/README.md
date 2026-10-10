@@ -220,12 +220,17 @@ failure feedback. The FlashREINFORCE launcher enables the opt-in strict GSM8K re
 must contain one non-empty thought, exactly one `</think>`, a final `\boxed{...}` answer
 (or a GSM8K `####` answer) after it, a real EOS token, and no truncation. The extracted answer
 is checked with `math_verify.verify(..., strict=False)` for mathematical equivalence, not string equality.
-`examples/train/rwkv/rollout.py` uses the same `gsm8k_rwkv.utils.compute_strict_score` for its Math domain
+`examples/train/rwkv/rollout.py` uses the same `gsm8k.utils.compute_strict_score` for its Math domain
 and requests generated token IDs to verify the actual final EOS token. Other domains and non-strict
 GSM8K rewards retain their existing scoring.
+Use `environment.env_class=gsm8k` and `environment.skyrl_gym.gsm8k.strict_reward=true` to enable
+strict rewards for dataset rows labelled `gsm8k` in training and evaluation, including the fully
+asynchronous entry point. Rows labelled with other environments retain their own routing;
+GSM8K rewards remain unchanged when strict mode is disabled. The shared parquet files do not
+need to be rewritten. Historical answer-match scores are not directly comparable to strict rewards.
 For the asynchronous pipeline, use the existing
 `examples.train.fully_async.main_fully_async` entrypoint, set `trainer.fully_async.enabled=true` and
-`generator.batched=false`; also pass `environment.skyrl_gym.gsm8k_rwkv.strict_reward=true`. The default gate is `3e-3`; monitor
+`generator.batched=false`; also pass `environment.skyrl_gym.gsm8k.strict_reward=true`. The default gate is `3e-3`; monitor
 `policy/loss_metrics/flashreinforce/acceptance_rate` and the rollout/trainer logprob-difference
 metrics before tuning it.
 

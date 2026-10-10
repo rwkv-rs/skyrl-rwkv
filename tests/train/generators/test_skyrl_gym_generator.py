@@ -15,7 +15,7 @@ from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_PADDING,
     SampleSupportTrace,
 )
-from skyrl.train.config import ChatTemplateConfig, GeneratorConfig
+from skyrl.train.config import ChatTemplateConfig, GeneratorConfig, SkyRLGymConfig
 from skyrl.train.generators.base import (
     TRAINING_PHASE_EVAL,
     TRAINING_PHASE_TRAIN,
@@ -29,7 +29,7 @@ from skyrl.train.generators.skyrl_gym_generator import (
     SkyRLGymGenerator,
     TurnOutput,
 )
-from skyrl.train.generators.utils import build_vllm_cache_salt
+from skyrl.train.generators.utils import build_vllm_cache_salt, prepare_generator_input
 from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput
 
 # Mock constants, where 4 is the eos token id
@@ -157,6 +157,86 @@ def mock_env_cfg():
     cfg.max_env_workers = 0
     cfg.env_class = "gsm8k"
     return cfg
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("training_phase", [TRAINING_PHASE_TRAIN, TRAINING_PHASE_EVAL])
+@pytest.mark.parametrize("batched", [False, True])
+@pytest.mark.parametrize("strict_mode", [False, True])
+@pytest.mark.parametrize(
+    "response, response_ids, stop_reason, strict_reward",
+    [
+        (">reasoning </think> \\boxed{42}", [1, 10, 12, 4], "stop", 1.0),
+        (">reasoning </think> #### 42", [1, 10, 12, 4], "stop", 1.0),
+        ("\\boxed{42}", [1, 10, 12, 4], "stop", 0.0),
+        ("></think> \\boxed{42}", [1, 10, 12, 4], "stop", 0.0),
+        (">reasoning </think> </think> \\boxed{42}", [1, 10, 12, 4], "stop", 0.0),
+        (">reasoning </think> \\boxed{42}", [1, 10, 12], "stop", 0.0),
+        (">reasoning </think> \\boxed{42}", [1, 10, 12, 4], "length", 0.0),
+        (">reasoning </think> \\boxed{42}", [1, 10, 12], "max_tokens", 0.0),
+    ],
+)
+async def test_generate_prepared_gsm8k_reward_contract(
+    mock_tokenizer,
+    mock_llm,
+    generator_cfg,
+    training_phase,
+    batched,
+    strict_mode,
+    response,
+    response_ids,
+    stop_reason,
+    strict_reward,
+):
+    """Score dataset-labelled GSM8K responses through the real environment factory."""
+    generator_cfg.batched = batched
+    generator_cfg.use_conversation_multi_turn = False
+    generator_cfg.preserve_truncated_action_mask = True
+    generator_cfg.sampling_params.logprobs = 1
+    gym_cfg = SkyRLGymConfig(max_env_workers=0)
+    gym_cfg.gsm8k.strict_reward = strict_mode
+    mock_tokenizer.decode.side_effect = lambda ids: response
+    mock_llm.generate.return_value = {
+        "responses": [response],
+        "response_ids": [response_ids.copy()],
+        "response_logprobs": [[0.1] * len(response_ids)],
+        "stop_reasons": [stop_reason],
+    }
+    mock_llm.generate.side_effect = None
+    generator = SkyRLGymGenerator(generator_cfg, gym_cfg, mock_llm, mock_tokenizer)
+    input_batch, _ = prepare_generator_input(
+        [
+            {
+                "prompt": [{"role": "user", "content": "What is 6 * 7?"}],
+                "env_class": "gsm8k",
+                "env_extras": {"reward_spec": {"method": "rule", "ground_truth": "42"}},
+                "uid": "0",
+            }
+        ],
+        n_samples_per_prompt=1,
+        sampling_params={"logprobs": 1},
+        default_env_class="gsm8k",
+        training_phase=training_phase,
+        global_step=1,
+    )
+
+    output = await generator.generate(input_batch)
+    reward = output["rewards"][0]
+    reward = sum(reward) if isinstance(reward, list) else reward
+    assert reward == (strict_reward if strict_mode else 1.0)
+    assert len(output["response_ids"][0]) == len(output["loss_masks"][0])
+    assert len(output["response_ids"][0]) == len(output["rollout_logprobs"][0])
+    if stop_reason in {"length", "max_tokens"}:
+        assert all(output["loss_masks"][0])
+    metrics = output["rollout_metrics"]
+    if strict_mode:
+        assert metrics["environment/strict_reward"] == strict_reward
+        assert metrics["environment/truncated"] == float(stop_reason in {"length", "max_tokens"})
+        assert metrics["environment/ended_eod"] == float(
+            response_ids[-1] == mock_tokenizer.eos_token_id and stop_reason not in {"length", "max_tokens"}
+        )
+    else:
+        assert "environment/strict_reward" not in metrics
 
 
 def validate_generator_input(input_batch: GeneratorInput) -> bool:

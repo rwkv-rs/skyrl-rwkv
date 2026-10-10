@@ -18,10 +18,55 @@ from skyrl.train.generators.utils import (
     get_metrics_from_generator_output,
     get_rollout_metrics,
     merge_stepwise_output,
+    prepare_generator_input,
     slice_generator_output,
 )
 from skyrl.train.utils.utils import validate_cfg
 from tests.train.util import example_dummy_config
+
+
+@pytest.mark.parametrize("training_phase", ["train", "eval"])
+@pytest.mark.parametrize("strict_reward", [False, True])
+@pytest.mark.parametrize(
+    "default_env_class, dataset_env_class, expected_env_class",
+    [
+        ("gsm8k", None, "gsm8k"),
+        ("gsm8k", "gsm8k", "gsm8k"),
+        ("text2sql", "gsm8k", "gsm8k"),
+    ],
+)
+def test_prepare_generator_input_gsm8k_strict_reward_extras(
+    training_phase, strict_reward, default_env_class, dataset_env_class, expected_env_class
+):
+    prompts = [
+        {
+            "prompt": [{"role": "user", "content": "What is 6 * 7?"}],
+            "env_class": dataset_env_class,
+            "env_extras": {"reward_spec": {"method": "rule", "ground_truth": "42", "strict": strict_reward}},
+            "uid": "0",
+        },
+        {
+            "prompt": [{"role": "user", "content": "SELECT 1"}],
+            "env_class": "text2sql",
+            "env_extras": {"db_id": "test"},
+            "uid": "1",
+        },
+    ]
+    generator_input, uids = prepare_generator_input(
+        prompts,
+        n_samples_per_prompt=2,
+        sampling_params={"temperature": 1.0},
+        default_env_class=default_env_class,
+        training_phase=training_phase,
+        global_step=1,
+    )
+
+    assert generator_input["env_classes"] == [expected_env_class] * 2 + ["text2sql"] * 2
+    assert generator_input["batch_metadata"].training_phase == training_phase
+    assert uids == ["0", "0", "1", "1"]
+    assert prompts[0]["env_class"] == dataset_env_class
+    assert generator_input["env_extras"][0] == prompts[0]["env_extras"]
+    assert generator_input["env_extras"][0] is not prompts[0]["env_extras"]
 
 
 def test_generator_output_concatenation():

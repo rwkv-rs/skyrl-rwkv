@@ -56,6 +56,45 @@ class AutocastAwareToyCausalLM(ToyCausalLM):
         return super().forward(input_ids, **kwargs)
 
 
+class ToyRecurrentCache:
+    def __init__(self, state):
+        self.state = state
+
+    def clone(self):
+        return ToyRecurrentCache(self.state.clone())
+
+
+class ToyRecurrentCausalLM(ToyCausalLM):
+    def forward(self, input_ids, past_key_values=None, use_cache=False):
+        self.calls.append((input_ids.detach().clone(), {}))
+        hidden = self.embed_tokens(input_ids).cumsum(dim=1)
+        if past_key_values is not None:
+            hidden = hidden + past_key_values.state.unsqueeze(1)
+        cache = ToyRecurrentCache(hidden[:, -1]) if use_cache else None
+        return {"logits": self.lm_head(hidden), "past_key_values": cache}
+
+
+def test_rwkv_infctx_preserves_cross_chunk_labels_states_and_gradients():
+    model = ToyRecurrentCausalLM()
+    wrapper = HFModelWrapper(model, rwkv_chunk_size=2)
+    sequences = torch.tensor([[1, 2, 3, 4, 5, 6, 7]])
+    attention_mask = torch.ones_like(sequences)
+    actual = wrapper(sequences, num_actions=4, attention_mask=attention_mask)
+    assert max(call[0].shape[1] for call in model.calls) == 2
+    actual_loss = -actual.mean()
+    actual_loss.backward()
+    actual_grads = [p.grad.clone() for p in model.parameters()]
+    model.zero_grad(set_to_none=True)
+    wrapper.rwkv_chunk_size = 0
+    expected = wrapper(sequences, num_actions=4, attention_mask=attention_mask)
+    (-expected.mean()).backward()
+    assert torch.allclose(actual, expected)
+    for actual_grad, parameter in zip(actual_grads, model.parameters(), strict=True):
+        assert torch.allclose(actual_grad, parameter.grad, atol=1e-6)
+    # Only response tokens have loss, but their gradient reaches the original prompt.
+    assert actual_grads[0][1].abs().sum() > 0
+
+
 class ToyRwkvAttention(torch.nn.Module):
     def __init__(self, layer_idx: int) -> None:
         super().__init__()

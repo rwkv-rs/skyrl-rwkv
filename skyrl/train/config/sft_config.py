@@ -150,6 +150,8 @@ class SFTConfig(BaseConfig):
     the full ``[T, vocab]`` logits (Megatron). Maps to ``trainer.fused_lm_head_logprob``."""
     logprobs_chunk_size: Optional[int] = 1024
     """Token chunk size for the fused LM head. Maps to ``trainer.logprobs_chunk_size``."""
+    rwkv_chunk_size: int = 0
+    """Checkpoint RWKV training in recurrent chunks with full cross-chunk gradients; 0 disables chunking."""
     record_memory: bool = False
     """Save memory snapshots to ``{ckpt_path}/memory_snapshots/``.
     Visualize by dragging pickle files to https://docs.pytorch.org/memory_viz."""
@@ -557,6 +559,8 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
         raise ValueError(f"micro_train_batch_size_per_gpu must be > 0, got {cfg.micro_train_batch_size_per_gpu}")
     if cfg.batch_size <= 0:
         raise ValueError(f"batch_size must be > 0, got {cfg.batch_size}")
+    if cfg.rwkv_chunk_size < 0:
+        raise ValueError("rwkv_chunk_size must be non-negative")
     if cfg.num_steps is not None and cfg.num_steps <= 0:
         raise ValueError(f"num_steps must be > 0, got {cfg.num_steps}")
     if cfg.num_steps is None:
@@ -668,6 +672,7 @@ def build_skyrl_config_for_sft(sft_cfg: SFTConfig) -> SkyRLTrainConfig:
     cfg.trainer.policy.language_model_only = sft_cfg.language_model_only
     cfg.trainer.fused_lm_head_logprob = sft_cfg.fused_lm_head_logprob
     cfg.trainer.logprobs_chunk_size = sft_cfg.logprobs_chunk_size
+    cfg.trainer.rwkv_chunk_size = sft_cfg.rwkv_chunk_size
     cfg.trainer.policy.torch_profiler_config = sft_cfg.torch_profiler_config
 
     # SFT doesn't use KL/ref model

@@ -1719,6 +1719,12 @@ class TrainerConfig(BaseConfig):
     This lowers peak GPU memory at the cost of ~2x wall-clock time.
     ``None`` disables chunking (Megatron backend only; FSDP requires a positive int).
     See https://github.com/NovaSky-AI/SkyRL/pull/1610 for more details."""
+    rwkv_chunk_size: int = 0
+    """RWKV recurrent training chunk size; 0 keeps a single forward.
+
+    Positive values checkpoint each chunk while preserving differentiable recurrent
+    states across the complete sequence. This does not truncate or detach the history.
+    """
     vocab_entropy_chunk_size: Optional[int] = 0
     """Chunk size along the sequence dimension when computing Megatron vocab entropy.
     ``0`` auto-sizes from the local vocab shard size and ``vocab_entropy_chunk_memory_mb``.
@@ -1758,6 +1764,8 @@ class TrainerConfig(BaseConfig):
                 "sync preserves the inference engine's INT4 base weights."
             )
 
+        if self.rwkv_chunk_size < 0:
+            raise ValueError("rwkv_chunk_size must be non-negative")
         if self.logprobs_chunk_size is not None and (
             not isinstance(self.logprobs_chunk_size, int) or self.logprobs_chunk_size <= 0
         ):

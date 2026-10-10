@@ -562,6 +562,8 @@ class HFModelWrapper(nn.Module):
         canonical-position ``SampleSupportScores`` under ``SCORE_CENTERING_SCORES_KEY``.
         """
         if self.is_rwkv:
+            if enable_sample_support_replay:
+                raise ValueError("RWKV does not support enable_sample_support_replay=True")
             return self._forward_rwkv(
                 sequences,
                 num_actions,

@@ -205,6 +205,13 @@ class BasePPOExp:
         Returns:
             The trajectory logger.
         """
+        from transformers import AutoConfig
+
+        model_config = AutoConfig.from_pretrained(self.cfg.trainer.policy.model.path, trust_remote_code=True)
+        if model_config.model_type == "rwkv":
+            from skyrl.train.utils.rwkv_trajectory_logging import RWKVTrajectoryLogger
+
+            return RWKVTrajectoryLogger()
         return TrajectoryLogger()
 
     def get_inference_client(self) -> InferenceEngineInterface:

@@ -295,6 +295,7 @@ RUN_NAME=rwkv7-g1k-1.5b-20260930-ctx25600-gsm8k-flashreinforce-sc-2train-1infer-
   trainer.placement.colocate_all=false \
   trainer.placement.colocate_policy_ref=false \
   trainer.fully_async.enabled=true \
+  trainer.fully_async.clear_kv_cache_on_weight_sync=true \
   trainer.fully_async.max_staleness_steps=1 \
   trainer.fully_async.num_parallel_generation_workers=512 \
   trainer.fully_async.save_at_epoch_end=false \

@@ -25,18 +25,11 @@ _RWKV_DEBUG_CHECKSUM_NAMES = frozenset(
 
 def _rwkv_debug_checksum(tensor: torch.Tensor) -> str:
     sample = tensor.detach().reshape(-1)[:4096].float()
-    return (
-        f"sum={sample.sum().item():.9g},"
-        f"absmax={sample.abs().max().item():.9g},"
-        f"ptr={tensor.data_ptr()}"
-    )
+    return f"sum={sample.sum().item():.9g}," f"absmax={sample.abs().max().item():.9g}," f"ptr={tensor.data_ptr()}"
 
 
 def _log_rwkv_debug_weight(model: torch.nn.Module, name: str, source: torch.Tensor) -> None:
-    if (
-        os.environ.get("SKYRL_RWKV_DEBUG_WEIGHT_CHECKSUMS") != "1"
-        or name not in _RWKV_DEBUG_CHECKSUM_NAMES
-    ):
+    if os.environ.get("SKYRL_RWKV_DEBUG_WEIGHT_CHECKSUMS") != "1" or name not in _RWKV_DEBUG_CHECKSUM_NAMES:
         return
     target = model.get_parameter(name)
     expected = source.T if name.endswith(".mlp.value.weight") else source
@@ -48,7 +41,6 @@ def _log_rwkv_debug_weight(model: torch.nn.Module, name: str, source: torch.Tens
         _rwkv_debug_checksum(target),
         delta.abs().max().item(),
     )
-
 
 
 @torch.no_grad()
@@ -65,10 +57,14 @@ def load_rwkv_checkpoint_weights(
     CUDA-graph references) and apply that one runtime-layout transform here;
     all shape-preserving tensors continue through RWKV's native loader.
     """
+    from vllm.model_executor.models.utils import is_pp_missing_parameter
+
     loaded = set()
 
     def iter_regular_weights():
         for name, weight in weights:
+            if is_pp_missing_parameter(name, model):
+                continue
             if name.endswith(".mlp.value.weight"):
                 target = model.get_parameter(name)
                 if tuple(target.shape) == tuple(weight.T.shape):
@@ -98,19 +94,23 @@ def refresh_rwkv_runtime_weights(model: torch.nn.Module, fold_embedding: Callabl
     the existing parameter/buffer storage so captured CUDA graphs keep valid
     addresses.
     """
+    from vllm.distributed.parallel_state import get_pp_group
+    from vllm.model_executor.models.utils import is_pp_missing_parameter
+
     rwkv_model = model.model
-    embedding = rwkv_model.embed_tokens.weight
-    embedding_norm = rwkv_model.embedding_norm
-    for start in range(0, embedding.shape[0], 4096):
-        end = min(start + 4096, embedding.shape[0])
-        folded = fold_embedding(
-            embedding[start:end].to(torch.bfloat16).contiguous(),
-            embedding_norm.weight,
-            embedding_norm.bias,
-            eps=rwkv_model.config.layer_norm_epsilon,
-        )
-        embedding[start:end].copy_(folded)
-    rwkv_model._embedding_norm_folded = True
+    if get_pp_group().is_first_rank:
+        embedding = rwkv_model.embed_tokens.weight
+        embedding_norm = rwkv_model.embedding_norm
+        for start in range(0, embedding.shape[0], 4096):
+            end = min(start + 4096, embedding.shape[0])
+            folded = fold_embedding(
+                embedding[start:end].to(torch.bfloat16).contiguous(),
+                embedding_norm.weight,
+                embedding_norm.bias,
+                eps=rwkv_model.config.layer_norm_epsilon,
+            )
+            embedding[start:end].copy_(folded)
+        rwkv_model._embedding_norm_folded = True
 
     for layer_idx, layer in enumerate(
         rwkv_model.layers[rwkv_model.start_layer : rwkv_model.end_layer],
@@ -147,11 +147,9 @@ def refresh_rwkv_runtime_weights(model: torch.nn.Module, fold_embedding: Callabl
             "model.layers.0.linear_attn.w2_canonical",
             "model.layers.1.linear_attn.v1_canonical",
         ):
-            tensor = (
-                model.get_parameter(name)
-                if name == "model.embed_tokens.weight"
-                else model.get_buffer(name)
-            )
+            if is_pp_missing_parameter(name, model):
+                continue
+            tensor = model.get_parameter(name) if name == "model.embed_tokens.weight" else model.get_buffer(name)
             logger.info(
                 "RWKV runtime checksum name=%s (%s)",
                 name,
@@ -186,5 +184,3 @@ def clear_rwkv_cudagraphs() -> None:
     torch.accelerator.synchronize()
     CUDAGraphWrapper.clear_all_graphs()
     BreakableCUDAGraphWrapper.clear_all_graphs()
-
-

@@ -46,7 +46,9 @@ class DummyGenerator(GeneratorInterface):
 
 
 @pytest.mark.asyncio
-async def test_evaluate_computes_expected_metrics(dummy_config, tmp_path):
+@pytest.mark.parametrize("dataset_env_class", [None, "gsm8k"])
+@pytest.mark.parametrize("strict_reward", [False, True])
+async def test_evaluate_computes_expected_metrics(dummy_config, tmp_path, dataset_env_class, strict_reward):
     cfg = dummy_config
     cfg.generator.inference_engine.backend = "vllm"
     cfg.generator.eval_sampling_params = SamplingParams(
@@ -60,14 +62,18 @@ async def test_evaluate_computes_expected_metrics(dummy_config, tmp_path):
     )
     cfg.generator.eval_n_samples_per_prompt = 1
     cfg.environment = EnvironmentConfig(env_class="gsm8k")
+    cfg.environment.skyrl_gym.gsm8k.strict_reward = strict_reward
     cfg.trainer.dump_eval_results = False
     cfg.trainer.export_path = str(tmp_path)
 
     prompts_batch = [
         {
             "prompt": [{"role": "user", "content": "question-1"}],
-            "env_class": None,
-            "env_extras": {"data_source": "dataset/a"},
+            "env_class": dataset_env_class,
+            "env_extras": {
+                "data_source": "dataset/a",
+                "reward_spec": {"method": "rule", "ground_truth": "42", "strict": strict_reward},
+            },
             "uid": "uid-1",
         },
         {

@@ -88,6 +88,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             meta_init=use_meta,
             language_model_only=self.cfg.policy.language_model_only,
             logprobs_chunk_size=self.cfg.logprobs_chunk_size,
+            rwkv_chunk_size=self.cfg.rwkv_chunk_size,
         )
         if (
             wrapped_model.is_rwkv

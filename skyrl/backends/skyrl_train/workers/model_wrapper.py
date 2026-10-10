@@ -14,6 +14,7 @@ from loguru import logger
 from packaging.version import Version
 from peft import LoraConfig, TaskType, get_peft_model
 from peft.tuners.lora import LoraLayer
+from torch.utils.checkpoint import checkpoint
 from transformers import (
     AutoConfig,
     AutoModel,
@@ -185,6 +186,7 @@ class HFModelWrapper(nn.Module):
         meta_init: bool = False,
         language_model_only: bool = False,
         logprobs_chunk_size: int = 1024,
+        rwkv_chunk_size: int = 0,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -348,6 +350,7 @@ class HFModelWrapper(nn.Module):
             ), "Flash attention 2 should be used for `remove_microbatch_padding`"
 
         self.logprobs_chunk_size = logprobs_chunk_size
+        self.rwkv_chunk_size = rwkv_chunk_size
 
         # TODO (sumanthrh): do the same for `logprobs_from_logits` and test.
         # Credits: https://www.tylerromero.com/posts/2025-02-selective-log-softmax/#efficient-solution
@@ -356,6 +359,48 @@ class HFModelWrapper(nn.Module):
             if use_torch_compile
             else chunked_entropy_from_logits
         )
+
+    def _forward_rwkv_infctx(self, sequences, labels, temperature, compute_entropy, entropy_requires_grad):
+        """Checkpoint complete recurrent streams without detaching their history."""
+        chunk_size = self.rwkv_chunk_size
+        cache = None
+        logprobs, entropies = [], []
+
+        def run_chunk(ids, targets, previous_cache):
+            # Recompute from an immutable snapshot: the HF forward updates its cache.
+            previous_cache = previous_cache.clone() if previous_cache is not None else None
+            with torch.autocast(device_type=ids.device.type, enabled=False):
+                result = self.model(ids, past_key_values=previous_cache, use_cache=True)
+            logits = result["logits"] / temperature
+            token_logprobs = logprobs_from_logits(logits, targets, inplace_backward=True)
+            token_entropy = (
+                self.chunked_entropy_from_logits_fn(
+                    logits,
+                    requires_grad=entropy_requires_grad,
+                    attention_mask=None,
+                    chunk_size=self.logprobs_chunk_size,
+                )
+                if compute_entropy
+                else None
+            )
+            return token_logprobs, token_entropy, result["past_key_values"]
+
+        was_training = self.model.training
+        self.model.train()
+        try:
+            for start in range(0, sequences.shape[1], chunk_size):
+                ids = sequences[:, start : start + chunk_size]
+                targets = labels[:, start : start + chunk_size]
+                if torch.is_grad_enabled():
+                    lp, entropy, cache = checkpoint(run_chunk, ids, targets, cache, use_reentrant=False)
+                else:
+                    lp, entropy, cache = run_chunk(ids, targets, cache)
+                logprobs.append(lp)
+                if compute_entropy:
+                    entropies.append(entropy)
+        finally:
+            self.model.train(was_training)
+        return torch.cat(logprobs, dim=1), torch.cat(entropies, dim=1) if compute_entropy else None
 
     def _forward_rwkv(
         self,
@@ -401,6 +446,11 @@ class HFModelWrapper(nn.Module):
 
         for bucket_lengths, bucket_indices in buckets:
             bucket_length = int(bucket_lengths.max().item())
+            if self.rwkv_chunk_size and torch.distributed.is_available() and torch.distributed.is_initialized():
+                # Each FSDP rank must enter the same number of chunk forwards and recomputations.
+                global_length = bucket_lengths.max().clone()
+                torch.distributed.all_reduce(global_length, op=torch.distributed.ReduceOp.MAX)
+                bucket_length = int(global_length.item())
             bucket_sequences = sequences.new_zeros((bucket_indices.numel(), bucket_length))
             for bucket_row, (sequence_index, sequence_length_tensor) in enumerate(
                 zip(bucket_indices, bucket_lengths, strict=True)
@@ -408,6 +458,30 @@ class HFModelWrapper(nn.Module):
                 sequence_length = int(sequence_length_tensor.item())
                 bucket_sequences[bucket_row, :sequence_length] = sequences[sequence_index, -sequence_length:]
             bucket_labels = torch.roll(bucket_sequences, shifts=-1, dims=1)
+            if self.rwkv_chunk_size and not enable_score_centering:
+                bucket_log_probs, bucket_entropy = self._forward_rwkv_infctx(
+                    bucket_sequences, bucket_labels, temperature, compute_entropy, entropy_requires_grad
+                )
+                bucket_log_probs = torch.stack(
+                    [
+                        nn.functional.pad(row[: int(length.item())], (padded_length - int(length.item()), 0))
+                        for row, length in zip(bucket_log_probs, bucket_lengths, strict=True)
+                    ]
+                )
+                if log_probs is None:
+                    log_probs = bucket_log_probs.new_zeros((batch_size, padded_length))
+                log_probs = log_probs.index_copy(0, bucket_indices, bucket_log_probs)
+                if compute_entropy:
+                    bucket_entropy = torch.stack(
+                        [
+                            nn.functional.pad(row[: int(length.item())], (padded_length - int(length.item()), 0))
+                            for row, length in zip(bucket_entropy, bucket_lengths, strict=True)
+                        ]
+                    )
+                    if entropy is None:
+                        entropy = bucket_entropy.new_zeros((batch_size, padded_length))
+                    entropy = entropy.index_copy(0, bucket_indices, bucket_entropy)
+                continue
             bucket_score_row_ids = None
             if enable_score_centering:
                 bucket_score_row_ids = torch.full(

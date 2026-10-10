@@ -184,7 +184,6 @@ class HFModelWrapper(nn.Module):
         self.remove_microbatch_padding = remove_microbatch_padding
         self.is_vlm = False
 
-
         if isinstance(pretrain_or_model, str):
             if load_in_4bit:
                 assert bf16, "we only support bnb_4bit_compute_dtype = bf16"
@@ -541,6 +540,8 @@ class HFModelWrapper(nn.Module):
     ) -> torch.Tensor:
         """Returns action log probs"""
         if self.is_rwkv:
+            if enable_sample_support_replay:
+                raise ValueError("RWKV does not support enable_sample_support_replay=True")
             return self._forward_rwkv(
                 sequences,
                 num_actions,

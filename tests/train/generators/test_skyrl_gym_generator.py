@@ -128,6 +128,7 @@ def mock_llm():
 @pytest.fixture
 def mock_env():
     mock_env_instance = MagicMock()
+    mock_env_instance.strict_reward = False
     mock_env_instance.step.side_effect = lambda x: BaseTextEnvStepOutput(
         observations=[{"role": "user", "content": "next"}], reward=1.0, done=True, metadata={}
     )
@@ -922,21 +923,39 @@ async def test_generate_batched_metrics_use_truncated_responses(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("batched", [True, False])
+@pytest.mark.parametrize("batched,step_wise", [(True, False), (False, False), (False, True)])
+@pytest.mark.parametrize("stop_reason", ["length", "max_tokens"])
+@pytest.mark.parametrize("strict_reward", [False, True])
+@pytest.mark.parametrize("preserve_mask", [False, True])
 @patch("skyrl_gym.make")
 async def test_truncated_action_mask_can_be_preserved(
-    mock_make, mock_tokenizer, mock_llm, mock_env, generator_cfg, mock_env_cfg, batched
+    mock_make,
+    mock_tokenizer,
+    mock_llm,
+    mock_env,
+    generator_cfg,
+    mock_env_cfg,
+    batched,
+    strict_reward,
+    preserve_mask,
+    step_wise,
+    stop_reason,
 ):
     """FlashREINFORCE keeps sampled action tokens trainable when truncation gives zero reward."""
+    from skyrl.train.generators.base import TrajectoryID
+
     generator_cfg.batched = batched
-    generator_cfg.preserve_truncated_action_mask = True
-    generator_cfg.use_conversation_multi_turn = False
+    generator_cfg.step_wise_trajectories = step_wise
+    generator_cfg.preserve_truncated_action_mask = preserve_mask
+    mock_env.strict_reward = strict_reward
+    generator_cfg.use_conversation_multi_turn = step_wise
+    mock_env.step.side_effect = lambda x: BaseTextEnvStepOutput(observations=[], reward=1.0, done=True, metadata={})
     mock_make.return_value = mock_env
     mock_env.init.return_value = ([{"role": "user", "content": "Initial input"}], {})
     mock_llm.generate = AsyncMock(
         return_value={
             "responses": ["truncated response"],
-            "stop_reasons": ["length"],
+            "stop_reasons": [stop_reason],
             "response_ids": [[10, 11, 12, 13]],
         }
     )
@@ -954,15 +973,19 @@ async def test_truncated_action_mask_can_be_preserved(
             "prompts": [[{"role": "user", "content": "What is 3 + 5?"}]],
             "env_extras": [{"answer": "8"}],
             "env_classes": ["gsm8k"],
+            "trajectory_ids": [TrajectoryID("question", 0)],
         }
     )
 
     if isinstance(output["rewards"][0], list):
-        assert sum(output["rewards"][0]) == 0.0
+        assert sum(output["rewards"][0]) == float(not strict_reward)
     else:
-        assert output["rewards"] == [0.0]
-    assert output["loss_masks"] == [[1, 1, 1, 1]]
-    assert mock_env.step.call_count == 0
+        assert output["rewards"] == [float(not strict_reward)]
+    expected_mask = [int(not strict_reward or preserve_mask)] * 4
+    if not batched and not step_wise and not strict_reward and stop_reason == "max_tokens":
+        expected_mask.append(1)  # Native single-turn EOS behavior.
+    assert output["loss_masks"] == [expected_mask]
+    assert mock_env.step.call_count == int(not strict_reward)
 
 
 @pytest.mark.asyncio
@@ -1317,6 +1340,7 @@ async def test_apply_overlong_filtering_non_batched(
     - Trajectories with responses ending with eos token keep their original loss masks
     """
     mock_make.return_value = mock_env
+    mock_env.strict_reward = True
     generator_cfg.apply_overlong_filtering = True  # Enable filtering
     generator_cfg.batched = False
     generator_cfg.max_turns = 1
@@ -1429,6 +1453,7 @@ async def test_apply_overlong_filtering_batched(
     Tests a response that doesn't end with eos token to verify that it gets filtered.
     """
     mock_make.return_value = mock_env
+    mock_env.strict_reward = True
     generator_cfg.apply_overlong_filtering = True  # Enable filtering
     generator_cfg.batched = True
     generator_cfg.max_turns = 1

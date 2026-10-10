@@ -2011,6 +2011,16 @@ class SkyRLTrainConfig(BaseConfig):
                     "use_conversation_multi_turn=False appends a synthetic loss-active EOS without captured support"
                 )
 
+            if flashreinforce.score_centering:
+                raise ValueError("sample-support replay cannot be combined with raw Score-Centering")
+            if self.generator.sampling_params.top_k <= 1:
+                raise ValueError("sample-support replay requires generator.sampling_params.top_k > 1")
+            if self.generator.inference_engine.sample_support_logprobs_mode != "processed_logprobs":
+                raise ValueError("sample-support replay requires processed_logprobs capture")
+            support_top_k = self.generator.inference_engine.sample_support_top_k
+            if support_top_k is not None and support_top_k != self.generator.sampling_params.top_k:
+                raise ValueError("sample-support replay requires sample_support_top_k to match sampling_params.top_k")
+
         # Eval requests opt out of capture and do not use these constraints.
         if self.generator.inference_engine.enable_return_sample_support_set:
             sampling_params = self.generator.sampling_params

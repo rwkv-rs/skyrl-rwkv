@@ -21,10 +21,7 @@ from skyrl.backends.skyrl_train.utils.sample_support import (
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
 from skyrl.backends.skyrl_train.workers import model_wrapper as model_wrapper_module
-from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
-    FSDPPolicyWorkerBase,
-    FSDPWeightExtractor,
-)
+from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
 from skyrl.train.config import SamplingParams
 
@@ -293,18 +290,30 @@ def test_rwkv_recurrent_forward_preserves_gradients():
     assert torch.isfinite(model.lm_head.weight.grad).all()
 
 
-def test_rwkv_weight_extractor_matches_fsdp_bf16_forward_dtype(monkeypatch):
-    source = torch.tensor([1.003, -2.007], dtype=torch.float32)
-    extractor = FSDPWeightExtractor(torch.nn.Module(), rwkv_effective_bf16=True)
-    monkeypatch.setattr(extractor, "_gather_tensor", lambda param: param)
+def test_rwkv_weight_source_matches_metadata_and_fsdp_bf16_forward_dtype(monkeypatch):
+    from skyrl.backends.skyrl_train.weight_sync.sources import FsdpWeightSource
 
-    actual = extractor._gather_for_dtype(source, torch.float16)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    weights = torch.tensor([1.003, -2.007], dtype=torch.float32)
+    model = torch.nn.Module()
+    model.register_parameter("weight", torch.nn.Parameter(weights))
+    source = FsdpWeightSource(model, torch.float16, rwkv_effective_bf16=True)
+    metadata = source.metadata()
+    [(name, actual)] = list(source)
 
-    assert torch.equal(actual, source.to(torch.bfloat16).to(torch.float16))
-    assert not torch.equal(actual, source.to(torch.float16))
+    assert metadata[0].name == name == "weight"
+    assert metadata[0].dtype == actual.dtype == torch.float16
+    assert metadata[0].shape == tuple(actual.shape) == (2,)
+    assert torch.equal(actual, weights.to(torch.bfloat16).to(torch.float16))
+    assert not torch.equal(actual, weights.to(torch.float16))
+    [(name, direct)] = list(FsdpWeightSource(model, torch.float16))
+    assert torch.equal(direct, weights.to(torch.float16))
 
 
-def test_rwkv_weight_reload_preserves_runtime_layout_and_derived_storage():
+def test_rwkv_weight_reload_preserves_runtime_layout_and_derived_storage(monkeypatch):
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
     model = ToyVllmRwkv()
     checkpoint_value = torch.arange(8, dtype=torch.float16).view(2, 4)
     checkpoint_embedding = torch.arange(10, dtype=torch.float16).view(5, 2)
@@ -482,3 +491,126 @@ def test_rwkv_sampling_parameters_are_forwarded_to_vllm(sampling_params, expecte
     actual = get_vllm_sampling_params(config)
 
     assert {key: actual[key] for key in expected} == expected
+
+
+def test_rwkv_rejects_sample_support_replay_before_forward():
+    model = ToyCausalLM()
+    with pytest.raises(ValueError, match="RWKV does not support enable_sample_support_replay"):
+        HFModelWrapper(model)(
+            torch.tensor([[1, 2, 3]]),
+            num_actions=2,
+            attention_mask=torch.ones(1, 3),
+            enable_sample_support_replay=True,
+        )
+    assert not model.calls
+
+
+def test_rwkv_weight_reload_skips_missing_pp_parameters(monkeypatch):
+    from vllm.distributed import parallel_state
+    from vllm.model_executor.models.utils import PPMissingLayer
+
+    model = ToyVllmRwkv()
+    model.model.embed_tokens = PPMissingLayer()
+    model.model.embedding_norm = PPMissingLayer()
+    model.model.layers[0] = PPMissingLayer()
+    model.model.start_layer = 1
+    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: SimpleNamespace(is_first_rank=False))
+    value = torch.arange(8, dtype=torch.float16).view(2, 4)
+    loaded = load_rwkv_checkpoint_weights(
+        model,
+        [
+            ("model.layers.0.mlp.value.weight", value),
+            ("model.layers.0.linear_attn.w1", torch.zeros(2, 3)),
+            ("model.embed_tokens.weight", torch.zeros(5, 2)),
+            ("model.layers.1.mlp.value.weight", value),
+        ],
+    )
+
+    def unexpected_fold(*args, **kwargs):
+        pytest.fail("non-first PP rank must not fold embeddings")
+
+    refresh_rwkv_runtime_weights(model, unexpected_fold)
+    assert loaded == {"model.layers.1.mlp.value.weight"}
+    assert torch.equal(model.model.layers[1].mlp.value.weight, value.T)
+    assert not model.model._embedding_norm_folded
+    assert torch.equal(model.model.layers[1].linear_attn.w1_canonical, model.model.layers[1].linear_attn.w1.T)
+
+
+@pytest.mark.parametrize(
+    "model_type,clear_cache,accepted",
+    [("rwkv", False, False), ("rwkv", True, True), ("llama", False, True)],
+)
+def test_rwkv_fully_async_requires_cache_reset_before_fsdp_prepare(monkeypatch, model_type, clear_cache, accepted):
+    from unittest.mock import MagicMock
+
+    from skyrl.backends.skyrl_train.workers.fsdp import fsdp_worker as module
+    from skyrl.train.config import SkyRLTrainConfig
+
+    cfg = SkyRLTrainConfig().trainer
+    cfg.fully_async.enabled = True
+    cfg.fully_async.clear_kv_cache_on_weight_sync = clear_cache
+    cfg.gradient_checkpointing = False
+    wrapper = HFModelWrapper(ToyCausalLM(model_type))
+    strategy = MagicMock()
+    strategy.prepare.return_value = (wrapper, object(), object())
+    monkeypatch.setattr(module, "FSDPStrategy", lambda **kwargs: strategy)
+    monkeypatch.setattr(
+        module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: SimpleNamespace(tie_word_embeddings=False),
+    )
+    monkeypatch.setattr(module, "should_use_meta_init", lambda **kwargs: False)
+    monkeypatch.setattr(module, "HFModelWrapper", lambda *args, **kwargs: wrapper)
+    monkeypatch.setattr(module, "build_profiler_from_policy_cfg", lambda cfg: None)
+    worker = object.__new__(FSDPPolicyWorkerBase)
+    worker.cfg = cfg
+    worker._seq_parallel_monkey_patch = MagicMock()
+    worker._set_expandable_segments = MagicMock()
+    if accepted:
+        worker.init_model("checkpoint")
+        strategy.prepare.assert_called_once()
+    else:
+        with pytest.raises(ValueError, match="clear_kv_cache_on_weight_sync=True"):
+            worker.init_model("checkpoint")
+        strategy.prepare.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "override,message",
+    [
+        ("generator.sampling_params.top_k=-1", "sampling_params.top_k > 1"),
+        ("generator.inference_engine.sample_support_top_k=128", "match sampling_params.top_k"),
+        ("generator.inference_engine.sample_support_logprobs_mode=raw_logprobs", "processed_logprobs"),
+        ("trainer.algorithm.flashreinforce.score_centering=true", "raw Score-Centering"),
+    ],
+)
+def test_rwkv_flashreinforce_diagnostic_capture_cannot_relax_replay(override, message):
+    from skyrl.train.config import SkyRLTrainConfig
+
+    with pytest.raises(ValueError, match=message):
+        SkyRLTrainConfig.from_cli_overrides(
+            [
+                "trainer.algorithm.policy_loss_type=flashreinforce",
+                "trainer.algorithm.enable_sample_support_replay=true",
+                "generator.use_conversation_multi_turn=true",
+                "generator.inference_engine.enable_return_sample_support_set=true",
+                "generator.sampling_params.top_k=8",
+                override,
+            ]
+        )
+
+
+def test_rwkv_flashreinforce_raw_score_centering_keeps_independent_capture_width():
+    from skyrl.train.config import SkyRLTrainConfig
+
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "trainer.algorithm.policy_loss_type=flashreinforce",
+            "trainer.algorithm.flashreinforce.score_centering=true",
+            "generator.use_conversation_multi_turn=true",
+            "generator.sampling_params.top_k=-1",
+        ]
+    )
+    assert not cfg.trainer.algorithm.enable_sample_support_replay
+    assert cfg.generator.inference_engine.sample_support_top_k == 128
+    assert cfg.generator.inference_engine.sample_support_logprobs_mode == "raw_logprobs"

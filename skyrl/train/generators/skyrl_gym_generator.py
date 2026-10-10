@@ -646,7 +646,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                 )
 
                 # 2. Environment step
-                if stop_reason in {"length", "max_tokens"}:
+                if getattr(env, "strict_reward", False) and stop_reason in {"length", "max_tokens"}:
                     # A generation cut off at the token budget is an
                     # unanswered trajectory, even if it contains a matching
                     # answer marker somewhere before the cutoff.
@@ -699,7 +699,8 @@ class SkyRLGymGenerator(GeneratorInterface):
                     # agent loop only tracks loss mask and rollout logprobs for this turn with step_wise training
                     turn_loss_mask = turn_output.get_turn_loss_mask()
                     if (
-                        stop_reason in {"length", "max_tokens"}
+                        getattr(env, "strict_reward", False)
+                        and stop_reason in {"length", "max_tokens"}
                         and not self.generator_cfg.preserve_truncated_action_mask
                     ):
                         turn_loss_mask = [0] * len(turn_loss_mask)
@@ -813,7 +814,8 @@ class SkyRLGymGenerator(GeneratorInterface):
 
             appended_eos_token = False
             if (
-                stop_reason in {"length", "max_tokens"}
+                getattr(env, "strict_reward", False)
+                and stop_reason in {"length", "max_tokens"}
                 and loss_mask is not None
                 and not self.generator_cfg.preserve_truncated_action_mask
             ):
@@ -821,7 +823,8 @@ class SkyRLGymGenerator(GeneratorInterface):
             if not self.use_conversation_multi_turn:
                 assert response_ids is not None and loss_mask is not None
                 if (
-                    stop_reason not in {"length", "max_tokens"}
+                    stop_reason != "length"
+                    and not (getattr(env, "strict_reward", False) and stop_reason == "max_tokens")
                     and response_ids
                     and response_ids[-1] != self.tokenizer.eos_token_id
                 ):
@@ -1098,9 +1101,8 @@ class SkyRLGymGenerator(GeneratorInterface):
                 response,
                 stop_reasons[i],
             )
-            # A response cut off at the generation limit is unanswered and
-            # must not receive an environment reward or training advantage.
-            if stop_reasons[i] in {"length", "max_tokens"}:
+            # Strict rewards treat generation-limit truncation as unanswered.
+            if getattr(env, "strict_reward", False) and stop_reasons[i] in {"length", "max_tokens"}:
                 reward = 0.0
             else:
                 env_step_output: BaseTextEnvStepOutput = await self._run_in_executor_if_available(env.step, output)
@@ -1110,7 +1112,11 @@ class SkyRLGymGenerator(GeneratorInterface):
             if len(response) > max_tokens:
                 response = response[:max_tokens]
             is_truncated = stop_reasons[i] in {"length", "max_tokens"}
-            if is_truncated and not self.generator_cfg.preserve_truncated_action_mask:
+            if (
+                getattr(env, "strict_reward", False)
+                and is_truncated
+                and not self.generator_cfg.preserve_truncated_action_mask
+            ):
                 loss_masks.append([0] * len(response))
             else:
                 loss_masks.append([1] * len(response))

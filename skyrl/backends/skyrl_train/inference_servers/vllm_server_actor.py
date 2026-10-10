@@ -501,13 +501,14 @@ class VLLMServerActor(ServerActorProtocol):
                 """Identify the Ray frontend exporting this server's engine metrics."""
                 return Response(content=orjson.dumps(metrics_info), media_type="application/json")
 
-        # vLLM's dev-mode app already installs a route with this path. Remove it
-        # before registering SkyRL's body-based retrying route; otherwise FastAPI
-        # dispatches the first route and the reset_running_requests JSON field is
-        # silently ignored by vLLM's query-parameter handler.
-        app.router.routes[:] = [
-            route for route in app.router.routes if getattr(route, "path", None) != "/reset_prefix_cache"
-        ]
+        is_rwkv = engine.model_config.hf_config.model_type == "rwkv"
+        if is_rwkv:
+            # vLLM's dev route reads query parameters, whereas SkyRL sends a
+            # JSON body. RWKV must reset running requests before reusing state
+            # slots with new weights; keep the native route for other models.
+            app.router.routes[:] = [
+                route for route in app.router.routes if getattr(route, "path", None) != "/reset_prefix_cache"
+            ]
 
         @app.post("/reset_prefix_cache")
         async def _reset_prefix_cache(request: Request):
@@ -517,33 +518,10 @@ class VLLMServerActor(ServerActorProtocol):
             except Exception:
                 data = {}
             reset_running_requests = data.get("reset_running_requests", False)
-            reset_attempts = 0
-            while True:
-                try:
-                    reset_succeeded = await engine.reset_prefix_cache(reset_running_requests=reset_running_requests)
-                except (RuntimeError, ValueError) as exc:
-                    # Some vLLM revisions raise instead of returning False when
-                    # preempted requests still own blocks. Treat that transient
-                    # state exactly like an unsuccessful reset.
-                    if not reset_running_requests or not any(
-                        message in str(exc)
-                        for message in (
-                            "Failed to reset KV cache",
-                            "output is in flight",
-                        )
-                    ):
-                        raise
-                    reset_succeeded = False
-                if reset_succeeded or not reset_running_requests:
-                    break
-                # In-flight output processing may still be releasing a block after
-                # reset_running_requests preempts the scheduler. Do not start a
-                # weight reload until the cache and RWKV state slots are quiescent.
-                reset_attempts += 1
-                await asyncio.sleep(0.01)
-            if reset_attempts:
-                logger.info("Reset prefix cache after %d retry attempt(s)", reset_attempts)
-            return {"status": "ok", "reset_attempts": reset_attempts}
+            reset_succeeded = await engine.reset_prefix_cache(reset_running_requests=reset_running_requests)
+            if is_rwkv and not reset_succeeded:
+                raise HTTPException(status_code=409, detail="RWKV recurrent cache reset did not complete")
+            return {"status": "ok"}
 
         @app.post("/fetch_weights")
         async def _fetch_weights(request: Request):

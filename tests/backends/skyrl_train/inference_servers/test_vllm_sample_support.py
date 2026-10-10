@@ -96,6 +96,7 @@ def test_flat_logprobs_top_k_one_repairs_single_support_column():
 
 
 class FakeEngine:
+    model_config = SimpleNamespace(hf_config=SimpleNamespace(model_type="llama"))
     sampling_params = None
     lora_request = None
 
@@ -236,3 +237,63 @@ def test_skyrl_generate_rejects_unknown_model_with_lora_enabled():
     assert response.status_code == 404
     assert "missing-lora" in response.json()["detail"]
     assert engine.sampling_params is None
+
+
+@pytest.mark.parametrize("message", ["Failed to reset KV cache", "output is in flight"])
+def test_rwkv_weight_sync_cache_reset_propagates_errors_without_retry(message):
+    from unittest.mock import AsyncMock
+
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="rwkv")),
+        reset_prefix_cache=AsyncMock(side_effect=RuntimeError(message)),
+    )
+    app = FastAPI()
+    VLLMServerActor._add_custom_endpoints(app, engine, SimpleNamespace(enable_lora=False))
+    with TestClient(app) as client, pytest.raises(RuntimeError, match=message):
+        client.post("/reset_prefix_cache", json={"reset_running_requests": True})
+    engine.reset_prefix_cache.assert_awaited_once_with(reset_running_requests=True)
+
+
+def test_rwkv_weight_sync_cache_reset_preserves_native_success_response():
+    from unittest.mock import AsyncMock
+
+    from vllm.entrypoints.serve.dev.cache.api_router import router
+
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="rwkv")),
+        reset_prefix_cache=AsyncMock(return_value=True),
+    )
+    app = FastAPI()
+    app.include_router(router)
+    app.state.engine_client = engine
+    VLLMServerActor._add_custom_endpoints(app, engine, SimpleNamespace(enable_lora=False))
+    with TestClient(app) as client:
+        result = client.post("/reset_prefix_cache", json={"reset_running_requests": True})
+    assert result.json() == {"status": "ok"}
+    engine.reset_prefix_cache.assert_awaited_once_with(reset_running_requests=True)
+
+
+def test_rwkv_weight_sync_rejects_incomplete_cache_reset():
+    from unittest.mock import AsyncMock
+
+    engine = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type="rwkv")),
+        reset_prefix_cache=AsyncMock(return_value=False),
+    )
+    app = FastAPI()
+    VLLMServerActor._add_custom_endpoints(app, engine, SimpleNamespace(enable_lora=False))
+    with TestClient(app) as client:
+        result = client.post("/reset_prefix_cache", json={"reset_running_requests": True})
+    assert result.status_code == 409
+    engine.reset_prefix_cache.assert_awaited_once_with(reset_running_requests=True)
+
+
+def test_rwkv_weight_sync_route_override_keeps_other_models_native_route():
+    from vllm.entrypoints.serve.dev.cache.api_router import router
+
+    app = FastAPI()
+    app.include_router(router)
+    native_route = next(route for route in app.router.routes if getattr(route, "path", None) == "/reset_prefix_cache")
+    VLLMServerActor._add_custom_endpoints(app, FakeEngine(), SimpleNamespace(enable_lora=False))
+    reset_routes = [route for route in app.router.routes if getattr(route, "path", None) == "/reset_prefix_cache"]
+    assert reset_routes[0] is native_route

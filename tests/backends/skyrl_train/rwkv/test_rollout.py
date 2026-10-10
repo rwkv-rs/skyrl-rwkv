@@ -513,3 +513,63 @@ def test_owned_engine_acceptance_precedes_dataset_generation(tmp_path, tokenizer
         assert summary["Knowledge"]["correct_rollouts"] == 64
     else:
         assert not (tmp_path / "output/correct_counts_by_question.jsonl").exists()
+
+
+@pytest.mark.parametrize("entrypoint", ["prepare", "check"])
+@pytest.mark.parametrize("installed_commit", ["old-install", None])
+def test_rwkv_native_artifact_preflight_rejects_unmatched_install_before_loading(
+    tmp_path, monkeypatch, entrypoint, installed_commit
+):
+    from unittest.mock import MagicMock
+
+    from examples.train.rwkv import prepare_flashrwkv2 as preparation
+
+    (tmp_path / "pyproject.toml").write_text('[tool.uv.sources.vllm]\nrev = "project-pin"\n')
+    monkeypatch.chdir(tmp_path)
+    read_text = MagicMock(
+        return_value=json.dumps({"vcs_info": {"commit_id": installed_commit}}) if installed_commit else None
+    )
+    distribution = MagicMock(return_value=SimpleNamespace(read_text=read_text))
+    monkeypatch.setattr(preparation.importlib.metadata, "distribution", distribution)
+    load = MagicMock()
+    monkeypatch.setattr(preparation, "_load_flashrwkv2", load)
+
+    with pytest.raises(SystemExit, match="vLLM RWKV revision mismatch") as error:
+        getattr(preparation, entrypoint)()
+
+    assert repr(installed_commit) in str(error.value)
+    assert "project-pin" in str(error.value)
+    distribution.assert_called_once_with("vllm")
+    read_text.assert_called_once_with("direct_url.json")
+    load.assert_not_called()
+
+
+def test_rwkv_native_artifact_environment_records_verified_installed_revision(tmp_path, monkeypatch):
+    from unittest.mock import MagicMock
+
+    from examples.train.rwkv import prepare_flashrwkv2 as preparation
+
+    (tmp_path / "pyproject.toml").write_text('[tool.uv.sources.vllm]\nrev = "matched-install"\n')
+    monkeypatch.chdir(tmp_path)
+    installed_metadata = json.dumps({"vcs_info": {"commit_id": "matched-install"}})
+    monkeypatch.setattr(
+        preparation.importlib.metadata,
+        "distribution",
+        lambda name: SimpleNamespace(read_text=lambda filename: installed_metadata),
+    )
+    monkeypatch.setattr(preparation.importlib.metadata, "version", lambda name: "test-version")
+    library = tmp_path / "extension.so"
+    library.write_bytes(b"mock native artifact")
+    monkeypatch.setattr(preparation, "_load_flashrwkv2", MagicMock())
+    monkeypatch.setattr(
+        preparation,
+        "load_extension",
+        lambda: SimpleNamespace(library=str(library), target="test-target", status="cached"),
+    )
+    monkeypatch.setattr(preparation.subprocess, "check_output", lambda *args, **kwargs: "test-driver\n")
+
+    preparation.prepare()
+
+    environment = json.loads((tmp_path / "environment.json").read_text())
+    assert environment["vllm_rwkv_commit"] == "matched-install"
+    assert environment["build"] == "cached"

@@ -611,13 +611,21 @@ def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, mon
     import transformers
 
     source = tmp_path / "expert.jsonl"
-    write_rows(source, [{"uuid": "a", "prompt": "question", "solution": "expert"}])
+    write_rows(source, [{"uuid": uuid, "prompt": "question", "solution": "expert"} for uuid in ("a", "b")])
     output = tmp_path / "boosted.jsonl"
     options = []
     preflights = []
     shutdowns = []
     proposals = []
     tokenizer = Tokenizer()
+    format_calls = []
+    apply_chat_template = tokenizer.apply_chat_template
+
+    def format_chat(messages, **kwargs):
+        format_calls.append(messages[0]["content"])
+        return apply_chat_template(messages, **kwargs)
+
+    tokenizer.apply_chat_template = format_chat
     generation_config = transformers.GenerationConfig(
         do_sample=True,
         temperature=0.96,
@@ -657,6 +665,9 @@ def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, mon
 
     def sample(p, *args, **kwargs):
         proposals.append(p.sampling_params)
+        for _ in range(3):
+            assert p.format_prompt("question") == [7, 8]
+            assert p.format_prompt("Expert solution:\nexpert\nQuestion:\nquestion") == [7, 8]
         return {
             "response_ids": [3, 0],
             "finish_reason": "stop",
@@ -678,7 +689,8 @@ def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, mon
     ]
     boost.run(boost.parse_args(argv))
     boost.run(boost.parse_args(argv + ["--resume"]))
-    assert len(list(data.load_rows(str(output)))) == 1
+    assert len(list(data.load_rows(str(output)))) == 2
+    assert format_calls == ["question", "Expert solution:\nexpert\nQuestion:\nquestion"] * 2
     assert len(preflights) == 2
     assert len(shutdowns) == 2
     assert options[0]["hf_overrides"] == {"wkv_mode": "fp32io16"}

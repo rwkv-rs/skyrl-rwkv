@@ -5,6 +5,7 @@ SkyRL pretokenized SFT contract. No trainer or policy-loss changes are needed.
 """
 
 import argparse
+import functools
 import hashlib
 import os
 import time
@@ -178,7 +179,17 @@ def run(args):
 
             def write_batch(rows):
                 nonlocal written, truncated, repetitions
-                result = boost_record(p, rows[0] if args.batch_size == 1 else rows, args)
+                format_prompt = p.format_prompt
+                if is_rwkv:
+                    # Like native SFT's _parse_tools_str cache: reuse fixed text.
+                    # RWKV appends response token IDs after formatting, so each
+                    # batch only needs its question and expert-conditioned prefix.
+                    p.format_prompt = functools.lru_cache(maxsize=2 * len(rows))(format_prompt)
+                try:
+                    result = boost_record(p, rows[0] if args.batch_size == 1 else rows, args)
+                finally:
+                    if is_rwkv:
+                        p.format_prompt = format_prompt
                 for record in [result] if args.batch_size == 1 else result:
                     append_jsonl(handle, record)
                     completed.add(record["uuid"])

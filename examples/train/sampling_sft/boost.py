@@ -106,7 +106,7 @@ def run(args):
             "rwkv_generation_prompt": args.rwkv_generation_prompt,
         }
     config = {
-        "version": 4 if is_rwkv else 1,
+        "version": 5 if is_rwkv else 1,
         "algorithm": "greedy_mean_logprob_suffix_search",
         "input": str(Path(args.input).resolve()),
         "model": args.model,
@@ -126,6 +126,7 @@ def run(args):
         "shard_index": args.shard_index,
         "batch_size": args.batch_size,
         "skip_repetition": args.skip_repetition,
+        "repetition_filter": "three_adjacent_spans_min16" if args.skip_repetition else None,
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "enforce_eager": args.enforce_eager,
     }

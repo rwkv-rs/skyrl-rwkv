@@ -88,7 +88,7 @@ vLLM，每条轨迹保留自己的 UUID seed、prefix 和贪心接受状态。�
 每卡 TP1、独立输出 shard。`--max-num-batched-tokens` 控制 prefill token budget，
 `--no-enforce-eager` 启用 vLLM 的图执行路径；这两个执行参数不修改解码分布。
 
-生产数据准备使用 `--skip-repetition`：检测到任意 16–128 tokens 的连续三次重复时，
+生产数据准备使用 `--skip-repetition`：检测到任意至少 16 tokens 的片段连续三次重复时，
 立即跳过当前轨迹，记录 `finish_reason=repetition`，`input_ids/loss_mask` 为空。
 复读 suffix 候选直接拒绝，不执行评分，不替换健康轨迹。跳过记录仍写入 JSONL，
 以便统计和 resume；不会追加 EOS 将复读伪装成完整回答。该过滤是显式选项，
@@ -141,7 +141,7 @@ validation 仅用于 SFT held-out loss，不是新任务 reward / accuracy 评�
   完整专家推理与答案使用单个换行符拼接，原题后直接结束 User 消息；已有回答只出现在 Bot 前缀中。
   Proposal 保留专家条件，评分和最终 SFT 则使用只有原题的上下文。
   生成 `✿`（token ID 10060）时结束 Bot 回答，并追加 EOS（token ID 0）；模型直接生成 EOS 也会停止。
-  separator 与 EOS 保留在 `response_ids` 和训练 loss mask 中。RWKV 输出 metadata 版本为 4，
+  separator 与 EOS 保留在 `response_ids` 和训练 loss mask 中。RWKV 输出 metadata 版本为 5，
   旧版拼接产生的记录应使用独立输出路径保留。
 
 恢复加 `--resume`，不重新生成已完成 UUID。切点 RNG 与 vLLM proposal seed 按 UUID 固定，

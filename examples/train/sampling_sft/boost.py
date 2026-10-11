@@ -74,7 +74,7 @@ def run(args):
             "rwkv_generation_prompt": args.rwkv_generation_prompt,
         }
     config = {
-        "version": 1,
+        "version": 2 if is_rwkv else 1,
         "algorithm": "greedy_mean_logprob_suffix_search",
         "input": str(Path(args.input).resolve()),
         "model": args.model,

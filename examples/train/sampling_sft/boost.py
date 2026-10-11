@@ -119,30 +119,35 @@ def run(args):
             enforce_eager=True,
             seed=args.seed,
         )
-        p = vLLMAutoregressiveSampler(
-            llm,
-            model_type=args.model_type,
-            chat_template_kwargs=template,
-            repetition_penalty=args.repetition_penalty,
-        )
-        selected = written = truncated = 0
-        for index, row in enumerate(expert_rows(args.input, subset=args.subset)):
-            if index % args.num_shards != args.shard_index:
-                continue
-            validation = validation_question(row.get("question_id", row["uuid"]), args.seed, args.validation_fraction)
-            if args.partition != "all" and validation != (args.partition == "validation"):
-                continue
-            if args.limit and selected >= args.limit:
-                break
-            selected += 1
-            if row["uuid"] in completed:
-                continue
-            record = boost_record(p, row, args)
-            append_jsonl(handle, record)
-            completed.add(row["uuid"])
-            written += 1
-            truncated += record["finish_reason"] != "stop"
-            print(f"written={written} truncated={truncated} uuid={row['uuid']}", flush=True)
+        try:
+            p = vLLMAutoregressiveSampler(
+                llm,
+                model_type=args.model_type,
+                chat_template_kwargs=template,
+                repetition_penalty=args.repetition_penalty,
+            )
+            selected = written = truncated = 0
+            for index, row in enumerate(expert_rows(args.input, subset=args.subset)):
+                if index % args.num_shards != args.shard_index:
+                    continue
+                validation = validation_question(
+                    row.get("question_id", row["uuid"]), args.seed, args.validation_fraction
+                )
+                if args.partition != "all" and validation != (args.partition == "validation"):
+                    continue
+                if args.limit and selected >= args.limit:
+                    break
+                selected += 1
+                if row["uuid"] in completed:
+                    continue
+                record = boost_record(p, row, args)
+                append_jsonl(handle, record)
+                completed.add(row["uuid"])
+                written += 1
+                truncated += record["finish_reason"] != "stop"
+                print(f"written={written} truncated={truncated} uuid={row['uuid']}", flush=True)
+        finally:
+            llm.llm_engine.engine_core.shutdown()
 
 
 def parse_args(argv=None):

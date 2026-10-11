@@ -340,13 +340,17 @@ def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, mon
     output = tmp_path / "boosted.jsonl"
     options = []
     preflights = []
+    shutdowns = []
     tokenizer = Tokenizer()
 
     def llm(**kwargs):
         options.append(kwargs)
         return SimpleNamespace(
             get_tokenizer=lambda: tokenizer,
-            llm_engine=SimpleNamespace(model_config=SimpleNamespace(max_model_len=32768)),
+            llm_engine=SimpleNamespace(
+                model_config=SimpleNamespace(max_model_len=32768),
+                engine_core=SimpleNamespace(shutdown=lambda: shutdowns.append(True)),
+            ),
         )
 
     monkeypatch.setattr(
@@ -372,6 +376,7 @@ def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, mon
     boost.run(boost.parse_args(argv + ["--resume"]))
     assert len(list(data.load_rows(str(output)))) == 1
     assert len(preflights) == 2
+    assert len(shutdowns) == 2
     assert options[0]["hf_overrides"] == {"wkv_mode": "fp32io16"}
     assert options[0]["dtype"] == "float16"
     assert options[0]["mamba_ssm_cache_dtype"] == "float32"

@@ -22,12 +22,20 @@ SEQ_PROMPT = (
 class vLLMAutoregressiveSampler:
     """Use one fixed model for expert-conditioned proposals and question-only scoring."""
 
-    def __init__(self, llm, *, model_type="chat", chat_template_kwargs=None, repetition_penalty=1.1):
+    def __init__(
+        self, llm, *, model_type="chat", chat_template_kwargs=None, repetition_penalty=1.1, sampling_params=None
+    ):
         self.llm = llm
         self.tokenizer = llm.get_tokenizer()
         self.model_type = model_type
         self.chat_template_kwargs = chat_template_kwargs or {}
-        self.repetition_penalty = repetition_penalty
+        self.sampling_params = {
+            "temperature": 0.6,
+            "top_p": 1.0,
+            "top_k": -1,
+            "repetition_penalty": repetition_penalty,
+        }
+        self.sampling_params.update(sampling_params or {})
         self.max_model_len = llm.llm_engine.model_config.max_model_len
         self.stop_token_ids = [self.tokenizer.eos_token_id]
         self.rwkv_separator_id = None
@@ -87,10 +95,7 @@ def proposal_vLLM(p, question, solution, current, ext_len, rng):
         {"prompt_token_ids": ids},
         SamplingParams(
             max_tokens=ext_len,
-            temperature=0.6,
-            top_p=1.0,
-            top_k=-1,
-            repetition_penalty=p.repetition_penalty,
+            **p.sampling_params,
             stop_token_ids=p.stop_token_ids,
             seed=rng.randrange(2**31),
         ),

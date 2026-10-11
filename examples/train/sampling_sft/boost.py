@@ -56,7 +56,7 @@ def boost_record(p, row, args):
 
 
 def run(args):
-    from transformers import AutoConfig
+    from transformers import AutoConfig, GenerationConfig
 
     model_config = AutoConfig.from_pretrained(args.model, revision=args.revision, trust_remote_code=True)
     is_rwkv = model_config.model_type == "rwkv"
@@ -64,7 +64,20 @@ def run(args):
         args.repetition_penalty = 1.0 if is_rwkv else 1.1
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     template = {}
+    sampling_params = {
+        "temperature": 0.6,
+        "top_p": 1.0,
+        "top_k": -1,
+        "repetition_penalty": args.repetition_penalty,
+    }
     if is_rwkv:
+        generation_config = GenerationConfig.from_pretrained(args.model, revision=args.revision).to_dict()
+        sampling_params.update(
+            {
+                key: generation_config[key]
+                for key in ("temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "penalty_decay")
+            }
+        )
         cache = Path.home() / ".cache/skyrl-rwkv"
         os.environ.setdefault("XDG_CACHE_HOME", str(cache))
         os.environ.setdefault("TORCH_EXTENSIONS_DIR", str(cache / "torch_extensions"))
@@ -74,7 +87,7 @@ def run(args):
             "rwkv_generation_prompt": args.rwkv_generation_prompt,
         }
     config = {
-        "version": 3 if is_rwkv else 1,
+        "version": 4 if is_rwkv else 1,
         "algorithm": "greedy_mean_logprob_suffix_search",
         "input": str(Path(args.input).resolve()),
         "model": args.model,
@@ -93,6 +106,8 @@ def run(args):
         "num_shards": args.num_shards,
         "shard_index": args.shard_index,
     }
+    if is_rwkv:
+        config["sampling_params"] = sampling_params
     with open_output(args.output, config, args.resume) as (handle, completed):
         # Validate resume metadata before allocating a GPU model.
         from vllm import LLM
@@ -125,6 +140,7 @@ def run(args):
                 model_type=args.model_type,
                 chat_template_kwargs=template,
                 repetition_penalty=args.repetition_penalty,
+                sampling_params=sampling_params,
             )
             selected = written = truncated = 0
             for index, row in enumerate(expert_rows(args.input, subset=args.subset)):

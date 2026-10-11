@@ -9,6 +9,8 @@ This implements the published greedy mean-logprob approximation, not exact MH.
 import random
 from collections.abc import Mapping
 
+from loguru import logger
+
 SEQ_PROMPT = (
     "Study the question and expert solution below. Continue the partial response in your own words, "
     "preserving the expert's reasoning and final answer. Return only the continuation, "
@@ -99,7 +101,7 @@ def proj_samp_vLLM(p, question, solution, *, mcmc_steps=10, max_new_tokens=1856,
     gen = []
     attempts = acceptances = 0
     finished = False
-    for _ in range(block_num):
+    for block in range(block_num):
         gen, finished = proposal_vLLM(p, question, solution, gen, max_new_tokens // block_num, rng)
         score = get_logprobs_vLLM(p, question, gen)
         for _ in range(mcmc_steps):
@@ -110,6 +112,16 @@ def proj_samp_vLLM(p, question, solution, *, mcmc_steps=10, max_new_tokens=1856,
             if candidate_score > score:
                 gen, score, finished = candidate, candidate_score, candidate_finished
                 acceptances += 1
+        logger.info(
+            "Sampling block {}/{}: tokens={}, mean_logprob={:.4f}, accepted={}/{}, finished={}",
+            block + 1,
+            block_num,
+            len(gen),
+            score,
+            acceptances,
+            attempts,
+            finished,
+        )
         if finished or p.tokenizer.eos_token_id in gen:
             finished = True
             break

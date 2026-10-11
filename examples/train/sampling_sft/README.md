@@ -97,6 +97,11 @@ uv run --isolated --no-project .venv/bin/python \
 vLLM，每条轨迹保留自己的 UUID seed、prefix 和贪心接受状态。默认 1；多卡仍然
 每卡 TP1、独立输出 shard。`--max-num-batched-tokens` 控制 prefill token budget，
 `--no-enforce-eager` 启用 vLLM 的图执行路径；这两个执行参数不修改解码分布。
+采样 `--resume` 允许调整 `--batch-size`、`--max-num-batched-tokens`、
+`--enforce-eager` 和 `--gpu-memory-utilization`，保留已落盘 UUID，
+并将调整前后的完整配置与已完成记录数追加到 `.jsonl.meta.history.jsonl`。
+模型、数据源、seed、prompt template、解码参数及采样算法配置仍须一致。
+不同批次与 kernel 路径可能产生不同回答，运行阶段记录用于保留这些执行差异。
 
 2026-10-11 在同一批 256 道代表性训练题上的单卡对照，使用上述 checkpoint、
 8 blocks、每块 1 次 suffix proposal、图执行和 0.94 显存预算；耗时包含模型启动：

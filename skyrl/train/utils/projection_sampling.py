@@ -9,6 +9,7 @@ This implements the published greedy mean-logprob approximation, not exact MH.
 import random
 from collections.abc import Mapping
 
+import numpy as np
 from loguru import logger
 
 SEQ_PROMPT = (
@@ -23,7 +24,13 @@ class vLLMAutoregressiveSampler:
     """Use one fixed model for expert-conditioned proposals and question-only scoring."""
 
     def __init__(
-        self, llm, *, model_type="chat", chat_template_kwargs=None, repetition_penalty=1.1, sampling_params=None
+        self,
+        llm,
+        *,
+        model_type="chat",
+        chat_template_kwargs=None,
+        repetition_penalty=1.1,
+        sampling_params=None,
     ):
         self.llm = llm
         self.tokenizer = llm.get_tokenizer()
@@ -66,88 +73,196 @@ def get_logprobs_vLLM(p, question, current):
     """Mean response logprob under the unprivileged, untempered base model."""
     from vllm import SamplingParams
 
-    context = p.format_prompt(question)
-    ids = context + current
-    p.check_context(ids, 1)
-    result = p.llm.generate(
-        {"prompt_token_ids": ids},
+    single = isinstance(question, str)
+    questions = [question] if single else question
+    currents = [current] if single else current
+    contexts = [p.format_prompt(q) for q in questions]
+    prompts = []
+    for context, response in zip(contexts, currents, strict=True):
+        ids = context + response
+        p.check_context(ids, 1)
+        prompts.append({"prompt_token_ids": ids})
+    results = p.llm.generate(
+        prompts[0] if single else prompts,
         SamplingParams(max_tokens=1, temperature=1.0, top_p=1.0, top_k=-1, prompt_logprobs=0),
         use_tqdm=False,
-    )[0]
-    values = [item[token].logprob for token, item in zip(current, result.prompt_logprobs[len(context) :], strict=True)]
-    return sum(values) / len(values)
+    )
+    scores = []
+    for context, response, result in zip(contexts, currents, results, strict=True):
+        values = [
+            item[token].logprob for token, item in zip(response, result.prompt_logprobs[len(context) :], strict=True)
+        ]
+        scores.append(sum(values) / len(values))
+    return scores[0] if single else scores
 
 
 def proposal_vLLM(p, question, solution, current, ext_len, rng):
     from vllm import SamplingParams
 
-    if p.rwkv_separator_id is not None:
-        prompt = f"Expert solution:\n{solution}\nQuestion:\n{question}"
-    else:
-        prompt = SEQ_PROMPT.format(
-            PROBLEM=question,
-            SOLUTION=solution,
-            RESPONSE=p.tokenizer.decode(current, skip_special_tokens=True),
+    single = isinstance(question, str)
+    rows = (
+        [(question, solution, current, ext_len, rng)]
+        if single
+        else zip(question, solution, current, ext_len, rng, strict=True)
+    )
+    prompts, params, currents = [], [], []
+    for q, s, response, length, generator in rows:
+        if p.rwkv_separator_id is not None:
+            prompt = f"Expert solution:\n{s}\nQuestion:\n{q}"
+        else:
+            prompt = SEQ_PROMPT.format(
+                PROBLEM=q,
+                SOLUTION=s,
+                RESPONSE=p.tokenizer.decode(response, skip_special_tokens=True),
+            )
+        ids = p.format_prompt(prompt) + response
+        p.check_context(ids, length)
+        prompts.append({"prompt_token_ids": ids})
+        currents.append(response)
+        params.append(
+            SamplingParams(
+                max_tokens=length,
+                **p.sampling_params,
+                stop_token_ids=p.stop_token_ids,
+                seed=generator.randrange(2**31),
+            )
         )
-    ids = p.format_prompt(prompt) + current
-    p.check_context(ids, ext_len)
-    result = p.llm.generate(
-        {"prompt_token_ids": ids},
-        SamplingParams(
-            max_tokens=ext_len,
-            **p.sampling_params,
-            stop_token_ids=p.stop_token_ids,
-            seed=rng.randrange(2**31),
-        ),
+    results = p.llm.generate(
+        prompts[0] if single else prompts,
+        params[0] if single else params,
         use_tqdm=False,
-    )[0].outputs[0]
-    if not result.token_ids:
-        raise ValueError("Proposal returned no tokens")
-    response_ids = current + list(result.token_ids)
-    finished = result.finish_reason == "stop"
-    if p.rwkv_separator_id is not None and response_ids[-1] == p.rwkv_separator_id:
-        # Match the native generator's EOS append after a turn-ending stop.
-        response_ids.append(p.tokenizer.eos_token_id)
-        finished = True
-    return response_ids, finished
+    )
+    proposals = []
+    for response, result in zip(currents, results, strict=True):
+        output = result.outputs[0]
+        if not output.token_ids:
+            raise ValueError("Proposal returned no tokens")
+        response_ids = response + list(output.token_ids)
+        finished = output.finish_reason == "stop"
+        if p.rwkv_separator_id is not None and response_ids[-1] == p.rwkv_separator_id:
+            # Match the native generator's EOS append after a turn-ending stop.
+            response_ids.append(p.tokenizer.eos_token_id)
+            finished = True
+        proposals.append((response_ids, finished))
+    return proposals[0] if single else proposals
 
 
-def proj_samp_vLLM(p, question, solution, *, mcmc_steps=10, max_new_tokens=1856, block_num=32, seed=0):
+def has_repetition(tokens):
+    """Detect three adjacent copies of a 16–128 token span, using repeated n-gram matching."""
+    ids = np.asarray(tokens)
+    for width in range(16, min(128, len(ids) // 3) + 1):
+        mismatches = np.concatenate(([0], np.cumsum(ids[width:] != ids[:-width])))
+        if np.any(mismatches[2 * width :] == mismatches[: -2 * width]):
+            return True
+    return False
+
+
+def proj_samp_vLLM(
+    p,
+    question,
+    solution,
+    *,
+    mcmc_steps=10,
+    max_new_tokens=1856,
+    block_num=32,
+    seed=0,
+    skip_repetition=False,
+):
     """Extend by blocks, then greedily resample suffixes from any previous position."""
     if max_new_tokens < 1 or block_num < 1 or max_new_tokens % block_num or mcmc_steps < 0:
         raise ValueError("Require positive max_new_tokens/block_num, exact divisibility, and non-negative mcmc_steps")
-    rng = random.Random(seed)
-    gen = []
-    attempts = acceptances = 0
-    finished = False
-    for block in range(block_num):
-        gen, finished = proposal_vLLM(p, question, solution, gen, max_new_tokens // block_num, rng)
-        score = get_logprobs_vLLM(p, question, gen)
-        for _ in range(mcmc_steps):
-            attempts += 1
-            cut = rng.randrange(len(gen))
-            candidate, candidate_finished = proposal_vLLM(p, question, solution, gen[:cut], len(gen) - cut, rng)
-            candidate_score = get_logprobs_vLLM(p, question, candidate)
-            if candidate_score > score:
-                gen, score, finished = candidate, candidate_score, candidate_finished
-                acceptances += 1
-        logger.info(
-            "Sampling block {}/{}: tokens={}, mean_logprob={:.4f}, accepted={}/{}, finished={}",
-            block + 1,
-            block_num,
-            len(gen),
-            score,
-            acceptances,
-            attempts,
-            finished,
+    single = isinstance(question, str)
+    questions = [question] if single else question
+    solutions = [solution] if single else solution
+    seeds = [seed] if single else seed
+    rngs = [random.Random(s) for s in seeds]
+    states = [
+        dict(
+            response_ids=[],
+            target_log_prob_cur=None,
+            finish_reason="length",
+            attempts=0,
+            acceptances=0,
+            rejected_repetitions=0,
         )
-        if finished or p.tokenizer.eos_token_id in gen:
-            finished = True
+        for _ in questions
+    ]
+    active = list(range(len(questions)))
+
+    def propose(indices, prefixes, lengths):
+        args = (
+            [questions[i] for i in indices],
+            [solutions[i] for i in indices],
+            prefixes,
+            lengths,
+            [rngs[i] for i in indices],
+        )
+        if single:
+            return [proposal_vLLM(p, *(a[0] for a in args))]
+        return proposal_vLLM(p, *args)
+
+    def score(indices, responses):
+        if single:
+            return [get_logprobs_vLLM(p, questions[indices[0]], responses[0])]
+        return get_logprobs_vLLM(p, [questions[i] for i in indices], responses)
+
+    for block in range(block_num):
+        proposals = propose(
+            active,
+            [states[i]["response_ids"] for i in active],
+            [max_new_tokens // block_num] * len(active),
+        )
+        finished = {}
+        for i, (gen, ended) in zip(active, proposals, strict=True):
+            states[i]["response_ids"] = gen
+            finished[i] = ended
+            if skip_repetition and has_repetition(gen):
+                states[i]["finish_reason"] = "repetition"
+        active = [i for i in active if states[i]["finish_reason"] != "repetition"]
+        if not active:
             break
-    return {
-        "response_ids": gen,
-        "target_log_prob_cur": score,
-        "finish_reason": "stop" if finished else "length",
-        "attempts": attempts,
-        "acceptances": acceptances,
-    }
+        scores = score(active, [states[i]["response_ids"] for i in active])
+        for i, value in zip(active, scores, strict=True):
+            states[i]["target_log_prob_cur"] = value
+        for _ in range(mcmc_steps):
+            cuts = [rngs[i].randrange(len(states[i]["response_ids"])) for i in active]
+            proposals = propose(
+                active,
+                [states[i]["response_ids"][:cut] for i, cut in zip(active, cuts, strict=True)],
+                [len(states[i]["response_ids"]) - cut for i, cut in zip(active, cuts, strict=True)],
+            )
+            candidates = []
+            for i, (candidate, ended) in zip(active, proposals, strict=True):
+                states[i]["attempts"] += 1
+                if skip_repetition and has_repetition(candidate):
+                    states[i]["rejected_repetitions"] += 1
+                else:
+                    candidates.append((i, candidate, ended))
+            if candidates:
+                values = score([i for i, _, _ in candidates], [gen for _, gen, _ in candidates])
+                for (i, gen, ended), value in zip(candidates, values, strict=True):
+                    if value > states[i]["target_log_prob_cur"]:
+                        states[i]["response_ids"] = gen
+                        states[i]["target_log_prob_cur"] = value
+                        finished[i] = ended
+                        states[i]["acceptances"] += 1
+        for i in active:
+            state = states[i]
+            ended = finished[i] or p.tokenizer.eos_token_id in state["response_ids"]
+            logger.info(
+                "Sampling row {} block {}/{}: tokens={}, mean_logprob={:.4f}, accepted={}/{}, finished={}",
+                i,
+                block + 1,
+                block_num,
+                len(state["response_ids"]),
+                state["target_log_prob_cur"],
+                state["acceptances"],
+                state["attempts"],
+                ended,
+            )
+            if ended:
+                state["finish_reason"] = "stop"
+        active = [i for i in active if states[i]["finish_reason"] == "length"]
+        if not active:
+            break
+    return states[0] if single else states

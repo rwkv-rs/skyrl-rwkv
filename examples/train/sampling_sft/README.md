@@ -83,6 +83,17 @@ uv run --isolated --no-project .venv/bin/python \
 `--num-shards N --shard-index K` 与独立输出文件；训练/验证需保持相同分片和 seed。
 vLLM 使用 8192-token chunked prefill。
 
+`--batch-size N` 将 N 条独立轨迹的 proposal 和 question-only scoring 合批交给
+vLLM，每条轨迹保留自己的 UUID seed、prefix 和贪心接受状态。默认 1；多卡仍然
+每卡 TP1、独立输出 shard。`--max-num-batched-tokens` 控制 prefill token budget，
+`--no-enforce-eager` 启用 vLLM 的图执行路径；这两个执行参数不修改解码分布。
+
+生产数据准备使用 `--skip-repetition`：检测到任意 16–128 tokens 的连续三次重复时，
+立即跳过当前轨迹，记录 `finish_reason=repetition`，`input_ids/loss_mask` 为空。
+复读 suffix 候选直接拒绝，不执行评分，不替换健康轨迹。跳过记录仍写入 JSONL，
+以便统计和 resume；不会追加 EOS 将复读伪装成完整回答。该过滤是显式选项，
+不改变其他任务的默认采样行为。
+
 模型必须是准备训练的具体 checkpoint，不是 DS teacher。RWKV 示例明确使用：
 
 ```bash
@@ -167,9 +178,9 @@ RAY_ADDRESS=local uv run --isolated --no-project --env-file .env .venv/bin/pytho
   remove_microbatch_padding=false sequence_parallel_size=1 \
   rwkv_chunk_size=1024 \
   'model_config_kwargs={wkv_mode: fp32io16}' \
-  num_epochs=2 batch_size=16 micro_train_batch_size_per_gpu=1 \
-  placement.num_nodes=1 placement.num_gpus_per_node=1 \
-  optimizer_config.lr=5e-5 optimizer_config.max_grad_norm=1.0 \
+  num_epochs=1 batch_size=32 micro_train_batch_size_per_gpu=1 \
+  placement.num_nodes=1 placement.num_gpus_per_node=8 \
+  optimizer_config.lr=1e-6 optimizer_config.max_grad_norm=1.0 \
   optimizer_config.scheduler=cosine \
   max_length=null ckpt_path=outputs/sampling_sft/checkpoints \
   ckpt_interval=50 eval_interval=50 hf_save_interval=50 \

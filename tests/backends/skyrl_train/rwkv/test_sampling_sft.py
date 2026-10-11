@@ -224,20 +224,31 @@ def test_vllm_adapter_rwkv_template_context_and_unprivileged_scoring(monkeypatch
         llm_engine=SimpleNamespace(model_config=SimpleNamespace(max_model_len=10000)),
     )
     p = sampling.vLLMAutoregressiveSampler(
-        llm, chat_template_kwargs={"rwkv_prompt_template": "bot", "rwkv_generation_prompt": "open_think"}
+        llm,
+        chat_template_kwargs={"rwkv_prompt_template": "bot", "rwkv_generation_prompt": "open_think"},
+        sampling_params={
+            "temperature": 0.96,
+            "top_p": 0.76,
+            "top_k": 32,
+            "repetition_penalty": 1.0,
+            "presence_penalty": 1.0,
+            "frequency_penalty": 0.1,
+            "penalty_decay": 0.988,
+        },
     )
     assert sampling.get_logprobs_vLLM(p, "question", [3, 4]) == -3
     assert tokenizer.messages == [{"role": "user", "content": "question"}]
     assert tokenizer.kwargs["rwkv_generation_prompt"] == "open_think"
     assert calls[-1][0] == {"prompt_token_ids": [7, 8, 3, 4]}
     assert calls[-1][1]["temperature"] == 1
+    assert calls[-1][1]["top_p"] == 1 and calls[-1][1]["top_k"] == -1
+    assert "presence_penalty" not in calls[-1][1] and "penalty_decay" not in calls[-1][1]
     import random
 
     assert sampling.proposal_vLLM(p, "question", "expert info", [3], 1, random.Random(0)) == ([3, 4], False)
     assert tokenizer.messages == [{"role": "user", "content": "Expert solution:\nexpert info\nQuestion:\nquestion"}]
     assert calls[-1][0] == {"prompt_token_ids": [7, 8, 3]}
-    assert calls[-1][1]["temperature"] == 0.6
-    assert calls[-1][1]["repetition_penalty"] == 1.1
+    assert {key: calls[-1][1][key] for key in p.sampling_params} == p.sampling_params
     assert calls[-1][1]["stop_token_ids"] == [0, 10060]
     p.max_model_len = 2
     with pytest.raises(ValueError, match="Context needs"):
@@ -376,7 +387,17 @@ def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, mon
     options = []
     preflights = []
     shutdowns = []
+    proposals = []
     tokenizer = Tokenizer()
+    generation_config = transformers.GenerationConfig(
+        do_sample=True,
+        temperature=0.96,
+        top_p=0.76,
+        top_k=32,
+        presence_penalty=1.0,
+        frequency_penalty=0.1,
+        penalty_decay=0.988,
+    )
 
     def llm(**kwargs):
         options.append(kwargs)
@@ -391,21 +412,23 @@ def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, mon
     monkeypatch.setattr(
         transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: SimpleNamespace(model_type="rwkv")
     )
+    monkeypatch.setattr(transformers.GenerationConfig, "from_pretrained", lambda *args, **kwargs: generation_config)
     monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=llm))
     monkeypatch.setitem(
         sys.modules, "examples.train.rwkv.prepare_flashrwkv2", SimpleNamespace(check=lambda: preflights.append(True))
     )
-    monkeypatch.setattr(
-        boost,
-        "proj_samp_vLLM",
-        lambda *args, **kwargs: {
+
+    def sample(p, *args, **kwargs):
+        proposals.append(p.sampling_params)
+        return {
             "response_ids": [3, 0],
             "finish_reason": "stop",
             "target_log_prob_cur": -1.0,
             "attempts": 10,
             "acceptances": 3,
-        },
-    )
+        }
+
+    monkeypatch.setattr(boost, "proj_samp_vLLM", sample)
     argv = ["--input", str(source), "--output", str(output), "--model", "rwkv7-test", "--partition", "all"]
     boost.run(boost.parse_args(argv))
     boost.run(boost.parse_args(argv + ["--resume"]))
@@ -417,10 +440,27 @@ def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, mon
     assert options[0]["mamba_ssm_cache_dtype"] == "float32"
     assert options[0]["logprobs_mode"] == "raw_logprobs"
     assert options[0]["generation_config"] == "vllm"
-    assert json.loads(output.with_suffix(".jsonl.meta.json").read_text())["repetition_penalty"] == 1.0
+    metadata = json.loads(output.with_suffix(".jsonl.meta.json").read_text())
+    assert metadata["repetition_penalty"] == 1.0
+    assert (
+        metadata["sampling_params"]
+        == proposals[0]
+        == {
+            "temperature": 0.96,
+            "top_p": 0.76,
+            "top_k": 32,
+            "repetition_penalty": 1.0,
+            "presence_penalty": 1.0,
+            "frequency_penalty": 0.1,
+            "penalty_decay": 0.988,
+        }
+    )
     assert tokenizer.kwargs["rwkv_prompt_template"] == "bot"
     with pytest.raises(ValueError, match="configuration differs"):
         boost.run(boost.parse_args(argv + ["--resume", "--seed", "1"]))
+    generation_config.top_p = 0.8
+    with pytest.raises(ValueError, match="configuration differs"):
+        boost.run(boost.parse_args(argv + ["--resume"]))
     assert len(options) == 2  # Metadata mismatch fails before loading another GPU model.
 
 

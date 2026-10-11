@@ -112,8 +112,10 @@ validation 仅用于 SFT held-out loss，不是新任务 reward / accuracy 评�
 
 - `--max-new-tokens 1856 --block-num 32 --mcmc-steps 10`；实际每块58 tokens。
 - `--mcmc-steps 0` 是逐块续写的无搜索 rewrite 对照。
-- Proposal：temperature0.6、top-p1、top-k-1；RWKV 使用 repetition penalty1.0，其他模型默认1.1。
-  当前 RWKV Rapid-Sampling 后端不支持 multiplicative repetition penalty；禁用该 penalty，保留 suffix 搜索与原始评分。
+- RWKV Proposal 从 checkpoint 的 `generation_config.json` 读取 temperature、top-p、top-k、
+  presence penalty、frequency penalty 和 penalty decay。`rwkv7-g1k-1.5b-20260930-ctx25600`
+  的默认值为 0.96、0.76、32、1.0、0.1、0.988；multiplicative repetition penalty 为 1.0。
+  其他模型的 Proposal 保持 temperature0.6、top-p1、top-k-1、repetition penalty1.1。
   Scoring：只有原题、temperature1、无截断采样限制，读取 raw prompt logprobs。
 - `--max-model-len 32768` 包含专家提示、prefix 与 suffix；输入不截断，超预算报错。
   专家 reasoning 很长时需要明确增大预算。采样算力与序列长度近似平方增长。
@@ -128,7 +130,7 @@ validation 仅用于 SFT held-out loss，不是新任务 reward / accuracy 评�
   完整专家推理与答案使用单个换行符拼接，原题后直接结束 User 消息；已有回答只出现在 Bot 前缀中。
   Proposal 保留专家条件，评分和最终 SFT 则使用只有原题的上下文。
   生成 `✿`（token ID 10060）时结束 Bot 回答，并追加 EOS（token ID 0）；模型直接生成 EOS 也会停止。
-  separator 与 EOS 保留在 `response_ids` 和训练 loss mask 中。RWKV 输出 metadata 版本为 3，
+  separator 与 EOS 保留在 `response_ids` 和训练 loss mask 中。RWKV 输出 metadata 版本为 4，
   旧版拼接产生的记录应使用独立输出路径保留。
 
 恢复加 `--resume`，不重新生成已完成 UUID。切点 RNG 与 vLLM proposal seed 按 UUID 固定，

@@ -148,12 +148,34 @@ def proposal_vLLM(p, question, solution, current, ext_len, rng):
 
 
 def has_repetition(tokens):
-    """Detect three adjacent copies of a span of at least 16 tokens using repeated n-gram matching."""
-    ids = np.asarray(tokens)
-    for width in range(16, len(ids) // 3 + 1):
-        mismatches = np.concatenate(([0], np.cumsum(ids[width:] != ids[:-width])))
-        if np.any(mismatches[2 * width :] == mismatches[: -2 * width]):
-            return True
+    """Find matching 16-grams, then verify three adjacent full spans exactly."""
+    ids = np.asarray(tokens, dtype=np.uint64)
+    if len(ids) < 48:
+        return False
+    weights = np.array([pow(1000003, i, 1 << 64) for i in range(16)], dtype=np.uint64)
+    hashes = np.lib.stride_tricks.sliding_window_view(ids, 16) @ weights
+    order = np.argsort(hashes, kind="stable")
+    boundaries = np.flatnonzero(np.r_[True, hashes[order][1:] != hashes[order][:-1], True])
+    repeated = np.diff(boundaries) >= 3
+    for left, right in zip(boundaries[:-1][repeated], boundaries[1:][repeated], strict=True):
+        positions = order[left:right]
+        present = set(positions)
+        for index, start in enumerate(positions):
+            limit = (len(ids) - int(start)) // 3
+            for middle in positions[index + 1 :]:
+                width = int(middle) - int(start)
+                if width < 16:
+                    continue
+                if width > limit:
+                    break
+                if start + 2 * width not in present:
+                    continue
+                # Hashes only select candidates; collisions cannot decide the result.
+                span = ids[start : start + width]
+                if np.array_equal(span, ids[start + width : start + 2 * width]) and np.array_equal(
+                    span, ids[start + 2 * width : start + 3 * width]
+                ):
+                    return True
     return False
 
 

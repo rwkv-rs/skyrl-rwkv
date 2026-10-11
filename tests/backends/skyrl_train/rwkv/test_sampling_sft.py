@@ -408,6 +408,30 @@ def test_repetition_requires_three_adjacent_token_spans():
     assert not sampling.has_repetition(span + list(range(32, 64)) + span)
 
 
+def test_repetition_matches_exhaustive_search_with_offsets_and_partial_copies():
+    import random
+
+    rng = random.Random(7)
+
+    def exhaustive(tokens):
+        return any(
+            tokens[start : start + width]
+            == tokens[start + width : start + 2 * width]
+            == tokens[start + 2 * width : start + 3 * width]
+            for width in range(16, len(tokens) // 3 + 1)
+            for start in range(len(tokens) - 3 * width + 1)
+        )
+
+    for _ in range(160):
+        span = [rng.randrange(65536) for _ in range(rng.randrange(1, 50))]
+        prefix = [rng.randrange(65536) for _ in range(rng.randrange(30))]
+        suffix = [rng.randrange(65536) for _ in range(rng.randrange(30))]
+        tokens = prefix + span * rng.randrange(1, 5) + suffix
+        if tokens and rng.randrange(2):
+            tokens[rng.randrange(len(tokens))] = rng.randrange(65536)
+        assert sampling.has_repetition(tokens) == exhaustive(tokens)
+
+
 def test_repetition_detects_long_paragraphs_before_the_final_answer():
     span = list(range(256))
     assert sampling.has_repetition([999] + span * 3 + [10060, 0])

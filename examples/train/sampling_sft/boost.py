@@ -259,7 +259,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--skip-repetition",
         action="store_true",
-        help="Discard trajectories with three adjacent copies of a 16–128 token span",
+        help="Discard trajectories with three adjacent copies of any span of at least 16 tokens",
     )
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
     parser.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True)

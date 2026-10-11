@@ -23,36 +23,48 @@ from skyrl.train.utils.projection_sampling import (
 
 
 def boost_record(p, row, args):
-    if not isinstance(row.get("solution"), str) or not row["solution"].strip():
-        raise ValueError(f"Missing expert solution for {row['uuid']}")
-    seed = int.from_bytes(hashlib.sha256(f"{args.seed}:{row['uuid']}".encode()).digest()[:4], "big")
+    single = isinstance(row, dict)
+    rows = [row] if single else row
+    for item in rows:
+        if not isinstance(item.get("solution"), str) or not item["solution"].strip():
+            raise ValueError(f"Missing expert solution for {item['uuid']}")
+    seeds = [
+        int.from_bytes(hashlib.sha256(f"{args.seed}:{item['uuid']}".encode()).digest()[:4], "big") for item in rows
+    ]
     start = time.monotonic()
     result = proj_samp_vLLM(
         p,
-        row["prompt"],
-        row["solution"],
+        rows[0]["prompt"] if single else [item["prompt"] for item in rows],
+        rows[0]["solution"] if single else [item["solution"] for item in rows],
         mcmc_steps=args.mcmc_steps,
         max_new_tokens=args.max_new_tokens,
         block_num=args.block_num,
-        seed=seed,
+        seed=seeds[0] if single else seeds,
+        skip_repetition=args.skip_repetition,
     )
-    prompt_ids = p.format_prompt(row["prompt"])
-    response_ids = result["response_ids"]
-    complete = result["finish_reason"] == "stop"
-    return {
-        "uuid": row["uuid"],
-        "domain": row.get("domain", ""),
-        "prompt": row["prompt"],
-        "solution": row["solution"],
-        "ground_truth": row.get("ground_truth"),
-        "question_id": row.get("question_id", row["uuid"]),
-        "gen": p.tokenizer.decode(response_ids, skip_special_tokens=True),
-        # Keep truncated records for audit/resume, but make them non-trainable.
-        "input_ids": prompt_ids + response_ids if complete else [],
-        "loss_mask": [0] * len(prompt_ids) + [1] * len(response_ids) if complete else [],
-        **result,
-        "runtime_sec": time.monotonic() - start,
-    }
+    records = []
+    for row, result in zip(rows, [result] if single else result, strict=True):
+        prompt_ids = p.format_prompt(row["prompt"])
+        response_ids = result["response_ids"]
+        complete = result["finish_reason"] == "stop"
+        records.append(
+            {
+                "uuid": row["uuid"],
+                "domain": row.get("domain", ""),
+                "prompt": row["prompt"],
+                "solution": row["solution"],
+                "ground_truth": row.get("ground_truth"),
+                "question_id": row.get("question_id", row["uuid"]),
+                "gen": p.tokenizer.decode(response_ids, skip_special_tokens=True),
+                # Keep truncated records for audit/resume, but make them non-trainable.
+                "input_ids": prompt_ids + response_ids if complete else [],
+                "loss_mask": [0] * len(prompt_ids) + [1] * len(response_ids) if complete else [],
+                **result,
+                "runtime_sec": time.monotonic() - start,
+                "sampling_batch_size": len(rows),
+            }
+        )
+    return records[0] if single else records
 
 
 def run(args):
@@ -75,7 +87,14 @@ def run(args):
         sampling_params.update(
             {
                 key: generation_config[key]
-                for key in ("temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "penalty_decay")
+                for key in (
+                    "temperature",
+                    "top_p",
+                    "top_k",
+                    "presence_penalty",
+                    "frequency_penalty",
+                    "penalty_decay",
+                )
             }
         )
         cache = Path.home() / ".cache/skyrl-rwkv"
@@ -105,6 +124,10 @@ def run(args):
         "subset": args.subset,
         "num_shards": args.num_shards,
         "shard_index": args.shard_index,
+        "batch_size": args.batch_size,
+        "skip_repetition": args.skip_repetition,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "enforce_eager": args.enforce_eager,
     }
     if is_rwkv:
         config["sampling_params"] = sampling_params
@@ -130,8 +153,9 @@ def run(args):
             gpu_memory_utilization=args.gpu_memory_utilization,
             enable_prefix_caching=True,
             enable_chunked_prefill=True,
-            max_num_batched_tokens=8192,
-            enforce_eager=True,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_num_seqs=max(32, args.batch_size),
+            enforce_eager=args.enforce_eager,
             seed=args.seed,
         )
         try:
@@ -142,12 +166,30 @@ def run(args):
                 repetition_penalty=args.repetition_penalty,
                 sampling_params=sampling_params,
             )
-            selected = written = truncated = 0
+            selected = written = truncated = repetitions = 0
+            pending = []
+
+            def write_batch(rows):
+                nonlocal written, truncated, repetitions
+                result = boost_record(p, rows[0] if args.batch_size == 1 else rows, args)
+                for record in [result] if args.batch_size == 1 else result:
+                    append_jsonl(handle, record)
+                    completed.add(record["uuid"])
+                    written += 1
+                    truncated += record["finish_reason"] == "length"
+                    repetitions += record["finish_reason"] == "repetition"
+                    print(
+                        f"written={written} truncated={truncated} repetitions={repetitions} uuid={record['uuid']}",
+                        flush=True,
+                    )
+
             for index, row in enumerate(expert_rows(args.input, subset=args.subset)):
                 if index % args.num_shards != args.shard_index:
                     continue
                 validation = validation_question(
-                    row.get("question_id", row["uuid"]), args.seed, args.validation_fraction
+                    row.get("question_id", row["uuid"]),
+                    args.seed,
+                    args.validation_fraction,
                 )
                 if args.partition != "all" and validation != (args.partition == "validation"):
                     continue
@@ -156,34 +198,70 @@ def run(args):
                 selected += 1
                 if row["uuid"] in completed:
                     continue
-                record = boost_record(p, row, args)
-                append_jsonl(handle, record)
-                completed.add(row["uuid"])
-                written += 1
-                truncated += record["finish_reason"] != "stop"
-                print(f"written={written} truncated={truncated} uuid={row['uuid']}", flush=True)
+                pending.append(row)
+                if len(pending) == args.batch_size:
+                    write_batch(pending)
+                    pending = []
+            if pending:
+                write_batch(pending)
         finally:
             llm.llm_engine.engine_core.shutdown()
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", required=True, help="Expert JSONL file or directory (uuid/prompt/solution)")
+    parser.add_argument(
+        "--input",
+        required=True,
+        help="Expert JSONL file or directory (uuid/prompt/solution)",
+    )
     parser.add_argument("--output", required=True, help="Exact-token JSONL for native pretokenized SFT")
-    parser.add_argument("--model", required=True, help="Exact learner checkpoint path or Hugging Face model ID")
+    parser.add_argument(
+        "--model",
+        required=True,
+        help="Exact learner checkpoint path or Hugging Face model ID",
+    )
     parser.add_argument("--revision", help="Hugging Face model revision")
     parser.add_argument("--model-type", choices=["base", "chat"], default="chat")
-    parser.add_argument("--rwkv-prompt-template", choices=["bot", "assistant", "function_calling"], default="bot")
-    parser.add_argument("--rwkv-generation-prompt", choices=["open_think", "fake_think"], default="open_think")
+    parser.add_argument(
+        "--rwkv-prompt-template",
+        choices=["bot", "assistant", "function_calling"],
+        default="bot",
+    )
+    parser.add_argument(
+        "--rwkv-generation-prompt",
+        choices=["open_think", "fake_think"],
+        default="open_think",
+    )
     parser.add_argument("--max-new-tokens", type=int, default=1856)
     parser.add_argument("--block-num", type=int, default=32, help="Block count, not tokens per block")
     parser.add_argument(
-        "--mcmc-steps", type=int, default=10, help="Greedy proposals per block; 0 gives the rewrite baseline"
+        "--mcmc-steps",
+        type=int,
+        default=10,
+        help="Greedy proposals per block; 0 gives the rewrite baseline",
     )
-    parser.add_argument("--repetition-penalty", type=float, help="Default: 1.0 for RWKV Rapid-Sampling, otherwise 1.1")
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        help="Default: 1.0 for RWKV Rapid-Sampling, otherwise 1.1",
+    )
     parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Independent trajectories per vLLM proposal/scoring batch",
+    )
+    parser.add_argument(
+        "--skip-repetition",
+        action="store_true",
+        help="Discard trajectories with three adjacent copies of a 16–128 token span",
+    )
+    parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    parser.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--partition", choices=["all", "train", "validation"], default="train")
     parser.add_argument("--subset", help="Source subset, e.g. cot for Nemotron-SFT-Math-v4")
     parser.add_argument("--num-shards", type=int, default=1)
@@ -203,6 +281,8 @@ def parse_args(argv=None):
         parser.error("Require repetition-penalty > 0")
     if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:
         parser.error("Require num-shards >= 1 and 0 <= shard-index < num-shards")
+    if args.batch_size < 1 or args.max_num_batched_tokens < 1:
+        parser.error("Require batch-size and max-num-batched-tokens >= 1")
     return args
 
 

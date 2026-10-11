@@ -190,7 +190,9 @@ def test_api_concurrency_resume_and_secrets_not_persisted(tmp_path, monkeypatch)
 class Tokenizer:
     eos_token_id = 0
 
-    def encode(self, text):
+    def encode(self, text, **kwargs):
+        if text == "✿":
+            return [10060]
         return list(text.encode())
 
     def apply_chat_template(self, messages, **kwargs):
@@ -232,13 +234,44 @@ def test_vllm_adapter_rwkv_template_context_and_unprivileged_scoring(monkeypatch
     import random
 
     assert sampling.proposal_vLLM(p, "question", "expert info", [3], 1, random.Random(0)) == ([3, 4], False)
-    assert "expert info" in tokenizer.messages[0]["content"]
+    assert tokenizer.messages == [{"role": "user", "content": "question"}]
     assert calls[-1][0]["prompt_token_ids"][-1] == 3
     assert calls[-1][1]["temperature"] == 0.6
     assert calls[-1][1]["repetition_penalty"] == 1.1
+    assert calls[-1][1]["stop_token_ids"] == [0, 10060]
     p.max_model_len = 2
     with pytest.raises(ValueError, match="Context needs"):
         sampling.get_logprobs_vLLM(p, "question", [3])
+
+
+@pytest.mark.parametrize("rwkv_bot", [True, False])
+@pytest.mark.parametrize("end_token", [10060, 0, 4])
+def test_proposal_turn_separator_preserved_and_eos_appended(monkeypatch, rwkv_bot, end_token):
+    import random
+
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(SamplingParams=lambda **kwargs: kwargs))
+    tokenizer = Tokenizer()
+    llm = SimpleNamespace(
+        get_tokenizer=lambda: tokenizer,
+        generate=lambda *args, **kwargs: [
+            SimpleNamespace(
+                outputs=[SimpleNamespace(token_ids=[end_token], finish_reason="stop" if end_token == 0 else "length")]
+            )
+        ],
+        llm_engine=SimpleNamespace(model_config=SimpleNamespace(max_model_len=10000)),
+    )
+    p = sampling.vLLMAutoregressiveSampler(
+        llm, chat_template_kwargs={"rwkv_prompt_template": "bot"} if rwkv_bot else {}
+    )
+    ids, finished = sampling.proposal_vLLM(p, "question", "expert info", [3], 1, random.Random(0))
+    assert ids == ([3, 10060, 0] if rwkv_bot and end_token == 10060 else [3, end_token])
+    assert finished == (end_token == 0 or (rwkv_bot and end_token == 10060))
+    assert p.stop_token_ids == ([0, 10060] if rwkv_bot else [0])
+    if rwkv_bot:
+        assert tokenizer.messages == [{"role": "user", "content": "question"}]
+    else:
+        assert "expert info" in tokenizer.messages[0]["content"]
+        assert "Partial response:" in tokenizer.messages[0]["content"]
 
 
 def test_sampler_greedy_acceptance_and_old_block_rewrites(monkeypatch):

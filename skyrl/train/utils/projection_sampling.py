@@ -20,7 +20,7 @@ SEQ_PROMPT = (
 
 
 class vLLMAutoregressiveSampler:
-    """Use one fixed model for expert-conditioned proposals and question-only scoring."""
+    """Use one fixed model for proposals and question-only scoring."""
 
     def __init__(self, llm, *, model_type="chat", chat_template_kwargs=None, repetition_penalty=1.1):
         self.llm = llm
@@ -29,6 +29,11 @@ class vLLMAutoregressiveSampler:
         self.chat_template_kwargs = chat_template_kwargs or {}
         self.repetition_penalty = repetition_penalty
         self.max_model_len = llm.llm_engine.model_config.max_model_len
+        self.stop_token_ids = [self.tokenizer.eos_token_id]
+        self.rwkv_separator_id = None
+        if self.model_type == "chat" and self.chat_template_kwargs.get("rwkv_prompt_template") == "bot":
+            self.rwkv_separator_id = self.tokenizer.encode("✿", add_special_tokens=False)[0]
+            self.stop_token_ids.append(self.rwkv_separator_id)
 
     def format_prompt(self, text):
         if self.model_type == "base":
@@ -68,11 +73,14 @@ def get_logprobs_vLLM(p, question, current):
 def proposal_vLLM(p, question, solution, current, ext_len, rng):
     from vllm import SamplingParams
 
-    prompt = SEQ_PROMPT.format(
-        PROBLEM=question,
-        SOLUTION=solution,
-        RESPONSE=p.tokenizer.decode(current, skip_special_tokens=True),
-    )
+    if p.rwkv_separator_id is not None:
+        prompt = question
+    else:
+        prompt = SEQ_PROMPT.format(
+            PROBLEM=question,
+            SOLUTION=solution,
+            RESPONSE=p.tokenizer.decode(current, skip_special_tokens=True),
+        )
     ids = p.format_prompt(prompt) + current
     p.check_context(ids, ext_len)
     result = p.llm.generate(
@@ -83,14 +91,20 @@ def proposal_vLLM(p, question, solution, current, ext_len, rng):
             top_p=1.0,
             top_k=-1,
             repetition_penalty=p.repetition_penalty,
-            stop_token_ids=[p.tokenizer.eos_token_id],
+            stop_token_ids=p.stop_token_ids,
             seed=rng.randrange(2**31),
         ),
         use_tqdm=False,
     )[0].outputs[0]
     if not result.token_ids:
         raise ValueError("Proposal returned no tokens")
-    return current + list(result.token_ids), result.finish_reason == "stop"
+    response_ids = current + list(result.token_ids)
+    finished = result.finish_reason == "stop"
+    if p.rwkv_separator_id is not None and response_ids[-1] == p.rwkv_separator_id:
+        # Match the native generator's EOS append after a turn-ending stop.
+        response_ids.append(p.tokenizer.eos_token_id)
+        finished = True
+    return response_ids, finished
 
 
 def proj_samp_vLLM(p, question, solution, *, mcmc_steps=10, max_new_tokens=1856, block_num=32, seed=0):

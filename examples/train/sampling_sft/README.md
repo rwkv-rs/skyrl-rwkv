@@ -122,6 +122,13 @@ validation 仅用于 SFT held-out loss，不是新任务 reward / accuracy 评�
 - 默认 `bot/open_think`；通过 `--rwkv-prompt-template {bot,assistant,function_calling}` 和
   `--rwkv-generation-prompt {open_think,fake_think}` 明确选择模板。其他模型不传 RWKV 模板参数；
   非 chat 模型可以指定 `--model-type base`。HF model 可用 `--revision` 固定版本。
+- RWKV `bot` proposal 使用原题的 chat template，再追加一次已有 response IDs：
+  `User✿{question}✿\nBot✿<think{response_prefix}`。原题后直接结束 User 消息，
+  专家解答与 `Partial response` 不进入这个上下文。完整专家推理仍保存在输出的 `solution` 中；
+  此路径做 question-only greedy suffix search，不再做专家条件重写。
+  生成 `✿`（token ID 10060）时结束 Bot 回答，并追加 EOS（token ID 0）；模型直接生成 EOS 也会停止。
+  separator 与 EOS 保留在 `response_ids` 和训练 loss mask 中。RWKV 输出 metadata 版本为 2，
+  旧版拼接产生的记录应使用独立输出路径保留。
 
 恢复加 `--resume`，不重新生成已完成 UUID。切点 RNG 与 vLLM proposal seed 按 UUID 固定，
 与输入顺序/已完成题数无关；这不保证跨 GPU/kernel/vLLM 版本 bitwise identical。

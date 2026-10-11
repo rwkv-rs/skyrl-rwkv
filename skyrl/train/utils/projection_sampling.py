@@ -20,7 +20,7 @@ SEQ_PROMPT = (
 
 
 class vLLMAutoregressiveSampler:
-    """Use one fixed model for proposals and question-only scoring."""
+    """Use one fixed model for expert-conditioned proposals and question-only scoring."""
 
     def __init__(self, llm, *, model_type="chat", chat_template_kwargs=None, repetition_penalty=1.1):
         self.llm = llm
@@ -74,7 +74,7 @@ def proposal_vLLM(p, question, solution, current, ext_len, rng):
     from vllm import SamplingParams
 
     if p.rwkv_separator_id is not None:
-        prompt = question
+        prompt = f"Expert solution:\n{solution}\nQuestion:\n{question}"
     else:
         prompt = SEQ_PROMPT.format(
             PROBLEM=question,

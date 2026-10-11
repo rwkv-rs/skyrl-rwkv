@@ -408,6 +408,15 @@ def test_repetition_requires_three_adjacent_token_spans():
     assert not sampling.has_repetition(span + list(range(32, 64)) + span)
 
 
+def test_repetition_detects_long_paragraphs_before_the_final_answer():
+    span = list(range(256))
+    assert sampling.has_repetition([999] + span * 3 + [10060, 0])
+    assert not sampling.has_repetition(span * 2 + [10060, 0])
+    changed = span.copy()
+    changed[128] = 999
+    assert not sampling.has_repetition(span + changed + span)
+
+
 def test_repetitive_trajectory_is_skipped_before_scoring(monkeypatch):
     p = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=0))
     monkeypatch.setattr(sampling, "proposal_vLLM", lambda *args: (list(range(16)) * 3, False))

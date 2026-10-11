@@ -150,7 +150,7 @@ def proposal_vLLM(p, question, solution, current, ext_len, rng):
 def has_repetition(tokens):
     """Detect three adjacent copies of a 16–128 token span, using repeated n-gram matching."""
     ids = np.asarray(tokens)
-    for width in range(16, min(128, len(ids) // 3) + 1):
+    for width in range(16, len(ids) // 3 + 1):
         mismatches = np.concatenate(([0], np.cumsum(ids[width:] != ids[:-width])))
         if np.any(mismatches[2 * width :] == mismatches[: -2 * width]):
             return True

@@ -60,6 +60,8 @@ def run(args):
 
     model_config = AutoConfig.from_pretrained(args.model, revision=args.revision, trust_remote_code=True)
     is_rwkv = model_config.model_type == "rwkv"
+    if args.repetition_penalty is None:
+        args.repetition_penalty = 1.0 if is_rwkv else 1.1
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     template = {}
     if is_rwkv:
@@ -157,7 +159,7 @@ def parse_args(argv=None):
     parser.add_argument(
         "--mcmc-steps", type=int, default=10, help="Greedy proposals per block; 0 gives the rewrite baseline"
     )
-    parser.add_argument("--repetition-penalty", type=float, default=1.1)
+    parser.add_argument("--repetition-penalty", type=float, help="Default: 1.0 for RWKV Rapid-Sampling, otherwise 1.1")
     parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.8)
@@ -176,7 +178,7 @@ def parse_args(argv=None):
         parser.error("Require 0 < validation-fraction < 1, limit >= 0 and seed >= 0")
     if args.max_model_len < 2 or args.tensor_parallel_size < 1 or not 0 < args.gpu_memory_utilization <= 1:
         parser.error("Require max-model-len >= 2, tensor-parallel-size >= 1 and 0 < gpu-memory-utilization <= 1")
-    if args.repetition_penalty <= 0:
+    if args.repetition_penalty is not None and args.repetition_penalty <= 0:
         parser.error("Require repetition-penalty > 0")
     if args.num_shards < 1 or not 0 <= args.shard_index < args.num_shards:
         parser.error("Require num-shards >= 1 and 0 <= shard-index < num-shards")

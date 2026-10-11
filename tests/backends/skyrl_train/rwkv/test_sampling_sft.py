@@ -377,6 +377,7 @@ def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, mon
     assert options[0]["mamba_ssm_cache_dtype"] == "float32"
     assert options[0]["logprobs_mode"] == "raw_logprobs"
     assert options[0]["generation_config"] == "vllm"
+    assert json.loads(output.with_suffix(".jsonl.meta.json").read_text())["repetition_penalty"] == 1.0
     assert tokenizer.kwargs["rwkv_prompt_template"] == "bot"
     with pytest.raises(ValueError, match="configuration differs"):
         boost.run(boost.parse_args(argv + ["--resume", "--seed", "1"]))

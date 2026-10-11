@@ -65,14 +65,17 @@ uv run --isolated --no-project --env-file .env .venv/bin/python \
 
 ## 2. 用目标 learner 做 projection-inspired sampling
 
-Nemotron-SFT-Math-v4 已包含专家轨迹，可以直接输入 Parquet 目录：
+Nemotron-SFT-Math-v4 已包含专家轨迹，可以直接输入 Parquet 目录。
+以下执行参数来自 PRO6000 的批量采样对照：
 
 ```bash
 uv run --isolated --no-project .venv/bin/python \
   -m examples.train.sampling_sft.boost \
   --input "$HOME/Datasets/Nemotron-SFT-Math-v4" --subset cot \
   --model "$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600" \
-  --max-model-len 1048576 --max-new-tokens 8192 --block-num 32 \
+  --max-model-len 1048576 --max-new-tokens 8192 --block-num 8 --mcmc-steps 1 \
+  --batch-size 256 --gpu-memory-utilization 0.94 --skip-repetition \
+  --max-num-batched-tokens 16384 --no-enforce-eager \
   --output outputs/sampling_sft/nemotron_train.jsonl \
   > /tmp/results_sampling_nemotron.log 2>&1
 ```
@@ -81,12 +84,31 @@ uv run --isolated --no-project .venv/bin/python \
 标注的训练上下文筛选或截断。保留原始 user message 的数学输出要求。同题的不同
 轨迹按 `problem` 哈希进入同一 held-out partition。多卡采样使用每卡 TP1，分别指定
 `--num-shards N --shard-index K` 与独立输出文件；训练/验证需保持相同分片和 seed。
-vLLM 使用 8192-token chunked prefill。
+此示例使用 16384-token chunked prefill。
+
+`rwkv-sha-pro6000x8` 的本地 snapshot 为
+`84d42ad0cb960f07f951b9baa9ed2b46a5a18c66`，包含 545,431 条轨迹、95,170 道不同原题。
+其中 CoT 有 285,516 条轨迹、89,406 道原题；该训练配方消费完整 CoT 分区。
+以 seed 0、validation fraction 0.05 按原题划分后，训练源为 271,385 条轨迹、
+84,990 道原题，验证源为 14,131 条轨迹、4,416 道原题。验收或调参命令中的
+`--limit` 只控制实验规模，生产命令省略该参数。
 
 `--batch-size N` 将 N 条独立轨迹的 proposal 和 question-only scoring 合批交给
 vLLM，每条轨迹保留自己的 UUID seed、prefix 和贪心接受状态。默认 1；多卡仍然
 每卡 TP1、独立输出 shard。`--max-num-batched-tokens` 控制 prefill token budget，
 `--no-enforce-eager` 启用 vLLM 的图执行路径；这两个执行参数不修改解码分布。
+
+2026-10-11 在同一批 256 道代表性训练题上的单卡对照，使用上述 checkpoint、
+8 blocks、每块 1 次 suffix proposal、图执行和 0.94 显存预算；耗时包含模型启动：
+
+| batch size | 耗时（秒） | 正常结束 | 正常结束 / 小时 | GPU 利用率中位数 | 显存峰值（GiB） |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 64 | 1400.55 | 107 | 275.03 | 85% | 88.15 |
+| 128 | 969.40 | 99 | 367.65 | 85% | 88.46 |
+| 256 | 749.19 | 104 | 499.74 | 88% | 88.84 |
+
+三组均正常退出；这里的正常结束只表示生成了终止 token，正确性与格式另行审计。
+批量和 kernel 执行方式可能产生不同回答，比较使用有效回答产出速度。
 
 生产数据准备使用 `--skip-repetition`：检测到任意至少 16 tokens 的片段连续三次重复时，
 立即跳过当前轨迹，记录 `finish_reason=repetition`，`input_ids/loss_mask` 为空。
@@ -114,7 +136,8 @@ uv run --isolated --no-project .venv/bin/python \
   > /tmp/results_sampling_validation.log 2>&1
 ```
 
-默认按 `SHA256(seed:uuid)` 保留 5% questions 作为 validation；两次调用的 seed 和
+默认按 `SHA256(seed:question_id)` 保留 5% questions 作为 validation；缺少 question ID
+的通用输入使用 UUID。两次调用的 seed 和
 `--validation-fraction` 必须相同。很小的 smoke set 可能没有 validation question；正式训练
 前确认两个 partition 均包含完整样本。`--partition all` 可输出全部数据用于单次链路验收。
 validation 仅用于 SFT held-out loss，不是新任务 reward / accuracy 评测。
@@ -129,7 +152,7 @@ validation 仅用于 SFT held-out loss，不是新任务 reward / accuracy 评�
   其他模型的 Proposal 保持 temperature0.6、top-p1、top-k-1、repetition penalty1.1。
   Scoring：只有原题、temperature1、无截断采样限制，读取 raw prompt logprobs。
 - `--max-model-len 32768` 包含专家提示、prefix 与 suffix；输入不截断，超预算报错。
-  专家 reasoning 很长时需要明确增大预算。采样算力与序列长度近似平方增长。
+  专家 reasoning 很长时需要明确增大预算，并实测完整专家提示与 suffix 搜索的吞吐。
 - RWKV 使用 `wkv_mode=fp32io16`、FP16 inference weights、FP32 recurrent state、TP1、prefix caching；
   在加载前复用既有 FlashRWKV2 cache preflight。
 - 默认 `bot/open_think`；通过 `--rwkv-prompt-template {bot,assistant,function_calling}` 和
@@ -141,8 +164,7 @@ validation 仅用于 SFT held-out loss，不是新任务 reward / accuracy 评�
   完整专家推理与答案使用单个换行符拼接，原题后直接结束 User 消息；已有回答只出现在 Bot 前缀中。
   Proposal 保留专家条件，评分和最终 SFT 则使用只有原题的上下文。
   生成 `✿`（token ID 10060）时结束 Bot 回答，并追加 EOS（token ID 0）；模型直接生成 EOS 也会停止。
-  separator 与 EOS 保留在 `response_ids` 和训练 loss mask 中。RWKV 输出 metadata 版本为 5，
-  旧版拼接产生的记录应使用独立输出路径保留。
+  separator 与 EOS 保留在 `response_ids` 和训练 loss mask 中。RWKV 输出 metadata 版本为 5。
 
 恢复加 `--resume`，不重新生成已完成 UUID。切点 RNG 与 vLLM proposal seed 按 UUID 固定，
 与输入顺序/已完成题数无关；这不保证跨 GPU/kernel/vLLM 版本 bitwise identical。
@@ -163,6 +185,14 @@ mask 只监督 response，包含生成的 EOS。限长而未完成的记录保�
 等于正确答案。正式训练前应按任务的原生 verifier 审查专家与 boosted 数据的正确率和中间事实。
 不记录历史 proposal logprobs 冒充最终 sampler density，也不导入 teacher-logit trace 分支。
 
+此次 Nemotron 生产配置在采样审计 JSONL 之外，另外生成训练和验证 Parquet。
+使用现有 `skyrl_gym.envs.gsm8k.utils.compute_strict_score` 对完整回答的最终 boxed 答案
+与 `expected_answer` 做数学等价校验；仅保留 `strict_reward=1` 的记录，导出原始
+`uuid/question_id/input_ids/loss_mask`，不重新 tokenize。复读、限长、格式不完整、
+数学未通过记录都保留在审计输出中。此处校验的是最终答案；对部分符号等式、集合和
+文字答案会漏判，不作为全集数学准确率。生产任务按原题 hash 将 Parquet 划入训练和验证，
+消费全量源轨迹，生成后的可训练数量以实际筛选统计为准。
+
 ## 3. 使用原生 SkyRL SFT
 
 不需要新的 SFT trainer 或 dataset class，直接消费 `pretokenized_dataset_paths`：
@@ -176,26 +206,64 @@ RAY_ADDRESS=local uv run --isolated --no-project --env-file .env .venv/bin/pytho
   'pretokenized_dataset_paths=[outputs/sampling_sft/train.jsonl]' \
   'eval_pretokenized_dataset_paths=[outputs/sampling_sft/validation.jsonl]' \
   remove_microbatch_padding=false sequence_parallel_size=1 \
-  rwkv_chunk_size=1024 \
+  rwkv_chunk_size=4096 \
   'model_config_kwargs={wkv_mode: fp32io16}' \
-  num_epochs=1 batch_size=32 micro_train_batch_size_per_gpu=1 \
+  num_epochs=1 batch_size=128 micro_train_batch_size_per_gpu=16 \
   placement.num_nodes=1 placement.num_gpus_per_node=8 \
+  fsdp_config.fsdp_size=8 fsdp_config.reshard_after_forward=false \
+  fsdp_config.sync_gradients_each_microbatch=false \
   optimizer_config.lr=1e-6 optimizer_config.max_grad_norm=1.0 \
-  optimizer_config.scheduler=cosine \
+  optimizer_config.scheduler=constant optimizer_config.num_warmup_steps=0 \
+  optimizer_config.offload_after_step=false \
   max_length=null ckpt_path=outputs/sampling_sft/checkpoints \
   ckpt_interval=50 eval_interval=50 hf_save_interval=50 \
+  eval_before_train=true max_ckpts_to_keep=2 num_workers=0 \
   export_path=outputs/sampling_sft/hf_exports logger=wandb \
   project_name=rwkv_sampling_sft run_name=rwkv7-g1k-1.5b-20260930-ctx25600 \
   > /tmp/results_sampling_sft.log 2>&1
 ```
 
 `max_length=null` 保留所有完整 token 序列，不再二次截断；按真实模型/显存预算准备数据。
-`rwkv_chunk_size=1024` 使用现有 Transformers `RwkvCache` 的 WKV 与 token-shift
+`rwkv_chunk_size=4096` 使用现有 Transformers `RwkvCache` 的 WKV 与 token-shift
 状态分块执行，checkpoint 重算每个 chunk 的 forward 和 LM-head logprobs，保留完整
 跨块梯度，不 detach 历史。FSDP ranks 使用相同 chunk 次数，样本间独立初始化状态。
 `rwkv_chunk_size=0` 保留既有整段路径。
 此处 eval 记录 held-out SFT loss；reward/accuracy 曲线应另用既有 RWKV evaluation 流程，
 不能将 SFT loss 当作 reward 验收。W&B 使用用户已有配置。GPU 数与 batch size 需匹配实际资源。
+
+PRO6000×8 的硬件对照使用固定 128 条真实完整回答，共 293,236 个非 padding tokens，
+每组执行 3 个优化步，以下吞吐取第 2、3 步的均值：
+
+| microbatch / GPU | chunk size | FSDP size | reshard / 每个 microbatch 同步 | 真实 tokens / 秒 | 显存峰值（GiB） |
+| ---: | ---: | ---: | --- | ---: | ---: |
+| 4 | 1024 | 8 | true / true | 12,885 | 13.58 |
+| 4 | 1024 | 8 | false / false | 15,651 | 19.50 |
+| 16 | 2048 | 8 | false / false | 18,760 | 33.72 |
+| 16 | 4096 | 8 | false / false | 18,765 | 53.63 |
+| 16 | 8192 | 8 | false / false | 18,072 | 87.27 |
+| 16 | 4096 | 1 | false / false | 18,667 | 71.35 |
+
+六组均正常完成，梯度有限且非零；相同初始权重的首步 loss 最大差异约 `4.6e-5`。
+这组短实验选择 microbatch 16、chunk 4096、FSDP size 8，关闭 forward reshard 和
+每个 microbatch 的梯度同步。2048 与 4096 的吞吐十分接近，表中差异不足以证明
+4096 在所有输入上更快。全量 CoT 原题的 UTF-8 最大长度为 3471 bytes，
+加上 8192-token 回答与模板预算后，完整 SFT 序列的保守 token 上界为 11,791。
+
+学习率对照封存 52 条数学校验通过的训练回答和 7 条独立验证回答，global batch 32、
+microbatch 4，其余优化器与 infctx 配置相同。每组从原始 checkpoint 开始训练 8 步，
+AdamW betas 为 `[0.9, 0.999]`，weight decay 为 `0.01`，梯度裁剪为 `1.0`，
+使用 constant schedule、无 warmup。四组基线验证 loss 均为 `0.447872`：
+
+| learning rate | 第 8 步验证 loss |
+| --- | ---: |
+| `1e-6` | 0.412276 |
+| `3e-6` | 0.458720 |
+| `1e-5` | 0.568710 |
+| `3e-5` | 0.892523 |
+
+因此生产候选使用 `1e-6`；该结论来自小规模验证集与 global batch 32 的实验。
+生产的 global batch 128 通过了硬件对照，后续通过全量独立验证分区监测学习表现。
+所有训练从同一个原始 checkpoint 初始化，调参导出权重用于作答验收。
 
 ## 文件与测试
 

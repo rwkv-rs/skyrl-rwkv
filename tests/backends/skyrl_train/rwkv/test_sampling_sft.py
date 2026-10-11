@@ -20,14 +20,20 @@ def write_rows(path, rows):
 
 
 def question(uuid, domain="Math"):
-    return {"uuid": uuid, "query": f"Question {uuid}", "ground_truth": "4", "domain": domain}
+    return {
+        "uuid": uuid,
+        "query": f"Question {uuid}",
+        "ground_truth": "4",
+        "domain": domain,
+    }
 
 
 def response(content="\\boxed{4}", reasoning="Compute two plus two.", finish_reason="stop"):
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
-                message=SimpleNamespace(content=content, reasoning_content=reasoning), finish_reason=finish_reason
+                message=SimpleNamespace(content=content, reasoning_content=reasoning),
+                finish_reason=finish_reason,
             )
         ],
         usage=SimpleNamespace(model_dump=lambda: {"completion_tokens": 20}),
@@ -45,7 +51,10 @@ def test_expert_trace_keeps_reasoning_final_answer_and_gold():
     assert expert.expert_trace(row, response(reasoning=None), "teacher")["solution"] == "\\boxed{4}"
 
 
-@pytest.mark.parametrize("result", [response(finish_reason="length"), response(content=""), response(content=None)])
+@pytest.mark.parametrize(
+    "result",
+    [response(finish_reason="length"), response(content=""), response(content=None)],
+)
 def test_expert_rejects_truncated_or_empty_responses(result):
     with pytest.raises(ValueError, match="Incomplete expert"):
         expert.expert_trace({"uuid": "a"}, result, "teacher")
@@ -55,7 +64,16 @@ def test_ultradata_all_shards_domain_limit_and_disjoint_sharding(tmp_path):
     write_rows(tmp_path / "Math" / "a.jsonl", [question("a"), question("b")])
     write_rows(tmp_path / "Math" / "b.jsonl", [question("c")])
     write_rows(tmp_path / "Code" / "a.jsonl", [question("code", "Code")])
-    argv = ["--dataset", str(tmp_path), "--output", "unused", "--domain", "Math", "--limit", "3"]
+    argv = [
+        "--dataset",
+        str(tmp_path),
+        "--output",
+        "unused",
+        "--domain",
+        "Math",
+        "--limit",
+        "3",
+    ]
     full = list(data.questions(expert.parse_args(argv)))
     assert [row["uuid"] for row in full] == ["a", "b", "c"]
     left = list(data.questions(expert.parse_args(argv + ["--num-shards", "2", "--shard-index", "0"])))
@@ -72,7 +90,16 @@ def test_custom_question_key_stable_ids_and_parquet(tmp_path):
     path = tmp_path / "questions.parquet"
     pq.write_table(pa.Table.from_pylist([{"problem": "二加二?", "answer": "4"}]), path)
     args = expert.parse_args(
-        ["--dataset", str(path), "--output", "unused", "--question-key", "problem", "--answer-key", "answer"]
+        [
+            "--dataset",
+            str(path),
+            "--output",
+            "unused",
+            "--question-key",
+            "problem",
+            "--answer-key",
+            "answer",
+        ]
     )
     first = next(data.questions(args))
     assert first["prompt"] == "二加二?" and first["ground_truth"] == "4"
@@ -88,7 +115,11 @@ def test_nemotron_expert_preserves_complete_reasoning_and_question_partition(tmp
             "expected_answer": "4",
             "messages": [
                 {"role": "user", "content": "2+2?\nUse boxed answer."},
-                {"role": "assistant", "reasoning_content": "Full reasoning\n" * 10000, "content": "\\boxed{4}"},
+                {
+                    "role": "assistant",
+                    "reasoning_content": "Full reasoning\n" * 10000,
+                    "content": "\\boxed{4}",
+                },
             ],
         }
         for uuid in ("trace-a", "trace-b")
@@ -114,10 +145,24 @@ def test_hf_input_streaming_configuration(monkeypatch):
 
     monkeypatch.setattr(datasets, "load_dataset", load_dataset)
     args = expert.parse_args(
-        ["--dataset", "org/questions", "--dataset-config", "math", "--revision", "pinned", "--output", "unused"]
+        [
+            "--dataset",
+            "org/questions",
+            "--dataset-config",
+            "math",
+            "--revision",
+            "pinned",
+            "--output",
+            "unused",
+        ]
     )
     assert next(data.questions(args))["uuid"] == "hf"
-    assert calls == [(("org/questions",), {"name": "math", "split": "train", "revision": "pinned", "streaming": True})]
+    assert calls == [
+        (
+            ("org/questions",),
+            {"name": "math", "split": "train", "revision": "pinned", "streaming": True},
+        )
+    ]
 
 
 def test_resume_repairs_only_partial_tail_and_refuses_setting_changes(tmp_path):
@@ -174,7 +219,16 @@ def test_api_concurrency_resume_and_secrets_not_persisted(tmp_path, monkeypatch)
     monkeypatch.setenv("DS_MODEL_NAME", "configured-teacher")
     monkeypatch.setenv("DS_MODEL_URL", "https://provider.invalid/v1/chat/completions")
     monkeypatch.setenv("DS_MODEL_API_KEY", "test-secret-key")
-    argv = ["--dataset", str(source), "--output", str(output), "--concurrency", "2", "--limit", "3"]
+    argv = [
+        "--dataset",
+        str(source),
+        "--output",
+        str(output),
+        "--concurrency",
+        "2",
+        "--limit",
+        "3",
+    ]
     asyncio.run(expert.generate(expert.parse_args(argv)))
     asyncio.run(expert.generate(expert.parse_args(argv + ["--limit", "5", "--resume"])))
     assert len(calls) == 5 and peak == 2
@@ -212,7 +266,12 @@ def test_vllm_adapter_rwkv_template_context_and_unprivileged_scoring(monkeypatch
         calls.append((prompt, params))
         return [
             SimpleNamespace(
-                prompt_logprobs=[None, {}, {3: SimpleNamespace(logprob=-2)}, {4: SimpleNamespace(logprob=-4)}],
+                prompt_logprobs=[
+                    None,
+                    {},
+                    {3: SimpleNamespace(logprob=-2)},
+                    {4: SimpleNamespace(logprob=-4)},
+                ],
                 outputs=[SimpleNamespace(token_ids=[4], finish_reason="length")],
             )
         ]
@@ -225,7 +284,10 @@ def test_vllm_adapter_rwkv_template_context_and_unprivileged_scoring(monkeypatch
     )
     p = sampling.vLLMAutoregressiveSampler(
         llm,
-        chat_template_kwargs={"rwkv_prompt_template": "bot", "rwkv_generation_prompt": "open_think"},
+        chat_template_kwargs={
+            "rwkv_prompt_template": "bot",
+            "rwkv_generation_prompt": "open_think",
+        },
         sampling_params={
             "temperature": 0.96,
             "top_p": 0.76,
@@ -246,7 +308,12 @@ def test_vllm_adapter_rwkv_template_context_and_unprivileged_scoring(monkeypatch
     import random
 
     assert sampling.proposal_vLLM(p, "question", "expert info", [3], 1, random.Random(0)) == ([3, 4], False)
-    assert tokenizer.messages == [{"role": "user", "content": "Expert solution:\nexpert info\nQuestion:\nquestion"}]
+    assert tokenizer.messages == [
+        {
+            "role": "user",
+            "content": "Expert solution:\nexpert info\nQuestion:\nquestion",
+        }
+    ]
     assert calls[-1][0] == {"prompt_token_ids": [7, 8, 3]}
     assert {key: calls[-1][1][key] for key in p.sampling_params} == p.sampling_params
     assert calls[-1][1]["stop_token_ids"] == [0, 10060]
@@ -266,7 +333,12 @@ def test_proposal_turn_separator_preserved_and_eos_appended(monkeypatch, rwkv_bo
         get_tokenizer=lambda: tokenizer,
         generate=lambda *args, **kwargs: [
             SimpleNamespace(
-                outputs=[SimpleNamespace(token_ids=[end_token], finish_reason="stop" if end_token == 0 else "length")]
+                outputs=[
+                    SimpleNamespace(
+                        token_ids=[end_token],
+                        finish_reason="stop" if end_token == 0 else "length",
+                    )
+                ]
             )
         ],
         llm_engine=SimpleNamespace(model_config=SimpleNamespace(max_model_len=10000)),
@@ -279,7 +351,12 @@ def test_proposal_turn_separator_preserved_and_eos_appended(monkeypatch, rwkv_bo
     assert finished == (end_token == 0 or (rwkv_bot and end_token == 10060))
     assert p.stop_token_ids == ([0, 10060] if rwkv_bot else [0])
     if rwkv_bot:
-        assert tokenizer.messages == [{"role": "user", "content": "Expert solution:\nexpert info\nQuestion:\nquestion"}]
+        assert tokenizer.messages == [
+            {
+                "role": "user",
+                "content": "Expert solution:\nexpert info\nQuestion:\nquestion",
+            }
+        ]
     else:
         assert "expert info" in tokenizer.messages[0]["content"]
         assert "Partial response:" in tokenizer.messages[0]["content"]
@@ -324,6 +401,83 @@ def test_sampler_eos_ends_blocks_and_zero_step_rewrite(monkeypatch):
     assert result["finish_reason"] == "stop"
 
 
+def test_repetition_requires_three_adjacent_token_spans():
+    span = list(range(32))
+    assert not sampling.has_repetition(span * 2)
+    assert sampling.has_repetition([999] + span * 3 + [10060, 0])
+    assert not sampling.has_repetition(span + list(range(32, 64)) + span)
+
+
+def test_repetitive_trajectory_is_skipped_before_scoring(monkeypatch):
+    p = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=0))
+    monkeypatch.setattr(sampling, "proposal_vLLM", lambda *args: (list(range(16)) * 3, False))
+    monkeypatch.setattr(
+        sampling,
+        "get_logprobs_vLLM",
+        lambda *args: pytest.fail("Skipped trajectory must not be scored"),
+    )
+    result = sampling.proj_samp_vLLM(p, "q", "s", max_new_tokens=64, block_num=1, skip_repetition=True)
+    assert result["finish_reason"] == "repetition" and result["attempts"] == 0
+
+
+def test_batch_sampling_preserves_independent_rng_and_greedy_state(monkeypatch):
+    p = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=0))
+
+    def propose(p, question, solution, current, length, rng):
+        single = isinstance(question, str)
+        rows = [(current, length, rng)] if single else zip(current, length, rng, strict=True)
+        results = []
+        for prefix, count, generator in rows:
+            gen = prefix + [generator.randrange(1, 20) for _ in range(count)]
+            results.append((gen, False))
+        return results[0] if single else results
+
+    def score(p, question, current):
+        return -sum(current) if isinstance(question, str) else [-sum(ids) for ids in current]
+
+    monkeypatch.setattr(sampling, "proposal_vLLM", propose)
+    monkeypatch.setattr(sampling, "get_logprobs_vLLM", score)
+    settings = dict(max_new_tokens=12, block_num=3, mcmc_steps=3)
+    separate = [sampling.proj_samp_vLLM(p, q, "s", seed=seed, **settings) for q, seed in zip(["a", "b"], [7, 9])]
+    together = sampling.proj_samp_vLLM(p, ["a", "b"], ["s", "s"], seed=[7, 9], **settings)
+    assert together == separate
+
+
+def test_batched_vllm_proposals_keep_prefixes_and_terminal_ids(monkeypatch):
+    import random
+
+    calls = []
+    monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(SamplingParams=lambda **kwargs: kwargs))
+
+    def generate(prompts, params, **kwargs):
+        calls.append((prompts, params))
+        return [
+            SimpleNamespace(outputs=[SimpleNamespace(token_ids=[10060], finish_reason="stop")]),
+            SimpleNamespace(outputs=[SimpleNamespace(token_ids=[5], finish_reason="length")]),
+        ]
+
+    llm = SimpleNamespace(
+        get_tokenizer=lambda: Tokenizer(),
+        generate=generate,
+        llm_engine=SimpleNamespace(model_config=SimpleNamespace(max_model_len=10000)),
+    )
+    p = sampling.vLLMAutoregressiveSampler(llm, chat_template_kwargs={"rwkv_prompt_template": "bot"})
+    results = sampling.proposal_vLLM(
+        p,
+        ["a", "b"],
+        ["s1", "s2"],
+        [[3], [4, 4]],
+        [2, 3],
+        [random.Random(7), random.Random(9)],
+    )
+    assert results == [([3, 10060, 0], True), ([4, 4, 5], False)]
+    assert calls[0][0] == [
+        {"prompt_token_ids": [7, 8, 3]},
+        {"prompt_token_ids": [7, 8, 4, 4]},
+    ]
+    assert [params["max_tokens"] for params in calls[0][1]] == [2, 3]
+
+
 @pytest.mark.parametrize("complete", [True, False])
 def test_boost_native_sft_replay_mask_and_truncation(tmp_path, monkeypatch, complete):
     from skyrl.train.dataset.pretokenized import load_from_pretokenized
@@ -344,7 +498,16 @@ def test_boost_native_sft_replay_mask_and_truncation(tmp_path, monkeypatch, comp
     path = tmp_path / "train.jsonl"
     # Include a completed row so the native loader has trainable data in both cases.
     write_rows(
-        path, [record, {**record, "uuid": "other", "input_ids": [7, 8, 3, 10060, 0], "loss_mask": [0, 0, 1, 1, 1]}]
+        path,
+        [
+            record,
+            {
+                **record,
+                "uuid": "other",
+                "input_ids": [7, 8, 3, 10060, 0],
+                "loss_mask": [0, 0, 1, 1, 1],
+            },
+        ],
     )
     loaded = load_from_pretokenized(str(path))
     assert len(loaded) == (2 if complete else 1)
@@ -371,7 +534,12 @@ def test_question_partitions_stable_and_disjoint():
 
 @pytest.mark.parametrize(
     "argv",
-    [["--block-num", "3"], ["--mcmc-steps", "-1"], ["--validation-fraction", "1"], ["--repetition-penalty", "0"]],
+    [
+        ["--block-num", "3"],
+        ["--mcmc-steps", "-1"],
+        ["--validation-fraction", "1"],
+        ["--repetition-penalty", "0"],
+    ],
 )
 def test_boost_cli_rejects_invalid_sampling_settings(argv):
     with pytest.raises(SystemExit):
@@ -410,12 +578,20 @@ def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, mon
         )
 
     monkeypatch.setattr(
-        transformers.AutoConfig, "from_pretrained", lambda *args, **kwargs: SimpleNamespace(model_type="rwkv")
+        transformers.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: SimpleNamespace(model_type="rwkv"),
     )
-    monkeypatch.setattr(transformers.GenerationConfig, "from_pretrained", lambda *args, **kwargs: generation_config)
+    monkeypatch.setattr(
+        transformers.GenerationConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: generation_config,
+    )
     monkeypatch.setitem(sys.modules, "vllm", SimpleNamespace(LLM=llm))
     monkeypatch.setitem(
-        sys.modules, "examples.train.rwkv.prepare_flashrwkv2", SimpleNamespace(check=lambda: preflights.append(True))
+        sys.modules,
+        "examples.train.rwkv.prepare_flashrwkv2",
+        SimpleNamespace(check=lambda: preflights.append(True)),
     )
 
     def sample(p, *args, **kwargs):
@@ -429,7 +605,16 @@ def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, mon
         }
 
     monkeypatch.setattr(boost, "proj_samp_vLLM", sample)
-    argv = ["--input", str(source), "--output", str(output), "--model", "rwkv7-test", "--partition", "all"]
+    argv = [
+        "--input",
+        str(source),
+        "--output",
+        str(output),
+        "--model",
+        "rwkv7-test",
+        "--partition",
+        "all",
+    ]
     boost.run(boost.parse_args(argv))
     boost.run(boost.parse_args(argv + ["--resume"]))
     assert len(list(data.load_rows(str(output)))) == 1

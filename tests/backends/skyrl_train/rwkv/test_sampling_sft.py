@@ -234,8 +234,8 @@ def test_vllm_adapter_rwkv_template_context_and_unprivileged_scoring(monkeypatch
     import random
 
     assert sampling.proposal_vLLM(p, "question", "expert info", [3], 1, random.Random(0)) == ([3, 4], False)
-    assert tokenizer.messages == [{"role": "user", "content": "question"}]
-    assert calls[-1][0]["prompt_token_ids"][-1] == 3
+    assert tokenizer.messages == [{"role": "user", "content": "Expert solution:\nexpert info\nQuestion:\nquestion"}]
+    assert calls[-1][0] == {"prompt_token_ids": [7, 8, 3]}
     assert calls[-1][1]["temperature"] == 0.6
     assert calls[-1][1]["repetition_penalty"] == 1.1
     assert calls[-1][1]["stop_token_ids"] == [0, 10060]
@@ -268,7 +268,7 @@ def test_proposal_turn_separator_preserved_and_eos_appended(monkeypatch, rwkv_bo
     assert finished == (end_token == 0 or (rwkv_bot and end_token == 10060))
     assert p.stop_token_ids == ([0, 10060] if rwkv_bot else [0])
     if rwkv_bot:
-        assert tokenizer.messages == [{"role": "user", "content": "question"}]
+        assert tokenizer.messages == [{"role": "user", "content": "Expert solution:\nexpert info\nQuestion:\nquestion"}]
     else:
         assert "expert info" in tokenizer.messages[0]["content"]
         assert "Partial response:" in tokenizer.messages[0]["content"]
@@ -319,7 +319,7 @@ def test_boost_native_sft_replay_mask_and_truncation(tmp_path, monkeypatch, comp
 
     p = SimpleNamespace(format_prompt=lambda q: [7, 8], tokenizer=Tokenizer())
     result = {
-        "response_ids": [3, 0],
+        "response_ids": [3, 10060, 0],
         "finish_reason": "stop" if complete else "length",
         "target_log_prob_cur": -1.0,
         "attempts": 10,
@@ -328,23 +328,25 @@ def test_boost_native_sft_replay_mask_and_truncation(tmp_path, monkeypatch, comp
     monkeypatch.setattr(boost, "proj_samp_vLLM", lambda *args, **kwargs: result)
     args = boost.parse_args(["--input", "unused", "--output", "unused", "--model", "rwkv7-test"])
     record = boost.boost_record(p, {"uuid": "q", "prompt": "question", "solution": "expert"}, args)
-    assert record["input_ids"] == ([7, 8, 3, 0] if complete else [])
-    assert record["loss_mask"] == ([0, 0, 1, 1] if complete else [])
+    assert record["input_ids"] == ([7, 8, 3, 10060, 0] if complete else [])
+    assert record["loss_mask"] == ([0, 0, 1, 1, 1] if complete else [])
     path = tmp_path / "train.jsonl"
     # Include a completed row so the native loader has trainable data in both cases.
-    write_rows(path, [record, {**record, "uuid": "other", "input_ids": [7, 8, 3, 0], "loss_mask": [0, 0, 1, 1]}])
+    write_rows(
+        path, [record, {**record, "uuid": "other", "input_ids": [7, 8, 3, 10060, 0], "loss_mask": [0, 0, 1, 1, 1]}]
+    )
     loaded = load_from_pretokenized(str(path))
     assert len(loaded) == (2 if complete else 1)
-    assert loaded[0]["input_ids"] == [7, 8, 3, 0]
-    assert loaded[0]["num_actions"] == 2
-    assert loaded[0]["loss_mask"] == [1, 1]
-    assert loaded[0]["attention_mask"] == [1, 1, 1, 1]
+    assert loaded[0]["input_ids"] == [7, 8, 3, 10060, 0]
+    assert loaded[0]["num_actions"] == 3
+    assert loaded[0]["loss_mask"] == [1, 1, 1]
+    assert loaded[0]["attention_mask"] == [1, 1, 1, 1, 1]
     from skyrl.train.dataset.collators import DefaultCollator
 
     batch = DefaultCollator(SimpleNamespace(pad_token_id=0), 1)([loaded[0]], batch_size=1)
-    assert batch["sequences"].tolist() == [[7, 8, 3, 0]]
-    assert batch["loss_mask"].tolist() == [[0.5, 0.5]]
-    assert batch.metadata["response_length"] == 2
+    assert batch["sequences"].tolist() == [[7, 8, 3, 10060, 0]]
+    assert batch["loss_mask"].tolist()[0] == pytest.approx([1 / 3, 1 / 3, 1 / 3])
+    assert batch.metadata["response_length"] == 3
 
 
 def test_question_partitions_stable_and_disjoint():

@@ -74,8 +74,8 @@ uv run --isolated --no-project .venv/bin/python \
   --input "$HOME/Datasets/Nemotron-SFT-Math-v4" --subset cot \
   --model "$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600" \
   --max-model-len 1048576 --max-new-tokens 8192 --block-num 8 --mcmc-steps 1 \
-  --batch-size 256 --gpu-memory-utilization 0.94 --skip-repetition \
-  --max-num-batched-tokens 16384 --no-enforce-eager \
+  --batch-size 512 --gpu-memory-utilization 0.94 --skip-repetition \
+  --max-num-batched-tokens 32768 --no-enforce-eager \
   --output outputs/sampling_sft/nemotron_train.jsonl \
   > /tmp/results_sampling_nemotron.log 2>&1
 ```
@@ -84,7 +84,7 @@ uv run --isolated --no-project .venv/bin/python \
 标注的训练上下文筛选或截断。保留原始 user message 的数学输出要求。同题的不同
 轨迹按 `problem` 哈希进入同一 held-out partition。多卡采样使用每卡 TP1，分别指定
 `--num-shards N --shard-index K` 与独立输出文件；训练/验证需保持相同分片和 seed。
-此示例使用 16384-token chunked prefill。
+此示例使用 32768-token chunked prefill。
 
 `rwkv-sha-pro6000x8` 的本地 snapshot 为
 `84d42ad0cb960f07f951b9baa9ed2b46a5a18c66`，包含 545,431 条轨迹、95,170 道不同原题。
@@ -103,6 +103,12 @@ vLLM，每条轨迹保留自己的 UUID seed、prefix 和贪心接受状态。�
 模型、数据源、seed、prompt template、解码参数及采样算法配置仍须一致。
 不同批次与 kernel 路径可能产生不同回答，运行阶段记录用于保留这些执行差异。
 
+RWKV 在每个采样批次内缓存已格式化的原题和专家条件前缀，续写仍直接追加
+实际 response token IDs；批次结束后释放缓存。复读检测先匹配 16-token n-gram，
+再比较完整重复片段，保持“至少 16 tokens 的片段连续三次重复”的判定不变。
+checkpoint 的 Bot 模板会去掉 user 内容中的空行和行尾空白；OpenThink 的生成前缀
+止于 `Bot✿<think`，随后直接拼接模型已生成的 response IDs，包括开头的 `>`。
+
 2026-10-11 在同一批 256 道代表性训练题上的单卡对照，使用上述 checkpoint、
 8 blocks、每块 1 次 suffix proposal、图执行和 0.94 显存预算；耗时包含模型启动：
 
@@ -114,6 +120,29 @@ vLLM，每条轨迹保留自己的 UUID seed、prefix 和贪心接受状态。�
 
 三组均正常退出；这里的正常结束只表示生成了终止 token，正确性与格式另行审计。
 批量和 kernel 执行方式可能产生不同回答，比较使用有效回答产出速度。
+
+随后在同一批 1024 道未完成原题上比较完整采样流程，固定每卡 400W、
+8192-token 输出预算、8 blocks、每块 1 次 suffix proposal。以下耗时只计采样，
+不含模型启动和审计文件写入；显存峰值来自采样期间的 1Hz NVML 监控。
+
+| batch | prefill | 显存预算 | 前缀缓存 | 候选 / 小时 | 严格验算通过 / 小时 | GPU 利用率均值 | 显存峰值（GiB） |
+| ---: | ---: | ---: | :---: | ---: | ---: | ---: | ---: |
+| 256 | 16384 | 0.94 | 关闭 | 1043.80 | 48.93 | 83.22% | 87.92 |
+| 512 | 32768 | 0.94 | 关闭 | 1170.41 | 61.72 | 84.20% | 85.22 |
+| 1024 | 16384 | 0.94 | 关闭 | 1023.44 | 49.97 | 87.94% | 88.53 |
+| 1024 | 32768 | 0.94 | 关闭 | 1062.69 | 56.04 | 87.25% | 85.84 |
+| 1024 | 32768 | 0.97 | 关闭 | 1083.86 | 57.16 | 86.63% | 88.67 |
+| 1024 | 32768 | 0.94 | 开启 | 1132.25 | 51.97 | 93.61% | 85.81 |
+| 1024 | 32768 | 0.97 | 开启 | 1087.76 | 50.99 | 93.80% | 88.67 |
+
+各配置在不同 GPU 上运行；同型号 GPU 的运行频率和冷却条件仍可能不同。
+这里的严格验算通过要求完整 `</think>`、最终 boxed answer、模型生成 `✿` 终止、
+训练序列末尾为 `✿` + EOS 0，以及最终答案与 gold 等价；只检查最终答案，不证明推理步骤正确。
+这些指标用于比较采样和可训练样本产出速度，不表示模型数学准确率有所提高。
+
+生产采样采用每卡 batch 512、prefill 32768、0.94 显存预算、前缀缓存和图执行。
+其余未完成的并发对照已按用户要求停止，全部 8 张 GPU 用于全量 CoT 生产采样；
+采样和筛选完成后，管线自动启动已经验收的原生 infctx SFT 配置。
 
 生产数据准备使用 `--skip-repetition`：检测到任意至少 16 tokens 的片段连续三次重复时，
 立即跳过当前轨迹，记录 `finish_reason=repetition`，`input_ids/loss_mask` 为空。

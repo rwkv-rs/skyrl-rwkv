@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -96,14 +97,20 @@ def validation_question(uuid, seed, fraction):
 
 
 @contextmanager
-def open_output(path, config, resume):
-    """Refuse changed run settings; repair only an unterminated final record."""
+def open_output(path, config, resume, *, execution_keys=()):
+    """Resume exact records, recording explicitly allowed execution-setting changes."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     metadata = path.with_suffix(path.suffix + ".meta.json")
     completed = set()
     if resume:
-        if json.loads(metadata.read_text()) != config:
+        previous = json.loads(metadata.read_text())
+        changed = {
+            key
+            for key in previous.keys() | config.keys()
+            if key not in previous or key not in config or previous[key] != config[key]
+        }
+        if changed - set(execution_keys):
             raise ValueError("Resume configuration differs; use the original settings or a new output path")
         with path.open("r+b") as handle:
             while line := handle.readline():
@@ -111,6 +118,19 @@ def open_output(path, config, resume):
                     handle.truncate(handle.tell() - len(line))
                     break
                 completed.add(json.loads(line)["uuid"])
+        if changed:
+            history = path.with_suffix(path.suffix + ".meta.history.jsonl")
+            with history.open("a", encoding="utf-8") as handle:
+                append_jsonl(
+                    handle,
+                    {
+                        "updated_utc": datetime.now(timezone.utc).isoformat(),
+                        "completed_records": len(completed),
+                        "previous": previous,
+                        "current": config,
+                    },
+                )
+            metadata.write_text(json.dumps(config, ensure_ascii=False, indent=2) + "\n")
     else:
         if path.exists() or metadata.exists():
             raise FileExistsError(f"Output exists: {path}; use --resume or a new output path")

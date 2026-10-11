@@ -129,10 +129,16 @@ def run(args):
         "repetition_filter": "three_adjacent_spans_min16" if args.skip_repetition else None,
         "max_num_batched_tokens": args.max_num_batched_tokens,
         "enforce_eager": args.enforce_eager,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
     }
     if is_rwkv:
         config["sampling_params"] = sampling_params
-    with open_output(args.output, config, args.resume) as (handle, completed):
+    with open_output(
+        args.output,
+        config,
+        args.resume,
+        execution_keys=("batch_size", "max_num_batched_tokens", "enforce_eager", "gpu_memory_utilization"),
+    ) as (handle, completed):
         # Validate resume metadata before allocating a GPU model.
         from vllm import LLM
 

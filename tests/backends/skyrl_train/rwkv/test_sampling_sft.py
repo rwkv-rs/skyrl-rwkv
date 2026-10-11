@@ -185,6 +185,34 @@ def test_resume_repairs_only_partial_tail_and_refuses_setting_changes(tmp_path):
             pass
 
 
+def test_resume_execution_changes_preserve_records_and_log_previous_config(tmp_path):
+    path = tmp_path / "traces.jsonl"
+    original = {"model": "rwkv7-test", "seed": 0, "batch_size": 256}
+    current = {**original, "batch_size": 1024, "gpu_memory_utilization": 0.94}
+    execution_keys = ("batch_size", "gpu_memory_utilization")
+    with data.open_output(path, original, False) as (handle, _):
+        data.append_jsonl(handle, {"uuid": "a", "input_ids": [3, 0]})
+    before = path.read_bytes()
+    with data.open_output(path, current, True, execution_keys=execution_keys) as (_, completed):
+        assert completed == {"a"}
+    assert path.read_bytes() == before
+    assert json.loads(path.with_suffix(".jsonl.meta.json").read_text()) == current
+    history_path = path.with_suffix(".jsonl.meta.history.jsonl")
+    history = [json.loads(line) for line in history_path.read_text().splitlines()]
+    assert len(history) == 1
+    assert history[0]["completed_records"] == 1
+    assert history[0]["previous"] == original and history[0]["current"] == current
+    with data.open_output(path, current, True, execution_keys=execution_keys):
+        pass
+    assert len(history_path.read_text().splitlines()) == 1
+    for key, value in (("seed", 1), ("model", "other")):
+        with pytest.raises(ValueError, match="configuration differs"):
+            with data.open_output(path, {**current, key: value}, True, execution_keys=execution_keys):
+                pass
+    assert path.read_bytes() == before
+    assert json.loads(path.with_suffix(".jsonl.meta.json").read_text()) == current
+
+
 def test_api_concurrency_resume_and_secrets_not_persisted(tmp_path, monkeypatch):
     import openai
 

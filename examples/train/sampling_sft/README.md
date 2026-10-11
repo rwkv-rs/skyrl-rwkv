@@ -112,7 +112,8 @@ validation 仅用于 SFT held-out loss，不是新任务 reward / accuracy 评�
 
 - `--max-new-tokens 1856 --block-num 32 --mcmc-steps 10`；实际每块58 tokens。
 - `--mcmc-steps 0` 是逐块续写的无搜索 rewrite 对照。
-- Proposal：temperature0.6、top-p1、top-k-1、repetition penalty1.1。
+- Proposal：temperature0.6、top-p1、top-k-1；RWKV 使用 repetition penalty1.0，其他模型默认1.1。
+  当前 RWKV Rapid-Sampling 后端不支持 multiplicative repetition penalty；禁用该 penalty，保留 suffix 搜索与原始评分。
   Scoring：只有原题、temperature1、无截断采样限制，读取 raw prompt logprobs。
 - `--max-model-len 32768` 包含专家提示、prefix 与 suffix；输入不截断，超预算报错。
   专家 reasoning 很长时需要明确增大预算。采样算力与序列长度近似平方增长。

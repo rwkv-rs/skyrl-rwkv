@@ -202,7 +202,7 @@ PY
     fi
     (
       cd "$LIGHTEVAL_PROJECT"
-      unset PYTHONPATH WANDB_RUN_ID WANDB_RESUME
+      unset PYTHONPATH WANDB_RUN_ID WANDB_RESUME WANDB_SERVICE
       exec setsid uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
         - "$phase" "$PHASE_ROOT" "$EVAL_NAME" "$ROUTER_PORT" \
         "$EVAL_MAX_NUM_SEQS" "$WANDB_RUN_PATH" "$SKYRL_PROJECT" \
@@ -228,6 +228,7 @@ eval_metrics = {}
 endpoint = ModelEndpoint(f"http://127.0.0.1:{port}", "unused", model_name,
                          int(gpu_count) * int(capacity) + 32, 25600)
 for selector in ["aime24", "aime25", "aimo_progress_prize_1", "math_500"]:
+    avg_k = 4 if selector == "math_500" else 16
     config = _litelm_model(endpoint, [endpoint], "CoT", "bot", 24576, 42,
                           cache_dir=str(root / ".lighteval_cache"))
     config.max_model_length = 32768
@@ -238,10 +239,10 @@ for selector in ["aime24", "aime25", "aimo_progress_prize_1", "math_500"]:
         launcher_type=ParallelismManager.NONE, streaming_evaluation=True),
         tracker, model_config=config)
     for task in pipeline.tasks_dict.values():
-        metric = Metrics.avg_at_n_math(sample_params={"n": 16})
+        metric = Metrics.avg_at_n_math(sample_params={"n": avg_k})
         metric.sample_level_fn.compute_score = RWKVExactMatches().compute
         task.metrics = task.config.metrics = [metric]
-        task.num_samples = [16]
+        task.num_samples = [avg_k]
         task.sampling_methods = [SamplingMethod.GENERATIVE]
     tracker.task_config_logger.log(pipeline.tasks_dict)
     pipeline.evaluate()
@@ -253,9 +254,9 @@ for selector in ["aime24", "aime25", "aimo_progress_prize_1", "math_500"]:
         score = next(value for name, value in metrics.items() if not name.endswith("_stderr"))
         count = pipeline.task_sample_counts[task_name]
         completions = pipeline.task_completion_counts[task_name]
-        if completions != 16 * count or pipeline.task_avg_k[task_name] != 16:
-            raise ValueError(f"Incomplete avg@16 evaluation: {task_name}, {count=}, {completions=}")
-        row = {"avg@16": float(score), "num_questions": count,
+        if completions != avg_k * count or pipeline.task_avg_k[task_name] != avg_k:
+            raise ValueError(f"Incomplete avg@{avg_k} evaluation: {task_name}, {count=}, {completions=}")
+        row = {f"avg@{avg_k}": float(score), "num_questions": count,
                "num_completions": completions,
                "truncation_rate": pipeline.task_truncation_counts[task_name] / completions}
         rows[task_name] = row
@@ -265,17 +266,20 @@ for selector in ["aime24", "aime25", "aimo_progress_prize_1", "math_500"]:
     subprocess.run([
         "uv", "run", "--isolated", "--no-config", "--no-project",
         str(Path(skyrl_project) / ".venv/bin/python"), "-", run_path, phase,
-        selector, str(root / selector), model_name, step,
+        selector, str(root / selector), model_name, step, str(avg_k),
     ], check=True, text=True, cwd=skyrl_project, input='''
 import json, sys
 from pathlib import Path
 import wandb
-run_path, phase, selector, directory, model_name, step = sys.argv[1:]
+run_path, phase, selector, directory, model_name, step, avg_k = sys.argv[1:]
 entity, project, run_id = run_path.split("/")
 run = wandb.init(entity=entity, project=project, id=f"{run_id}-eval-{phase}",
-                 resume="allow", name=f"{run_id}-{phase}-avg16", group=run_id,
+                 resume="allow", name=f"{run_id}-{phase}-math-eval", group=run_id,
                  job_type="evaluation", allow_val_change=True, config={"model_name": model_name,
-                     "phase": phase, "avg_k": 16, "max_generated_tokens": 24576,
+                     "phase": phase, "samples_per_question": {
+                         "aime24": 16, "aime25": 16,
+                         "aimo_progress_prize_1": 16, "math_500": 4},
+                     "max_generated_tokens": 24576,
                      "wkv_mode": "fp32io16"})
 rows = json.loads((Path(directory) / "scores.json").read_text())
 values = {f"eval/{phase}/{selector}/{key}": value
@@ -283,9 +287,7 @@ values = {f"eval/{phase}/{selector}/{key}": value
 run.define_metric("eval/global_step")
 run.define_metric(f"eval/{phase}/*", step_metric="eval/global_step")
 run.log({**values, "eval/global_step": int(step)})
-training_run = wandb.Api().run(run_path)
-training_run.summary.update(values)
-artifact = wandb.Artifact(f"{run_id}-{phase}-{selector}-avg16-step{step}", type="evaluation")
+artifact = wandb.Artifact(f"{run_id}-{phase}-{selector}-avg{avg_k}-step{step}", type="evaluation")
 artifact.add_dir(directory)
 run.log_artifact(artifact).wait()
 run.finish()

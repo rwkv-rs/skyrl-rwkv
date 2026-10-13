@@ -116,7 +116,7 @@ if [[ -n "${LIGHTEVAL_PROJECT:-}" ]]; then
         --max-model-len 32768 --max-num-seqs "$EVAL_MAX_NUM_SEQS" \
         --max-num-batched-tokens 32768 --gpu-memory-utilization 0.9 \
         --enable-prefix-caching --enable-chunked-prefill \
-        --disable-log-requests \
+        --no-enable-log-requests \
         > "$EVAL_ROOT/$phase/inference-gpu$gpu.log" 2>&1 &
       EVAL_PIDS+=("$!")
     done

@@ -607,8 +607,7 @@ def test_boost_cli_rejects_invalid_sampling_settings(argv):
         boost.parse_args(["--input", "unused", "--output", "unused", "--model", "rwkv7-test", *argv])
 
 
-@pytest.mark.parametrize("sampling_preset", ["model", "paper"])
-def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, monkeypatch, sampling_preset):
+def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, monkeypatch):
     import transformers
 
     source = tmp_path / "expert.jsonl"
@@ -687,8 +686,6 @@ def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, mon
         "rwkv7-test",
         "--partition",
         "all",
-        "--sampling-preset",
-        sampling_preset,
     ]
     boost.run(boost.parse_args(argv))
     boost.run(boost.parse_args(argv + ["--resume"]))
@@ -702,49 +699,27 @@ def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, mon
     assert options[0]["logprobs_mode"] == "raw_logprobs"
     assert options[0]["generation_config"] == "vllm"
     metadata = json.loads(output.with_suffix(".jsonl.meta.json").read_text())
-    assert metadata["repetition_penalty"] == (1.0 if sampling_preset == "model" else 1.1)
+    assert metadata["repetition_penalty"] == 1.0
     assert (
         metadata["sampling_params"]
         == proposals[0]
-        == (
-            {
-                "temperature": 0.96,
-                "top_p": 0.76,
-                "top_k": 32,
-                "repetition_penalty": 1.0,
-                "presence_penalty": 1.0,
-                "frequency_penalty": 0.1,
-                "penalty_decay": 0.988,
-            }
-            if sampling_preset == "model"
-            else {
-                "temperature": 0.6,
-                "top_p": 1.0,
-                "top_k": -1,
-                "repetition_penalty": 1.1,
-                "presence_penalty": 0.0,
-                "frequency_penalty": 0.0,
-            }
-        )
+        == {
+            "temperature": 0.96,
+            "top_p": 0.76,
+            "top_k": 32,
+            "repetition_penalty": 1.0,
+            "presence_penalty": 1.0,
+            "frequency_penalty": 0.1,
+            "penalty_decay": 0.988,
+        }
     )
     assert tokenizer.kwargs["rwkv_prompt_template"] == "bot"
     with pytest.raises(ValueError, match="configuration differs"):
         boost.run(boost.parse_args(argv + ["--resume", "--seed", "1"]))
-    with pytest.raises(ValueError, match="configuration differs"):
-        boost.run(
-            boost.parse_args(
-                argv + ["--resume", "--sampling-preset", "paper" if sampling_preset == "model" else "model"]
-            )
-        )
-    assert len(options) == 2  # Metadata mismatch fails before loading another GPU model.
     generation_config.top_p = 0.8
-    if sampling_preset == "model":
-        with pytest.raises(ValueError, match="configuration differs"):
-            boost.run(boost.parse_args(argv + ["--resume"]))
-        assert len(options) == 2
-    else:
+    with pytest.raises(ValueError, match="configuration differs"):
         boost.run(boost.parse_args(argv + ["--resume"]))
-        assert len(options) == 3  # Paper decoding is independent of generation_config changes.
+    assert len(options) == 2  # Metadata mismatch fails before loading another GPU model.
 
 
 def test_rwkv_sft_configuration_uses_native_pretokenized_fsdp():

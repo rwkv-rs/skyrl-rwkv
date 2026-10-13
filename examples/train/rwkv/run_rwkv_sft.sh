@@ -115,7 +115,9 @@ if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" == 1 ]]; then
     for pid in "${EVAL_PIDS[@]}"; do
       kill -- "-$pid" 2>/dev/null || true
     done
-    wait || true
+    for pid in "${EVAL_PIDS[@]}"; do
+      wait "$pid" 2>/dev/null || true
+    done
   }
   trap cleanup_eval EXIT
   trap 'exit 130' INT TERM
@@ -131,6 +133,9 @@ if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" == 1 ]]; then
       PHASE_ROOT="$EVAL_ROOT/global_step_$EVAL_STEP/sft"
       EVAL_MODEL="$OUTPUT_ROOT/hf_exports/global_step_$EVAL_STEP/policy"
       EVAL_NAME="$EVAL_NAME-nemotron-cot-sft-step$EVAL_STEP"
+      for config_name in fake_think_generation_config.json tools_generation_config.json; do
+        cp "$MODEL_DIR/$config_name" "$EVAL_MODEL/$config_name"
+      done
     fi
     mkdir -p "$PHASE_ROOT"
     WORKER_URLS=()
@@ -224,6 +229,7 @@ endpoint = ModelEndpoint(f"http://127.0.0.1:{port}", "unused", model_name,
 for selector in ["aime24", "aime25", "aimo_progress_prize_1", "math_500"]:
     config = _litelm_model(endpoint, [endpoint], "CoT", "bot", 24576, 42,
                           cache_dir=str(root / ".lighteval_cache"))
+    config.max_model_length = 32768
     tracker = EvaluationTracker(output_dir=str(root / selector),
                                 save_details=False, save_streaming_completions=True)
     pipeline = RWKVPipeline(selector, PipelineParameters(

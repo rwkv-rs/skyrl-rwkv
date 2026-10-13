@@ -68,3 +68,37 @@ uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" -m skyrl.trai
   eval_before_train=true max_ckpts_to_keep=2 \
   logger="$LOGGER" project_name=rwkv_direct_sft run_name="$RUN_NAME" \
   "$@"
+
+# An optional prepared benchmark directory queues full eval after the epoch.
+if [[ -n "${EVAL_DATA_DIR:-}" ]]; then
+  unset WANDB_RUN_ID WANDB_RESUME
+  for phase in base sft; do
+    EVAL_MODEL="$MODEL_DIR"
+    if [[ "$phase" == sft ]]; then
+      EVAL_MODEL="$OUTPUT_ROOT/hf_exports/global_step_$TOTAL_STEPS/policy"
+    fi
+    uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+      -m skyrl.train.entrypoints.main_generate \
+      "data.val_data=['$EVAL_DATA_DIR/math500.parquet','$EVAL_DATA_DIR/gsm8k.parquet']" \
+      trainer.policy.model.path="$EVAL_MODEL" \
+      'trainer.policy.model_config_kwargs={wkv_mode: fp32io16}' \
+      trainer.strategy=fsdp trainer.flash_attn=false trainer.remove_microbatch_padding=false \
+      trainer.placement.colocate_all=false trainer.placement.policy_num_gpus_per_node="$NUM_GPUS" \
+      trainer.eval_interval=1 trainer.eval_batch_size=256 trainer.max_prompt_length=4096 \
+      trainer.dump_eval_results=true trainer.logger="$LOGGER" \
+      trainer.project_name=rwkv_direct_sft_eval trainer.run_name="$RUN_NAME-$phase-full-eval" \
+      trainer.export_path="$OUTPUT_ROOT/evaluation/$phase" \
+      generator.inference_engine.backend=vllm generator.inference_engine.model_dtype=float16 \
+      generator.inference_engine.run_engines_locally=true \
+      generator.inference_engine.num_engines="$NUM_GPUS" generator.inference_engine.tensor_parallel_size=1 \
+      generator.inference_engine.gpu_memory_utilization=0.8 \
+      generator.inference_engine.max_num_seqs=256 generator.inference_engine.max_num_batched_tokens=32768 \
+      generator.batched=false generator.eval_n_samples_per_prompt=1 \
+      'generator.chat_template_kwargs={rwkv_prompt_template: bot, rwkv_generation_prompt: open_think}' \
+      generator.eval_sampling_params.max_generate_length=8192 \
+      generator.eval_sampling_params.temperature=0.96 generator.eval_sampling_params.top_p=0.76 \
+      generator.eval_sampling_params.top_k=32 \
+      'generator.eval_sampling_params.additional_kwargs={presence_penalty: 1.0, frequency_penalty: 0.1, penalty_decay: 0.988}' \
+      environment.env_class=gsm8k
+  done
+fi

@@ -277,6 +277,7 @@ class FSDPStrategy(DistributedStrategy):
                 new_optimizer,
                 num_warmup_steps=optim_config.num_warmup_steps,
                 num_training_steps=self.total_training_steps,
+                scheduler_specific_kwargs=optim_config.scheduler_specific_kwargs,
             )
         else:
             new_optimizer = None

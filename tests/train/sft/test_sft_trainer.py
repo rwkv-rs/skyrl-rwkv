@@ -1,4 +1,8 @@
+import json
+import subprocess
 from unittest.mock import MagicMock
+
+import pytest
 
 from skyrl.train.config.sft_config import (
     SFTConfig,
@@ -85,3 +89,42 @@ def test_sft_run_eval_opts_out_of_per_token_outputs(mock_dispatch):
     for call in mock_dispatch.forward.call_args_list:
         assert call.kwargs["loss_fn"] == "cross_entropy"
         assert call.kwargs["return_per_token_outputs"] is False
+
+
+def test_sft_run_eval_merges_checkpoint_benchmark_metrics(mock_dispatch, monkeypatch, tmp_path):
+    """Benchmarks use the evaluated checkpoint and return metrics before training resumes."""
+    trainer = _build_minimal_trainer(mock_dispatch)
+    trainer.global_step = 1100
+    trainer.cfg.trainer.export_path = str(tmp_path / "exports")
+    trainer.sft_cfg.eval_command = ["benchmark", "--step", "{global_step}", "--model", "{export_path}"]
+    trainer.sft_cfg.eval_command_metrics_path = str(tmp_path / "metrics_{global_step}.json")
+    trainer.save_hf_model = MagicMock()
+    trainer.eval_dataloaders = [("evalset", trainer.build_eval_dataloader(_dummy_tokenized()))]
+
+    def benchmark(command, *, check):
+        trainer.save_hf_model.assert_called_once()
+        mock_dispatch.empty_cache.assert_called_once_with("policy")
+        assert command == ["benchmark", "--step", "1100", "--model", str(tmp_path / "exports/global_step_1100/policy")]
+        assert check is True
+        (tmp_path / "metrics_1100.json").write_text(json.dumps({"sft/math_500/avg@16": 0.25}))
+
+    monkeypatch.setattr("skyrl.train.sft_trainer.subprocess.run", benchmark)
+    metrics, _ = trainer.run_eval()
+    assert metrics == {"evalset/loss": 0.31, "sft/math_500/avg@16": 0.25}
+    assert trainer.global_step == 1100
+
+
+def test_sft_run_eval_propagates_benchmark_failure(mock_dispatch, monkeypatch, tmp_path):
+    """A failed benchmark cannot be logged as a successful evaluation."""
+    trainer = _build_minimal_trainer(mock_dispatch)
+    trainer.cfg.trainer.export_path = str(tmp_path)
+    trainer.sft_cfg.eval_command = ["benchmark"]
+    trainer.sft_cfg.eval_command_metrics_path = str(tmp_path / "metrics.json")
+    trainer.save_hf_model = MagicMock()
+    trainer.eval_dataloaders = [("evalset", trainer.build_eval_dataloader(_dummy_tokenized()))]
+    monkeypatch.setattr(
+        "skyrl.train.sft_trainer.subprocess.run",
+        MagicMock(side_effect=subprocess.CalledProcessError(1, ["benchmark"])),
+    )
+    with pytest.raises(subprocess.CalledProcessError):
+        trainer.run_eval()

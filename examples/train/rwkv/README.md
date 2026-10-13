@@ -375,13 +375,19 @@ MODEL_DIR="$MODEL_DIR" DATA_DIR="$DATA_DIR" NUM_GPUS=8 \
 The launcher trains one epoch with native FSDP and complete cross-chunk
 gradients (`rwkv_chunk_size=2048`, `wkv_mode=fp32io16`). Similar-length batches
 are shuffled using a checkpointable sampler; each source row is visited once.
-AdamW uses learning rate `1e-6`, cosine decay and 5% warmup based on the actual
-epoch step count. Every 50 steps it saves resumable checkpoints, exports HF
+AdamW uses peak learning rate `1e-6`, cosine decay to `1e-7`, and 5% warmup
+based on the actual epoch step count. The decay floor is controlled by
+`MIN_LR_RATE` (default `0.1`, a fraction of the peak learning rate); warmup
+still starts at zero. The native FSDP scheduler is `cosine_with_min_lr` with
+`optimizer_config.scheduler_specific_kwargs={min_lr_rate: 0.1}`. On resume,
+the restored optimizer uses its saved learning rate for the first update;
+the next scheduler advance applies the configured floor at the restored step.
+Every 50 steps it saves resumable checkpoints, exports HF
 weights and logs held-out SFT loss to W&B under `rwkv_direct_sft`. Periodic
 evaluation uses a fixed 512-row panel selected by UUID hash from the validation
 partition; the complete validation split remains in `DATA_DIR/validation`.
 SFT loss measures teacher-forced fit, rather than free-generation math accuracy.
-`NUM_GPUS`, `BATCH_SIZE`, `MICRO_BATCH_SIZE`, `CHUNK_SIZE`, `RUN_NAME` and
+`NUM_GPUS`, `BATCH_SIZE`, `MICRO_BATCH_SIZE`, `CHUNK_SIZE`, `LEARNING_RATE`, `MIN_LR_RATE`, `RUN_NAME` and
 `OUTPUT_ROOT` are environment overrides. Pass `resume_from=latest` to resume
 from the same run directory. `--limit 128` prepares a separate small smoke dataset.
 

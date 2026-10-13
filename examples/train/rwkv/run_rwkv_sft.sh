@@ -20,6 +20,7 @@ fi
 : "${MICRO_BATCH_SIZE:=1}"
 : "${CHUNK_SIZE:=2048}"
 : "${LEARNING_RATE:=1e-6}"
+: "${MIN_LR_RATE:=0.1}"
 : "${LOGGER:=wandb}"
 : "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-nemotron-cot-sft}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
@@ -58,7 +59,9 @@ uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" -m skyrl.trai
   fsdp_config.fsdp_size="$NUM_GPUS" fsdp_config.reshard_after_forward=false \
   fsdp_config.sync_gradients_each_microbatch=false \
   optimizer_config.lr="$LEARNING_RATE" optimizer_config.max_grad_norm=1.0 \
-  optimizer_config.scheduler=cosine optimizer_config.num_warmup_steps="$WARMUP_STEPS" \
+  optimizer_config.scheduler=cosine_with_min_lr \
+  "optimizer_config.scheduler_specific_kwargs={min_lr_rate: $MIN_LR_RATE}" \
+  optimizer_config.num_warmup_steps="$WARMUP_STEPS" \
   optimizer_config.offload_after_step=false \
   sampler=custom sampler_class_path=examples.train.rwkv.prepare_sft.LengthGroupedSampler \
   "sampler_kwargs={batch_size: $BATCH_SIZE, seed: 0}" seed=0 \

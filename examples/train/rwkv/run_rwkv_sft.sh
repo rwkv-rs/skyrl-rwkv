@@ -101,10 +101,17 @@ if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" == 1 ]]; then
   : "${EVAL_MAX_NUM_SEQS:=1024}"
   : "${EVAL_GPU_MEMORY_UTILIZATION:=0.65}"
   : "${EVAL_STEP:=$TOTAL_STEPS}"
+  : "${BENCHMARK_INTERVAL:=500}"
+  EVAL_ROOT="$OUTPUT_ROOT/evaluation/lighteval_avg16"
+  if (( EVAL_STEP % BENCHMARK_INTERVAL != 0 && EVAL_STEP != TOTAL_STEPS )); then
+    mkdir -p "$EVAL_ROOT/global_step_$EVAL_STEP/sft"
+    printf '{}\n' > "$EVAL_ROOT/global_step_$EVAL_STEP/sft/eval_metrics.json"
+    echo "Skipping benchmark at step $EVAL_STEP (interval=$BENCHMARK_INTERVAL)."
+    exit 0
+  fi
   SKYRL_PROJECT="$PWD"
   export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
   export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
-  EVAL_ROOT="$OUTPUT_ROOT/evaluation/lighteval_avg16"
   read -r -a EVAL_PHASES <<< "${EVAL_PHASES:-base sft}"
   if [[ -f "$EVAL_ROOT/base/completed.json" ]]; then
     EVAL_PHASES=(sft)

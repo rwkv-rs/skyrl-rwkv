@@ -223,6 +223,19 @@ class SFTConfig(BaseConfig):
     when an eval dataset is configured. ``0`` disables periodic eval."""
     eval_before_train: bool = False
     """If True, run a baseline eval pass before training begins (logged at step 0)."""
+    eval_command: Optional[List[str]] = None
+    """Run an external benchmark command after each eval loss pass.
+
+    Arguments may contain ``{global_step}`` and ``{export_path}``. The current
+    policy is exported first and training waits for the command to finish.
+    Unused CUDA allocator memory is released before starting the command.
+    """
+    eval_command_metrics_path: str = ""
+    """Read external benchmark metrics from this JSON file after eval_command.
+
+    Supports ``{global_step}`` and ``{export_path}``. Metrics are merged with
+    eval loss and logged at the same training step, under the ``eval/`` prefix.
+    """
     max_length: Optional[int] = None
     """Maximum length of tokenized sequences. If specified, all sequences will be truncated to this value
     By default, no truncation is performed"""
@@ -593,6 +606,8 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
         raise ValueError("eval_interval > 0 requires eval_datasets or eval_pretokenized_dataset_paths to be set")
     if cfg.eval_before_train and not has_eval_dataset:
         raise ValueError("eval_before_train=True requires eval_datasets or eval_pretokenized_dataset_paths to be set")
+    if cfg.eval_command and not cfg.eval_command_metrics_path:
+        raise ValueError("eval_command requires eval_command_metrics_path")
 
     #  checks for megatron
     if cfg.strategy == "megatron":

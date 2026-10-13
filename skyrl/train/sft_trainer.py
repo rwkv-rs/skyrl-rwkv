@@ -24,6 +24,7 @@ import functools
 import json
 import multiprocessing as mp
 import os
+import subprocess
 import tempfile
 from dataclasses import asdict
 from typing import Any, Optional
@@ -1622,6 +1623,17 @@ class SFTTrainer:
             metrics[f"{name}/loss"] = eval_loss
             total_eval_batches += num_eval_batches
             logger.info(f"Eval dataset '{name}': loss={eval_loss:.4f} over {num_eval_batches} batches")
+        if self.sft_cfg.eval_command:
+            export_path = os.path.join(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "policy")
+            if not os.path.isdir(export_path):
+                self.save_hf_model()
+            values = {"global_step": self.global_step, "export_path": export_path}
+            command = [argument.format(**values) for argument in self.sft_cfg.eval_command]
+            self.dispatch.empty_cache("policy")
+            with Timer("benchmark_eval"):
+                subprocess.run(command, check=True)
+            with io.open_file(self.sft_cfg.eval_command_metrics_path.format(**values)) as stream:
+                metrics.update(json.load(stream))
         return metrics, total_eval_batches
 
     def _run_eval_one(self, eval_dataloader: StatefulDataLoader) -> tuple[float, int]:

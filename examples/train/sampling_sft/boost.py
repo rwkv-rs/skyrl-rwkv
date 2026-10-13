@@ -33,7 +33,7 @@ def boost_record(p, row, args):
         int.from_bytes(hashlib.sha256(f"{args.seed}:{item['uuid']}".encode()).digest()[:4], "big") for item in rows
     ]
     start = time.monotonic()
-    result = proj_samp_vLLM(
+    results = proj_samp_vLLM(
         p,
         rows[0]["prompt"] if single else [item["prompt"] for item in rows],
         rows[0]["solution"] if single else [item["solution"] for item in rows],
@@ -44,18 +44,18 @@ def boost_record(p, row, args):
         skip_repetition=args.skip_repetition,
     )
     records = []
-    for row, result in zip(rows, [result] if single else result, strict=True):
-        prompt_ids = p.format_prompt(row["prompt"])
+    for item, result in zip(rows, [results] if single else results, strict=True):
+        prompt_ids = p.format_prompt(item["prompt"])
         response_ids = result["response_ids"]
         complete = result["finish_reason"] == "stop"
         records.append(
             {
-                "uuid": row["uuid"],
-                "domain": row.get("domain", ""),
-                "prompt": row["prompt"],
-                "solution": row["solution"],
-                "ground_truth": row.get("ground_truth"),
-                "question_id": row.get("question_id", row["uuid"]),
+                "uuid": item["uuid"],
+                "domain": item.get("domain", ""),
+                "prompt": item["prompt"],
+                "solution": item["solution"],
+                "ground_truth": item.get("ground_truth"),
+                "question_id": item.get("question_id", item["uuid"]),
                 "gen": p.tokenizer.decode(response_ids, skip_special_tokens=True),
                 # Keep truncated records for audit/resume, but make them non-trainable.
                 "input_ids": prompt_ids + response_ids if complete else [],
@@ -74,7 +74,7 @@ def run(args):
     model_config = AutoConfig.from_pretrained(args.model, revision=args.revision, trust_remote_code=True)
     is_rwkv = model_config.model_type == "rwkv"
     if args.repetition_penalty is None:
-        args.repetition_penalty = 1.0 if is_rwkv else 1.1
+        args.repetition_penalty = 1.0 if is_rwkv and args.sampling_preset == "model" else 1.1
     os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     template = {}
     sampling_params = {
@@ -83,21 +83,24 @@ def run(args):
         "top_k": -1,
         "repetition_penalty": args.repetition_penalty,
     }
+    if args.sampling_preset == "paper":
+        sampling_params.update({"presence_penalty": 0.0, "frequency_penalty": 0.0})
     if is_rwkv:
-        generation_config = GenerationConfig.from_pretrained(args.model, revision=args.revision).to_dict()
-        sampling_params.update(
-            {
-                key: generation_config[key]
-                for key in (
-                    "temperature",
-                    "top_p",
-                    "top_k",
-                    "presence_penalty",
-                    "frequency_penalty",
-                    "penalty_decay",
-                )
-            }
-        )
+        if args.sampling_preset == "model":
+            generation_config = GenerationConfig.from_pretrained(args.model, revision=args.revision).to_dict()
+            sampling_params.update(
+                {
+                    key: generation_config[key]
+                    for key in (
+                        "temperature",
+                        "top_p",
+                        "top_k",
+                        "presence_penalty",
+                        "frequency_penalty",
+                        "penalty_decay",
+                    )
+                }
+            )
         cache = Path.home() / ".cache/skyrl-rwkv"
         os.environ.setdefault("XDG_CACHE_HOME", str(cache))
         os.environ.setdefault("TORCH_EXTENSIONS_DIR", str(cache / "torch_extensions"))
@@ -134,6 +137,8 @@ def run(args):
     }
     if is_rwkv:
         config["sampling_params"] = sampling_params
+    if args.sampling_preset == "paper":
+        config["sampling_preset"] = args.sampling_preset
     with open_output(
         args.output,
         config,
@@ -260,9 +265,15 @@ def parse_args(argv=None):
         help="Greedy proposals per block; 0 gives the rewrite baseline",
     )
     parser.add_argument(
+        "--sampling-preset",
+        choices=["model", "paper"],
+        default="model",
+        help="model: RWKV generation_config defaults; paper: temperature 0.6, top-p 1, repetition penalty 1.1",
+    )
+    parser.add_argument(
         "--repetition-penalty",
         type=float,
-        help="Default: 1.0 for RWKV Rapid-Sampling, otherwise 1.1",
+        help="Default: 1.0 for RWKV model preset, otherwise 1.1",
     )
     parser.add_argument("--max-model-len", type=int, default=32768)
     parser.add_argument("--tensor-parallel-size", type=int, default=1)

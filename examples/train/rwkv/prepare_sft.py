@@ -99,6 +99,8 @@ class LengthGroupedSampler(Sampler):
 def prepare_shard(args):
     """Stream one source shard to bounded Parquet row groups."""
     source, staging, model, seed, fraction, limit = args
+    pa.set_cpu_count(1)
+    pa.set_io_thread_count(1)
     tokenizer = get_tokenizer(model)
     schema = pa.schema(
         [

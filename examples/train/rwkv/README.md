@@ -367,7 +367,8 @@ uv run --isolated --no-config --no-project .venv/bin/python \
   > /tmp/results_direct_sft_prepare.log 2>&1
 
 MODEL_DIR="$MODEL_DIR" DATA_DIR="$DATA_DIR" NUM_GPUS=8 \
-  bash examples/train/rwkv/run_rwkv_sft.sh \
+  BATCH_SIZE=56 MICRO_BATCH_SIZE=7 NCCL_SHM_DISABLE=0 \
+  bash examples/train/rwkv/run_rwkv_sft.sh fsdp_config.fsdp_size=1 \
   > /tmp/results_direct_sft.log 2>&1
 ```
 
@@ -383,3 +384,32 @@ SFT loss measures teacher-forced fit, rather than free-generation math accuracy.
 `NUM_GPUS`, `BATCH_SIZE`, `MICRO_BATCH_SIZE`, `CHUNK_SIZE`, `RUN_NAME` and
 `OUTPUT_ROOT` are environment overrides. Pass `resume_from=latest` to resume
 from the same run directory. `--limit 128` prepares a separate small smoke dataset.
+
+On eight PRO6000 GPUs, `fsdp_config.fsdp_size=1` uses native FSDP's replicated
+data-parallel mesh, keeping model and Adam state on each GPU. This improves
+throughput for the 1.5B model while complete 140k-token CoT fits with microbatch
+7 and chunk 2048. Keep global batch 56 when continuing the seven-GPU run so
+the sampler order, epoch length (4,847 steps), and scheduler stay consistent.
+The checkpoint loader restores weights and Adam state across GPU counts using
+PyTorch's distributed state-dict APIs. GPU-count changes alter rank-local RNG
+streams and floating-point reduction order.
+
+A same-data benchmark on 56 rows of 12k–14k-token traces, with unchanged
+weights and learning rate zero, produced the following means over two steps
+after excluding initialization:
+
+| GPUs | FSDP size | Microbatch | NCCL SHM | Seconds/step | Tokens/s |
+| --- | --- | --- | --- | --- | --- |
+| 7 | 7 | 4 | disabled | 23.54 | 30,321 |
+| 8 | 8 | 7 | enabled | 14.16 | 50,409 |
+| 8 | 1 | 7 | enabled | 13.35 | 53,440 |
+
+Set `EVAL_DATA_DIR` to a prepared directory containing `math500.parquet` and
+`gsm8k.parquet` to run native `main_generate` after successful SFT completion.
+Each row needs `prompt`, `data_source`, and `reward_spec` with `ground_truth`
+and `strict=true`. The original model and final HF export each run all 500
+MATH-500 and 1,319 GSM8K questions with one sample per question, an 8,192-token
+completion budget, and the official RWKV eval decoding parameters. The native
+strict-CoT grader records answer correctness, format, EOS and truncation
+separately. W&B metrics use project `rwkv_direct_sft_eval`; full trajectories
+are saved under `OUTPUT_ROOT/evaluation/{base,sft}/dumped_evals/eval_only`.

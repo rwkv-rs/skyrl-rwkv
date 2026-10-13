@@ -137,7 +137,7 @@ if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" == 1 ]]; then
     for ((gpu=FIRST_GPU; gpu<FIRST_GPU+GPUS_PER_PHASE; gpu++)); do
       port=$((19100 + gpu))
       WORKER_URLS+=("http://127.0.0.1:$port")
-      setsid env CUDA_VISIBLE_DEVICES="$gpu" \
+      setsid env CUDA_VISIBLE_DEVICES="$gpu" VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
         uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
         -m vllm.entrypoints.openai.api_server \
         --model "$EVAL_MODEL" --served-model-name "$EVAL_NAME" \
@@ -151,21 +151,28 @@ if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" == 1 ]]; then
     done
     setsid uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
       -m vllm_router.launch_router --host 127.0.0.1 --port "$ROUTER_PORT" \
+      --prometheus-port "$((19300 + phase_index))" \
       --worker-urls "${WORKER_URLS[@]}" \
       > "$PHASE_ROOT/router.log" 2>&1 &
     EVAL_PIDS+=("$!")
     phase_index=$((phase_index + 1))
   done
 
-  uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" - "${#EVAL_PHASES[@]}" <<'PY'
+  uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+    - "${#EVAL_PHASES[@]}" "${EVAL_PIDS[@]}" <<'PY'
 import time
 import sys
+from pathlib import Path
 import httpx
 
 pending = [19100 + gpu for gpu in range(8)] + [19200 + i for i in range(int(sys.argv[1]))]
 deadline = time.monotonic() + 900
 with httpx.Client(trust_env=False) as client:
     while pending:
+        for pid in sys.argv[2:]:
+            status = Path(f"/proc/{pid}/stat")
+            if not status.exists() or status.read_text().split()[2] == "Z":
+                raise RuntimeError(f"Inference process {pid} exited during startup; see inference/router logs")
         if time.monotonic() > deadline:
             raise TimeoutError(f"Inference startup timed out: {pending}")
         for port in pending[:]:
@@ -251,7 +258,7 @@ for selector in ["aime24", "aime25", "aimo_progress_prize_1", "math_500"]:
         "uv", "run", "--isolated", "--no-config", "--no-project",
         str(Path(skyrl_project) / ".venv/bin/python"), "-", run_path, phase,
         selector, str(root / selector), model_name, step,
-    ], check=True, text=True, input='''
+    ], check=True, text=True, cwd=skyrl_project, input='''
 import json, sys
 from pathlib import Path
 import wandb

@@ -167,6 +167,20 @@ def test_trainer_config_rejects_invalid_vocab_entropy_chunking(field_name, value
         TrainerConfig(**{field_name: value})
 
 
+@pytest.mark.parametrize("shm_disable", [None, "0", "1"])
+def test_runtime_env_preserves_explicit_shm_transport_on_non_p2p_hardware(monkeypatch, shm_disable):
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: False)
+    if shm_disable is None:
+        monkeypatch.delenv("NCCL_SHM_DISABLE", raising=False)
+    else:
+        monkeypatch.setenv("NCCL_SHM_DISABLE", shm_disable)
+
+    env_vars = prepare_runtime_environment(example_dummy_config())
+
+    assert env_vars["NCCL_P2P_DISABLE"] == "1"
+    assert env_vars["NCCL_SHM_DISABLE"] == (shm_disable or "1")
+
+
 def test_runtime_env_forwards_te_block_scale_mode(monkeypatch):
     monkeypatch.setenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", "1")
     monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)

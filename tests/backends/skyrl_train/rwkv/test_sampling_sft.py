@@ -177,12 +177,10 @@ def test_resume_repairs_only_partial_tail_and_refuses_setting_changes(tmp_path):
         assert completed == {"a"}
         data.append_jsonl(handle, {"uuid": "b"})
     assert [row["uuid"] for row in data.load_rows(str(path))] == ["a", "b"]
-    with pytest.raises(FileExistsError):
-        with data.open_output(path, config, False):
-            pass
-    with pytest.raises(ValueError, match="configuration differs"):
-        with data.open_output(path, {"model": "changed"}, True):
-            pass
+    with pytest.raises(FileExistsError), data.open_output(path, config, False):
+        pass
+    with pytest.raises(ValueError, match="configuration differs"), data.open_output(path, {"model": "changed"}, True):
+        pass
 
 
 def test_resume_execution_changes_preserve_records_and_log_previous_config(tmp_path):
@@ -206,9 +204,11 @@ def test_resume_execution_changes_preserve_records_and_log_previous_config(tmp_p
         pass
     assert len(history_path.read_text().splitlines()) == 1
     for key, value in (("seed", 1), ("model", "other")):
-        with pytest.raises(ValueError, match="configuration differs"):
-            with data.open_output(path, {**current, key: value}, True, execution_keys=execution_keys):
-                pass
+        with (
+            pytest.raises(ValueError, match="configuration differs"),
+            data.open_output(path, {**current, key: value}, True, execution_keys=execution_keys),
+        ):
+            pass
     assert path.read_bytes() == before
     assert json.loads(path.with_suffix(".jsonl.meta.json").read_text()) == current
 
@@ -498,7 +498,7 @@ def test_batch_sampling_preserves_independent_rng_and_greedy_state(monkeypatch):
 
     monkeypatch.setattr(sampling, "proposal_vLLM", propose)
     monkeypatch.setattr(sampling, "get_logprobs_vLLM", score)
-    settings = dict(max_new_tokens=12, block_num=3, mcmc_steps=3)
+    settings = {"max_new_tokens": 12, "block_num": 3, "mcmc_steps": 3}
     separate = [sampling.proj_samp_vLLM(p, q, "s", seed=seed, **settings) for q, seed in zip(["a", "b"], [7, 9])]
     together = sampling.proj_samp_vLLM(p, ["a", "b"], ["s", "s"], seed=[7, 9], **settings)
     assert together == separate
@@ -607,7 +607,8 @@ def test_boost_cli_rejects_invalid_sampling_settings(argv):
         boost.parse_args(["--input", "unused", "--output", "unused", "--model", "rwkv7-test", *argv])
 
 
-def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, monkeypatch):
+@pytest.mark.parametrize("sampling_preset", ["model", "paper"])
+def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, monkeypatch, sampling_preset):
     import transformers
 
     source = tmp_path / "expert.jsonl"
@@ -686,6 +687,8 @@ def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, mon
         "rwkv7-test",
         "--partition",
         "all",
+        "--sampling-preset",
+        sampling_preset,
     ]
     boost.run(boost.parse_args(argv))
     boost.run(boost.parse_args(argv + ["--resume"]))
@@ -699,27 +702,49 @@ def test_rwkv_boost_entrypoint_backend_options_resume_and_manifest(tmp_path, mon
     assert options[0]["logprobs_mode"] == "raw_logprobs"
     assert options[0]["generation_config"] == "vllm"
     metadata = json.loads(output.with_suffix(".jsonl.meta.json").read_text())
-    assert metadata["repetition_penalty"] == 1.0
+    assert metadata["repetition_penalty"] == (1.0 if sampling_preset == "model" else 1.1)
     assert (
         metadata["sampling_params"]
         == proposals[0]
-        == {
-            "temperature": 0.96,
-            "top_p": 0.76,
-            "top_k": 32,
-            "repetition_penalty": 1.0,
-            "presence_penalty": 1.0,
-            "frequency_penalty": 0.1,
-            "penalty_decay": 0.988,
-        }
+        == (
+            {
+                "temperature": 0.96,
+                "top_p": 0.76,
+                "top_k": 32,
+                "repetition_penalty": 1.0,
+                "presence_penalty": 1.0,
+                "frequency_penalty": 0.1,
+                "penalty_decay": 0.988,
+            }
+            if sampling_preset == "model"
+            else {
+                "temperature": 0.6,
+                "top_p": 1.0,
+                "top_k": -1,
+                "repetition_penalty": 1.1,
+                "presence_penalty": 0.0,
+                "frequency_penalty": 0.0,
+            }
+        )
     )
     assert tokenizer.kwargs["rwkv_prompt_template"] == "bot"
     with pytest.raises(ValueError, match="configuration differs"):
         boost.run(boost.parse_args(argv + ["--resume", "--seed", "1"]))
-    generation_config.top_p = 0.8
     with pytest.raises(ValueError, match="configuration differs"):
-        boost.run(boost.parse_args(argv + ["--resume"]))
+        boost.run(
+            boost.parse_args(
+                argv + ["--resume", "--sampling-preset", "paper" if sampling_preset == "model" else "model"]
+            )
+        )
     assert len(options) == 2  # Metadata mismatch fails before loading another GPU model.
+    generation_config.top_p = 0.8
+    if sampling_preset == "model":
+        with pytest.raises(ValueError, match="configuration differs"):
+            boost.run(boost.parse_args(argv + ["--resume"]))
+        assert len(options) == 2
+    else:
+        boost.run(boost.parse_args(argv + ["--resume"]))
+        assert len(options) == 3  # Paper decoding is independent of generation_config changes.
 
 
 def test_rwkv_sft_configuration_uses_native_pretokenized_fsdp():

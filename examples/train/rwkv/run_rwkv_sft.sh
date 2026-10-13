@@ -106,7 +106,7 @@ if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" == 1 ]]; then
   export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
   EVAL_ROOT="$OUTPUT_ROOT/evaluation/lighteval_avg16"
   read -r -a EVAL_PHASES <<< "${EVAL_PHASES:-base sft}"
-  if [[ -f "$EVAL_ROOT/base/math_500/scores.json" ]]; then
+  if [[ -f "$EVAL_ROOT/base/completed.json" ]]; then
     EVAL_PHASES=(sft)
   fi
   GPUS_PER_PHASE=$((NUM_GPUS / ${#EVAL_PHASES[@]}))
@@ -275,6 +275,7 @@ artifact.add_dir(directory)
 run.log_artifact(artifact).wait()
 run.finish()
 ''')
+(root / "completed.json").write_text(json.dumps({"global_step": int(step), "model_name": model_name}) + "\n")
 PY
     ) > "$PHASE_ROOT/producer.log" 2>&1 &
     PRODUCER_PIDS+=("$!")

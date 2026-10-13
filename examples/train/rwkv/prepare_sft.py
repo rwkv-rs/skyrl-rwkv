@@ -28,7 +28,6 @@ import pyarrow.parquet as pq
 from torch.utils.data import Sampler
 
 from examples.train.sampling_sft.data import expert_rows, validation_question
-from skyrl.train.sft_trainer import tokenize_chat_example
 from skyrl.utils.tok import get_tokenizer
 
 
@@ -43,20 +42,21 @@ def convert_example(row, tokenizer):
             "content": f"<think>{row['reasoning_content']}\n</think>\n{row['content']}",
         },
     ]
-    tokenized = tokenize_chat_example(
-        {"messages": messages},
-        tokenizer,
-        max_length=None,
+    template_kwargs = dict(
+        tokenize=False,
         rwkv_prompt_template="bot",
         rwkv_generation_prompt="open_think",
     )
-    input_ids = tokenized["input_ids"] + [tokenizer.eos_token_id]
-    prompt_length = len(tokenized["input_ids"]) - tokenized["num_actions"]
+    prompt = tokenizer.apply_chat_template(messages[:1], add_generation_prompt=True, **template_kwargs)
+    full_text = tokenizer.apply_chat_template(messages, add_generation_prompt=False, **template_kwargs)
+    # Replay rollout's exact prompt IDs; encoding across this boundary merges tokens.
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    response_ids = tokenizer.encode(full_text[len(prompt) :], add_special_tokens=False) + [tokenizer.eos_token_id]
     return {
         "uuid": row["uuid"],
         "question_id": row["question_id"],
-        "input_ids": input_ids,
-        "loss_mask": [0] * prompt_length + tokenized["loss_mask"] + [1],
+        "input_ids": prompt_ids + response_ids,
+        "loss_mask": [0] * len(prompt_ids) + [1] * len(response_ids),
     }
 
 

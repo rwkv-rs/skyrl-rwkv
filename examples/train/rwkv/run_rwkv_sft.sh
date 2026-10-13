@@ -24,6 +24,8 @@ fi
 : "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-nemotron-cot-sft}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
 export RAY_ADDRESS=local
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+export SKYRL_PYTHONPATH_EXPORT=1
 export XDG_CACHE_HOME="$HOME/.cache/skyrl-rwkv"
 export TORCH_EXTENSIONS_DIR="$XDG_CACHE_HOME/torch_extensions"
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
@@ -31,7 +33,7 @@ export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 mkdir -p "$OUTPUT_ROOT"
 exec > >(tee -a "$OUTPUT_ROOT/train.log") 2>&1
 
-TOTAL_STEPS=$(uv run --isolated --no-config --no-project .venv/bin/python - "$DATA_DIR" "$BATCH_SIZE" <<'PY'
+TOTAL_STEPS=$(uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" - "$DATA_DIR" "$BATCH_SIZE" <<'PY'
 import json
 import math
 import sys
@@ -43,7 +45,7 @@ PY
 )
 WARMUP_STEPS=$((TOTAL_STEPS / 20))
 
-uv run --isolated --no-config --no-project .venv/bin/python -m skyrl.train.main_sft \
+uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" -m skyrl.train.main_sft \
   strategy=fsdp model.path="$MODEL_DIR" \
   "pretokenized_dataset_paths=['$DATA_DIR/train']" \
   "eval_pretokenized_dataset_paths=['$DATA_DIR/eval']" \

@@ -49,7 +49,7 @@ def convert_example(row, tokenizer):
     )
     prompt = tokenizer.apply_chat_template(messages[:1], add_generation_prompt=True, **template_kwargs)
     full_text = tokenizer.apply_chat_template(messages, add_generation_prompt=False, **template_kwargs)
-    # Replay rollout's exact prompt IDs; encoding across this boundary merges tokens.
+    # Replay rollout's prompt IDs and encode the supervised suffix separately.
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     response_ids = tokenizer.encode(full_text[len(prompt) :], add_special_tokens=False) + [tokenizer.eos_token_id]
     return {

@@ -1,7 +1,7 @@
 """Prepare complete Nemotron CoT for native RWKV FSDP SFT.
 
-Follows prepare_apigen_mt.py's messages conversion, sampling_sft/data.py's
-question split, and curriculum_sampler.py's checkpointable sampler.
+Follows prepare_apigen_mt.py's messages conversion and
+curriculum_sampler.py's checkpointable sampler.
 
 Usage from the repository root::
 
@@ -27,8 +27,31 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from torch.utils.data import Sampler
 
-from examples.train.sampling_sft.data import expert_rows, validation_question
 from skyrl.utils.tok import get_tokenizer
+
+
+def expert_rows(source, *, subset="cot"):
+    """Stream complete original Nemotron expert traces from one Parquet shard."""
+    for batch in pq.ParquetFile(source).iter_batches(batch_size=64):
+        for row in batch.to_pylist():
+            if row.get("subset") != subset:
+                continue
+            user, assistant = row["messages"]
+            if user["role"] != "user" or assistant["role"] != "assistant":
+                raise ValueError(f"Expected a user/assistant expert trace for {row['uuid']}")
+            yield {
+                "uuid": row["uuid"],
+                "question_id": hashlib.sha256(row["problem"].encode()).hexdigest(),
+                "prompt": user["content"],
+                "reasoning_content": assistant.get("reasoning_content") or "",
+                "content": assistant.get("content") or "",
+            }
+
+
+def validation_question(uuid, seed, fraction):
+    """Keep every trajectory of a question in the same held-out partition."""
+    digest = hashlib.sha256(f"{seed}:{uuid}".encode()).digest()
+    return int.from_bytes(digest, "big") / 2**256 < fraction
 
 
 def convert_example(row, tokenizer):

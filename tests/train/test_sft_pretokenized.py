@@ -17,6 +17,38 @@ from skyrl.train.dataset.pretokenized import load_from_pretokenized
 from skyrl.train.sft_trainer import SFTTrainer, collate_sft_batch
 
 
+def test_direct_nemotron_sft_preserves_original_cot_and_question_split(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from examples.train.rwkv.prepare_sft import expert_rows, validation_question
+
+    reasoning = "Original expert reasoning\n" * 10000
+    source = [
+        {
+            "uuid": uuid,
+            "subset": "cot",
+            "problem": "2+2?",
+            "messages": [
+                {"role": "user", "content": "2+2?\nUse boxed answer."},
+                {"role": "assistant", "reasoning_content": reasoning, "content": "\\boxed{4}"},
+            ],
+        }
+        for uuid in ("trace-a", "trace-b")
+    ]
+    path = tmp_path / "nemotron.parquet"
+    pq.write_table(pa.Table.from_pylist(source + [{**source[0], "subset": "tir"}]), path)
+    traces = list(expert_rows(path))
+    assert [trace["uuid"] for trace in traces] == ["trace-a", "trace-b"]
+    assert traces[0]["reasoning_content"] == reasoning
+    assert traces[0]["content"] == "\\boxed{4}"
+    assert traces[0]["prompt"] == source[0]["messages"][0]["content"]
+    assert traces[0]["question_id"] == traces[1]["question_id"]
+    assert validation_question(traces[0]["question_id"], 0, 0.05) == validation_question(
+        traces[1]["question_id"], 0, 0.05
+    )
+
+
 def _rows():
     """Rows in the pretokenized input schema: input_ids + full-sequence loss_mask."""
     return [

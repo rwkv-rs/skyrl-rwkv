@@ -346,3 +346,40 @@ JSONL dumps retain every step.
 Sample formatting remains bounded by `trainer.num_logger_train_samples` (20 in the
 FlashREINFORCE launcher). Detailed rollout JSONL dumps, 50-step evaluation, checkpoints,
 and HF exports are independent of the table writer.
+
+## Direct Nemotron CoT SFT
+
+Use `prepare_sft.py` to train directly on the original Nemotron expert traces.
+It preserves `reasoning_content` and the final `content` in the RWKV Bot
+`<think>...</think>` format, supervises the response plus `✿` and EOS, and
+assigns every trajectory of the same original problem to one split. The seed-0
+95%/5% split contains 271,385 training and 14,131 validation trajectories in
+the local Nemotron-SFT-Math-v4 snapshot. No sequence truncation is applied.
+
+```bash
+MODEL_DIR="$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600"
+DATA_DIR="$HOME/data/rwkv-direct-sft"
+
+uv run --isolated --no-config --no-project .venv/bin/python \
+  -m examples.train.rwkv.prepare_sft \
+  --input "$HOME/Datasets/Nemotron-SFT-Math-v4" \
+  --model "$MODEL_DIR" --output "$DATA_DIR" --num-workers 8 \
+  > /tmp/results_direct_sft_prepare.log 2>&1
+
+MODEL_DIR="$MODEL_DIR" DATA_DIR="$DATA_DIR" NUM_GPUS=8 \
+  bash examples/train/rwkv/run_rwkv_sft.sh \
+  > /tmp/results_direct_sft.log 2>&1
+```
+
+The launcher trains one epoch with native FSDP and complete cross-chunk
+gradients (`rwkv_chunk_size=2048`, `wkv_mode=fp32io16`). Similar-length batches
+are shuffled using a checkpointable sampler; each source row is visited once.
+AdamW uses learning rate `1e-6`, cosine decay and 5% warmup based on the actual
+epoch step count. Every 50 steps it saves resumable checkpoints, exports HF
+weights and logs held-out SFT loss to W&B under `rwkv_direct_sft`. Periodic
+evaluation uses a fixed 512-row panel selected by UUID hash from the validation
+partition; the complete validation split remains in `DATA_DIR/validation`.
+SFT loss measures teacher-forced fit, rather than free-generation math accuracy.
+`NUM_GPUS`, `BATCH_SIZE`, `MICRO_BATCH_SIZE`, `CHUNK_SIZE`, `RUN_NAME` and
+`OUTPUT_ROOT` are environment overrides. Pass `resume_from=latest` to resume
+from the same run directory. `--limit 128` prepares a separate small smoke dataset.

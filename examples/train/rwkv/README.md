@@ -410,12 +410,22 @@ after excluding initialization:
 | 8 | 8 | 7 | enabled | 14.16 | 50,409 |
 | 8 | 1 | 7 | enabled | 13.35 | 53,440 |
 
-Set `EVAL_DATA_DIR` to a prepared directory containing `math500.parquet` and
-`gsm8k.parquet` to run native `main_generate` after successful SFT completion.
-Each row needs `prompt`, `data_source`, and `reward_spec` with `ground_truth`
-and `strict=true`. The original model and final HF export each run all 500
-MATH-500 and 1,319 GSM8K questions with one sample per question, an 8,192-token
-completion budget, and the official RWKV eval decoding parameters. The native
-strict-CoT grader records answer correctness, format, EOS and truncation
-separately. W&B metrics use project `rwkv_direct_sft_eval`; full trajectories
-are saved under `OUTPUT_ROOT/evaluation/{base,sft}/dumped_evals/eval_only`.
+After the complete epoch, evaluate the original weights and the final HF export
+with `rwkv-rs/lighteval-rwkv` on the full `aime24`, `aime25`,
+`aimo_progress_prize_1` and `math_500` tasks. Use exactly 16 generated responses
+per question and report avg@16: mean correctness across the 16 responses,
+then across questions. Configure the producer explicitly; its current default
+sampling policy does not guarantee 16 responses for these tasks.
+
+Use CoT with the `bot` template and `open_think`, a 24,576-token completion
+budget, temperature 0.96, top-p 0.76, top-k 32, presence penalty 1.0,
+frequency penalty 0.1 and penalty decay 0.988. Save per-rollout results,
+question and completion counts, and truncation rates alongside aggregate
+scores. Invoke the existing producer checkout with its dedicated environment;
+SkyRL owns the final export and inference service. Set `LIGHTEVAL_PROJECT` to
+the producer checkout and `WANDB_RUN_PATH` to `entity/project/run_id` to queue
+this evaluation after training. `EVAL_ONLY=1` runs only the evaluation phase.
+The base and SFT models each use four independent one-GPU inference replicas
+and run concurrently. Scores are copied to the training run summary; separate
+evaluation runs in the same W&B project store curves and full result artifacts.
+This workflow only uploads to W&B.

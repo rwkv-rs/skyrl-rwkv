@@ -46,62 +46,202 @@ PY
 )
 WARMUP_STEPS=$((TOTAL_STEPS / 20))
 
-uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" -m skyrl.train.main_sft \
-  strategy=fsdp model.path="$MODEL_DIR" \
-  "pretokenized_dataset_paths=['$DATA_DIR/train']" \
-  "eval_pretokenized_dataset_paths=['$DATA_DIR/eval']" \
-  'eval_dataset_names=[nemotron_cot]' \
-  max_length=null remove_microbatch_padding=false use_sequence_packing=false \
-  rwkv_chunk_size="$CHUNK_SIZE" 'model_config_kwargs={wkv_mode: fp32io16}' \
-  num_epochs=1 max_training_steps="$TOTAL_STEPS" \
-  batch_size="$BATCH_SIZE" micro_train_batch_size_per_gpu="$MICRO_BATCH_SIZE" \
-  placement.num_nodes=1 placement.num_gpus_per_node="$NUM_GPUS" \
-  fsdp_config.fsdp_size="$NUM_GPUS" fsdp_config.reshard_after_forward=false \
-  fsdp_config.sync_gradients_each_microbatch=false \
-  optimizer_config.lr="$LEARNING_RATE" optimizer_config.max_grad_norm=1.0 \
-  optimizer_config.scheduler=cosine_with_min_lr \
-  "optimizer_config.scheduler_specific_kwargs={min_lr_rate: $MIN_LR_RATE}" \
-  optimizer_config.num_warmup_steps="$WARMUP_STEPS" \
-  optimizer_config.offload_after_step=false \
-  sampler=custom sampler_class_path=examples.train.rwkv.prepare_sft.LengthGroupedSampler \
-  "sampler_kwargs={batch_size: $BATCH_SIZE, seed: 0}" seed=0 \
-  dataloader_num_workers=2 dataloader_persistent_workers=true num_workers=0 \
-  ckpt_path="$OUTPUT_ROOT/checkpoints" export_path="$OUTPUT_ROOT/hf_exports" \
-  ckpt_interval=50 eval_interval=50 hf_save_interval=50 \
-  eval_before_train=true max_ckpts_to_keep=2 \
-  logger="$LOGGER" project_name=rwkv_direct_sft run_name="$RUN_NAME" \
-  "$@"
+if [[ "${EVAL_ONLY:-0}" != 1 ]]; then
+  uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" -m skyrl.train.main_sft \
+    strategy=fsdp model.path="$MODEL_DIR" \
+    "pretokenized_dataset_paths=['$DATA_DIR/train']" \
+    "eval_pretokenized_dataset_paths=['$DATA_DIR/eval']" \
+    'eval_dataset_names=[nemotron_cot]' \
+    max_length=null remove_microbatch_padding=false use_sequence_packing=false \
+    rwkv_chunk_size="$CHUNK_SIZE" 'model_config_kwargs={wkv_mode: fp32io16}' \
+    num_epochs=1 max_training_steps="$TOTAL_STEPS" \
+    batch_size="$BATCH_SIZE" micro_train_batch_size_per_gpu="$MICRO_BATCH_SIZE" \
+    placement.num_nodes=1 placement.num_gpus_per_node="$NUM_GPUS" \
+    fsdp_config.fsdp_size="$NUM_GPUS" fsdp_config.reshard_after_forward=false \
+    fsdp_config.sync_gradients_each_microbatch=false \
+    optimizer_config.lr="$LEARNING_RATE" optimizer_config.max_grad_norm=1.0 \
+    optimizer_config.scheduler=cosine_with_min_lr \
+    "optimizer_config.scheduler_specific_kwargs={min_lr_rate: $MIN_LR_RATE}" \
+    optimizer_config.num_warmup_steps="$WARMUP_STEPS" \
+    optimizer_config.offload_after_step=false \
+    sampler=custom sampler_class_path=examples.train.rwkv.prepare_sft.LengthGroupedSampler \
+    "sampler_kwargs={batch_size: $BATCH_SIZE, seed: 0}" seed=0 \
+    dataloader_num_workers=2 dataloader_persistent_workers=true num_workers=0 \
+    ckpt_path="$OUTPUT_ROOT/checkpoints" export_path="$OUTPUT_ROOT/hf_exports" \
+    ckpt_interval=50 eval_interval=50 hf_save_interval=50 \
+    eval_before_train=true max_ckpts_to_keep=2 \
+    logger="$LOGGER" project_name=rwkv_direct_sft run_name="$RUN_NAME" \
+    "$@"
+fi
 
-# An optional prepared benchmark directory queues full eval after the epoch.
-if [[ -n "${EVAL_DATA_DIR:-}" ]]; then
-  unset WANDB_RUN_ID WANDB_RESUME
+# Invoke the existing LightEval producer without changing its checkout.
+if [[ -n "${LIGHTEVAL_PROJECT:-}" ]]; then
+  : "${WANDB_RUN_PATH:?Set the training run path: entity/project/run_id}"
+  : "${EVAL_MAX_NUM_SEQS:=256}"
+  SKYRL_PROJECT="$PWD"
+  export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+  export NO_PROXY="127.0.0.1,localhost${NO_PROXY:+,$NO_PROXY}"
+  EVAL_ROOT="$OUTPUT_ROOT/evaluation/lighteval_avg16"
+  EVAL_PIDS=()
+  cleanup_eval() {
+    for pid in "${EVAL_PIDS[@]}"; do
+      kill -- "-$pid" 2>/dev/null || true
+    done
+    wait || true
+  }
+  trap cleanup_eval EXIT
+  trap 'exit 130' INT TERM
+
   for phase in base sft; do
+    mkdir -p "$EVAL_ROOT/$phase"
     EVAL_MODEL="$MODEL_DIR"
+    EVAL_NAME="$(basename "$MODEL_DIR")"
+    FIRST_GPU=0
+    ROUTER_PORT=19200
     if [[ "$phase" == sft ]]; then
       EVAL_MODEL="$OUTPUT_ROOT/hf_exports/global_step_$TOTAL_STEPS/policy"
+      EVAL_NAME="$EVAL_NAME-nemotron-cot-sft-step$TOTAL_STEPS"
+      FIRST_GPU=4
+      ROUTER_PORT=19201
     fi
-    uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
-      -m skyrl.train.entrypoints.main_generate \
-      "data.val_data=['$EVAL_DATA_DIR/math500.parquet','$EVAL_DATA_DIR/gsm8k.parquet']" \
-      trainer.policy.model.path="$EVAL_MODEL" \
-      'trainer.policy.model_config_kwargs={wkv_mode: fp32io16}' \
-      trainer.strategy=fsdp trainer.flash_attn=false trainer.remove_microbatch_padding=false \
-      trainer.placement.colocate_all=false trainer.placement.policy_num_gpus_per_node="$NUM_GPUS" \
-      trainer.eval_interval=1 trainer.eval_batch_size=256 trainer.max_prompt_length=4096 \
-      trainer.dump_eval_results=true trainer.logger="$LOGGER" \
-      trainer.project_name=rwkv_direct_sft_eval trainer.run_name="$RUN_NAME-$phase-full-eval" \
-      trainer.export_path="$OUTPUT_ROOT/evaluation/$phase" \
-      generator.inference_engine.backend=vllm generator.inference_engine.model_dtype=float16 \
-      generator.inference_engine.run_engines_locally=true \
-      generator.inference_engine.num_engines="$NUM_GPUS" generator.inference_engine.tensor_parallel_size=1 \
-      generator.inference_engine.gpu_memory_utilization=0.8 \
-      generator.inference_engine.max_num_seqs=256 generator.inference_engine.max_num_batched_tokens=32768 \
-      generator.batched=false generator.eval_n_samples_per_prompt=1 \
-      'generator.chat_template_kwargs={rwkv_prompt_template: bot, rwkv_generation_prompt: open_think}' \
-      generator.eval_sampling_params.max_generate_length=8192 \
-      generator.eval_sampling_params.temperature=0.96 generator.eval_sampling_params.top_p=0.76 \
-      generator.eval_sampling_params.top_k=32 \
-      'generator.eval_sampling_params.additional_kwargs={presence_penalty: 1.0, frequency_penalty: 0.1, penalty_decay: 0.988}' \
-      environment.env_class=gsm8k
+    WORKER_URLS=()
+    for ((gpu=FIRST_GPU; gpu<FIRST_GPU+4; gpu++)); do
+      port=$((19100 + gpu))
+      WORKER_URLS+=("http://127.0.0.1:$port")
+      setsid env CUDA_VISIBLE_DEVICES="$gpu" \
+        uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+        -m vllm.entrypoints.openai.api_server \
+        --model "$EVAL_MODEL" --served-model-name "$EVAL_NAME" \
+        --host 127.0.0.1 --port "$port" --dtype float16 \
+        --max-model-len 32768 --max-num-seqs "$EVAL_MAX_NUM_SEQS" \
+        --max-num-batched-tokens 32768 --gpu-memory-utilization 0.9 \
+        --enable-prefix-caching --enable-chunked-prefill \
+        --disable-log-requests \
+        > "$EVAL_ROOT/$phase/inference-gpu$gpu.log" 2>&1 &
+      EVAL_PIDS+=("$!")
+    done
+    setsid uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+      -m vllm_router.launch_router --host 127.0.0.1 --port "$ROUTER_PORT" \
+      --worker-urls "${WORKER_URLS[@]}" \
+      > "$EVAL_ROOT/$phase/router.log" 2>&1 &
+    EVAL_PIDS+=("$!")
+  done
+
+  uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" - <<'PY'
+import time
+import httpx
+
+pending = [19100 + gpu for gpu in range(8)] + [19200, 19201]
+deadline = time.monotonic() + 900
+with httpx.Client(trust_env=False) as client:
+    while pending:
+        if time.monotonic() > deadline:
+            raise TimeoutError(f"Inference startup timed out: {pending}")
+        for port in pending[:]:
+            try:
+                response = client.get(f"http://127.0.0.1:{port}/health", timeout=1)
+            except httpx.RequestError:
+                continue
+            if response.status_code == 200:
+                pending.remove(port)
+        time.sleep(2)
+PY
+
+  PRODUCER_PIDS=()
+  for phase in base sft; do
+    EVAL_NAME="$(basename "$MODEL_DIR")"
+    ROUTER_PORT=19200
+    if [[ "$phase" == sft ]]; then
+      EVAL_NAME="$EVAL_NAME-nemotron-cot-sft-step$TOTAL_STEPS"
+      ROUTER_PORT=19201
+    fi
+    (
+      cd "$LIGHTEVAL_PROJECT"
+      unset PYTHONPATH WANDB_RUN_ID WANDB_RESUME
+      exec setsid uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+        - "$phase" "$EVAL_ROOT" "$EVAL_NAME" "$ROUTER_PORT" \
+        "$EVAL_MAX_NUM_SEQS" "$WANDB_RUN_PATH" "$SKYRL_PROJECT" <<'PY'
+import json
+import logging
+import subprocess
+import sys
+from pathlib import Path
+
+from lighteval.logging.evaluation_tracker import EvaluationTracker
+from lighteval.metrics.metrics import Metrics
+from lighteval.pipeline import ParallelismManager, PipelineParameters
+from lighteval.tasks.requests import SamplingMethod
+from src.rwkv_eval.configs import ModelEndpoint
+from src.rwkv_eval.main import RWKVExactMatches, RWKVPipeline, _litelm_model
+
+logging.basicConfig(level=logging.INFO)
+phase, root, model_name, port, capacity, run_path, skyrl_project = sys.argv[1:]
+root = Path(root) / phase
+endpoint = ModelEndpoint(f"http://127.0.0.1:{port}", "unused", model_name,
+                         4 * int(capacity) + 32, 25600)
+for selector in ["aime24", "aime25", "aimo_progress_prize_1", "math_500"]:
+    config = _litelm_model(endpoint, [endpoint], "CoT", "bot", 24576, 42,
+                          cache_dir=str(root / ".lighteval_cache"))
+    tracker = EvaluationTracker(output_dir=str(root / selector),
+                                save_details=False, save_streaming_completions=True)
+    pipeline = RWKVPipeline(selector, PipelineParameters(
+        launcher_type=ParallelismManager.NONE, streaming_evaluation=True),
+        tracker, model_config=config)
+    for task in pipeline.tasks_dict.values():
+        metric = Metrics.avg_at_n_math(sample_params={"n": 16})
+        metric.sample_level_fn.compute_score = RWKVExactMatches().compute
+        task.metrics = task.config.metrics = [metric]
+        task.num_samples = [16]
+        task.sampling_methods = [SamplingMethod.GENERATIVE]
+    tracker.task_config_logger.log(pipeline.tasks_dict)
+    pipeline.evaluate()
+    pipeline.save_and_push_results()
+    results = pipeline.get_results()
+    rows = {}
+    for task_name in pipeline.tasks_dict:
+        metrics = results["results"][task_name.replace("|", ":")]
+        score = next(value for name, value in metrics.items() if not name.endswith("_stderr"))
+        count = pipeline.task_sample_counts[task_name]
+        completions = pipeline.task_completion_counts[task_name]
+        if completions != 16 * count or pipeline.task_avg_k[task_name] != 16:
+            raise ValueError(f"Incomplete avg@16 evaluation: {task_name}, {count=}, {completions=}")
+        row = {"avg@16": float(score), "num_questions": count,
+               "num_completions": completions,
+               "truncation_rate": pipeline.task_truncation_counts[task_name] / completions}
+        rows[task_name] = row
+    (root / selector / "scores.json").write_text(json.dumps(rows, indent=2) + "\n")
+    subprocess.run([
+        "uv", "run", "--isolated", "--no-config", "--no-project",
+        str(Path(skyrl_project) / ".venv/bin/python"), "-", run_path, phase,
+        selector, str(root / selector), model_name,
+    ], check=True, text=True, input='''
+import json, sys
+from pathlib import Path
+import wandb
+run_path, phase, selector, directory, model_name = sys.argv[1:]
+entity, project, run_id = run_path.split("/")
+run = wandb.init(entity=entity, project=project, id=f"{run_id}-eval-{phase}",
+                 resume="allow", name=f"{run_id}-{phase}-avg16", group=run_id,
+                 job_type="evaluation", config={"model_name": model_name,
+                     "phase": phase, "avg_k": 16, "max_generated_tokens": 24576,
+                     "wkv_mode": "fp32io16"})
+rows = json.loads((Path(directory) / "scores.json").read_text())
+values = {f"eval/{phase}/{selector}/{key}": value
+          for row in rows.values() for key, value in row.items()}
+run.log(values)
+training_run = wandb.Api().run(run_path)
+training_run.summary.update(values)
+artifact = wandb.Artifact(f"{run_id}-{phase}-{selector}-avg16", type="evaluation")
+artifact.add_dir(directory)
+run.log_artifact(artifact).wait()
+run.finish()
+''')
+PY
+    ) > "$EVAL_ROOT/$phase/producer.log" 2>&1 &
+    PRODUCER_PIDS+=("$!")
+    EVAL_PIDS+=("$!")
+  done
+  for pid in "${PRODUCER_PIDS[@]}"; do
+    wait "$pid"
   done
 fi

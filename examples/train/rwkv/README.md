@@ -410,7 +410,7 @@ after excluding initialization:
 | 8 | 8 | 7 | enabled | 14.16 | 50,409 |
 | 8 | 1 | 7 | enabled | 13.35 | 53,440 |
 
-At each SFT loss evaluation, including the final pass, evaluate the same HF
+Every 500 training steps and at the final pass, evaluate the same HF
 checkpoint with `rwkv-rs/lighteval-rwkv` on the full `aime24`, `aime25`,
 `aimo_progress_prize_1` and `math_500` tasks. Use 16 generated responses per
 question for AIME24, AIME25 and AIMO, and four for Math500. Report avg@16 and
@@ -425,9 +425,13 @@ question and completion counts, and truncation rates alongside aggregate
 scores. Invoke the existing producer checkout with its dedicated environment;
 SkyRL owns the final export and inference service. Set `LIGHTEVAL_PROJECT` to
 the producer checkout and `WANDB_RUN_PATH` to `entity/project/run_id` to enable
-periodic benchmarks. The native `eval_command` hook waits for the benchmark
-and merges its metrics with eval loss at the same training step.
-`EVAL_ONLY=1 EVAL_STEP=<step>` evaluates an existing export independently.
+periodic benchmarks. SFT loss evaluation and weight saving remain every
+50 steps. The launcher checks `BENCHMARK_INTERVAL` (default 500) before
+starting inference; other loss evaluations return no benchmark metrics.
+The native `eval_command` hook waits for scheduled benchmarks and merges
+their metrics with eval loss at the same training step.
+`EVAL_ONLY=1 EVAL_STEP=<step> BENCHMARK_INTERVAL=1` evaluates an existing
+export independently.
 
 The original model is evaluated once. The first round allocates four inference
 replicas to each model; subsequent rounds use all eight replicas for SFT.

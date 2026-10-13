@@ -428,8 +428,10 @@ the producer checkout and `WANDB_RUN_PATH` to `entity/project/run_id` to enable
 periodic benchmarks. SFT loss evaluation and weight saving remain every
 50 steps. The launcher checks `BENCHMARK_INTERVAL` (default 500) before
 starting inference; other loss evaluations return no benchmark metrics.
-The native `eval_command` hook waits for scheduled benchmarks and merges
-their metrics with eval loss at the same training step.
+The native `eval_command` hook waits for generation and scoring, then merges
+the locally saved metrics with eval loss at the same training step. W&B
+uploads run in a separate CPU process after scoring and do not delay the
+next training step. A file lock serializes uploads to each evaluation run.
 `EVAL_ONLY=1 EVAL_STEP=<step> BENCHMARK_INTERVAL=1` evaluates an existing
 export independently.
 
@@ -441,3 +443,10 @@ resident while their unused CUDA allocator memory is released. Inference uses
 to the training run and to evaluation curves keyed by the checkpoint step.
 Each checkpoint has a separate output directory and W&B result artifact.
 This workflow only uploads to W&B.
+
+Each phase records background upload progress in `upload_status.json` and
+`upload.log` alongside `eval_metrics.json`. Upload failures leave the saved
+scores and completions intact and do not fail training. To retry an upload
+without running inference, set `OUTPUT_ROOT`, `WANDB_RUN_PATH`,
+`UPLOAD_ONLY=1 UPLOAD_PHASE=sft EVAL_STEP=<step>` and invoke the same launcher.
+For the original model, use `UPLOAD_PHASE=base` and its evaluated step.

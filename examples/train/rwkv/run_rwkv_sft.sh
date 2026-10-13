@@ -213,6 +213,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+import litellm
 from lighteval.logging.evaluation_tracker import EvaluationTracker
 from lighteval.metrics.metrics import Metrics
 from lighteval.pipeline import ParallelismManager, PipelineParameters
@@ -230,6 +231,7 @@ for selector in ["aime24", "aime25", "aimo_progress_prize_1", "math_500"]:
     config = _litelm_model(endpoint, [endpoint], "CoT", "bot", 24576, 42,
                           cache_dir=str(root / ".lighteval_cache"))
     config.max_model_length = 32768
+    litellm.cache = None
     tracker = EvaluationTracker(output_dir=str(root / selector),
                                 save_details=False, save_streaming_completions=True)
     pipeline = RWKVPipeline(selector, PipelineParameters(

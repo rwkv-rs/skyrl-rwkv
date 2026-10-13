@@ -32,7 +32,61 @@ export TORCH_EXTENSIONS_DIR="$XDG_CACHE_HOME/torch_extensions"
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 
 mkdir -p "$OUTPUT_ROOT"
-exec > >(tee -a "$OUTPUT_ROOT/train.log") 2>&1
+if [[ "${UPLOAD_ONLY:-0}" != 1 ]]; then
+  exec > >(tee -a "$OUTPUT_ROOT/train.log") 2>&1
+fi
+
+if [[ "${UPLOAD_ONLY:-0}" == 1 ]]; then
+  unset WANDB_RUN_ID WANDB_RESUME WANDB_SERVICE
+  uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+    - "$OUTPUT_ROOT/evaluation/lighteval_avg16" "$EVAL_STEP" "$UPLOAD_PHASE" "$WANDB_RUN_PATH" <<'PY'
+import fcntl
+import json
+import os
+import sys
+from pathlib import Path
+
+import wandb
+
+evaluation_root, step, phase, run_path = sys.argv[1:]
+evaluation_root = Path(evaluation_root)
+root = evaluation_root / (f"global_step_{step}/sft" if phase == "sft" else "base")
+status = root / "upload_status.json"
+with (evaluation_root / f".{phase}.upload.lock").open("a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    status.write_text(json.dumps({"state": "uploading", "global_step": int(step), "pid": os.getpid()}) + "\n")
+    try:
+        model_name = json.loads((root / "completed.json").read_text())["model_name"]
+        scores = {selector: json.loads((root / selector / "scores.json").read_text())
+                  for selector in ["aime24", "aime25", "aimo_progress_prize_1", "math_500"]}
+        samples = {selector: next(iter(rows.values()))["num_completions"] //
+                   next(iter(rows.values()))["num_questions"] for selector, rows in scores.items()}
+        entity, project, run_id = run_path.split("/")
+        run = wandb.init(entity=entity, project=project, id=f"{run_id}-eval-{phase}",
+                         resume="allow", name=f"{run_id}-{phase}-math-eval", group=run_id,
+                         job_type="evaluation", allow_val_change=True,
+                         config={"model_name": model_name, "phase": phase,
+                                 "avg_k": samples, "samples_per_question": samples,
+                                 "max_generated_tokens": 24576, "wkv_mode": "fp32io16"})
+        values = {f"eval/{phase}/{selector}/{key}": value for selector, rows in scores.items()
+                  for row in rows.values() for key, value in row.items()}
+        run.define_metric("eval/global_step")
+        run.define_metric(f"eval/{phase}/*", step_metric="eval/global_step")
+        run.log({**values, "eval/global_step": int(step)})
+        for selector, avg_k in samples.items():
+            artifact = wandb.Artifact(f"{run_id}-{phase}-{selector}-avg{avg_k}-step{step}",
+                                     type="evaluation")
+            artifact.add_dir(str(root / selector))
+            run.log_artifact(artifact).wait()
+        run.finish()
+    except Exception as error:
+        status.write_text(json.dumps({"state": "failed", "global_step": int(step),
+                                      "pid": os.getpid(), "error": str(error)}) + "\n")
+        raise
+    status.write_text(json.dumps({"state": "completed", "global_step": int(step), "pid": os.getpid()}) + "\n")
+PY
+  exit 0
+fi
 
 TOTAL_STEPS=$(uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" - "$DATA_DIR" "$BATCH_SIZE" <<'PY'
 import json
@@ -216,6 +270,7 @@ PY
         "$EVAL_STEP" "$GPUS_PER_PHASE" <<'PY'
 import json
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -270,36 +325,24 @@ for selector in ["aime24", "aime25", "aimo_progress_prize_1", "math_500"]:
         eval_metrics.update({f"{phase}/{selector}/{key}": value for key, value in row.items()})
     (root / selector / "scores.json").write_text(json.dumps(rows, indent=2) + "\n")
     (root / "eval_metrics.json").write_text(json.dumps(eval_metrics, indent=2) + "\n")
-    subprocess.run([
-        "uv", "run", "--isolated", "--no-config", "--no-project",
-        str(Path(skyrl_project) / ".venv/bin/python"), "-", run_path, phase,
-        selector, str(root / selector), model_name, step, str(avg_k),
-    ], check=True, text=True, cwd=skyrl_project, input='''
-import json, sys
-from pathlib import Path
-import wandb
-run_path, phase, selector, directory, model_name, step, avg_k = sys.argv[1:]
-entity, project, run_id = run_path.split("/")
-run = wandb.init(entity=entity, project=project, id=f"{run_id}-eval-{phase}",
-                 resume="allow", name=f"{run_id}-{phase}-math-eval", group=run_id,
-                 job_type="evaluation", allow_val_change=True, config={"model_name": model_name,
-                     "phase": phase, "samples_per_question": {
-                         "aime24": 16, "aime25": 16,
-                         "aimo_progress_prize_1": 16, "math_500": 4},
-                     "max_generated_tokens": 24576,
-                     "wkv_mode": "fp32io16"})
-rows = json.loads((Path(directory) / "scores.json").read_text())
-values = {f"eval/{phase}/{selector}/{key}": value
-          for row in rows.values() for key, value in row.items()}
-run.define_metric("eval/global_step")
-run.define_metric(f"eval/{phase}/*", step_metric="eval/global_step")
-run.log({**values, "eval/global_step": int(step)})
-artifact = wandb.Artifact(f"{run_id}-{phase}-{selector}-avg{avg_k}-step{step}", type="evaluation")
-artifact.add_dir(directory)
-run.log_artifact(artifact).wait()
-run.finish()
-''')
 (root / "completed.json").write_text(json.dumps({"global_step": int(step), "model_name": model_name}) + "\n")
+(root / "upload_status.json").write_text(json.dumps({"state": "queued", "global_step": int(step)}) + "\n")
+evaluation_root = root.parent.parent if phase == "sft" else root.parent
+try:
+    with (root / "upload.log").open("ab") as log:
+        uploader = subprocess.Popen([
+            "bash", str(Path(skyrl_project) / "examples/train/rwkv/run_rwkv_sft.sh"),
+        ], cwd=skyrl_project, env={**os.environ, "UPLOAD_ONLY": "1", "UPLOAD_PHASE": phase,
+                                  "EVAL_STEP": step, "OUTPUT_ROOT": str(evaluation_root.parent.parent),
+                                  "WANDB_RUN_PATH": run_path, "CUDA_VISIBLE_DEVICES": ""},
+           stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+except OSError as error:
+    (root / "upload_status.json").write_text(json.dumps({"state": "failed", "global_step": int(step),
+                                                       "error": str(error)}) + "\n")
+    logging.exception("Could not start W&B uploader; evaluation results remain saved")
+else:
+    (root / "upload.pid").write_text(str(uploader.pid) + "\n")
+    logging.info("Evaluation saved; background W&B upload pid=%s, log=%s", uploader.pid, root / "upload.log")
 PY
     ) > "$PHASE_ROOT/producer.log" 2>&1 &
     PRODUCER_PIDS+=("$!")

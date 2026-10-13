@@ -189,6 +189,7 @@ def proj_samp_vLLM(
     block_num=32,
     seed=0,
     skip_repetition=False,
+    ground_truth=None,
 ):
     """Extend by blocks, then greedily resample suffixes from any previous position."""
     if max_new_tokens < 1 or block_num < 1 or max_new_tokens % block_num or mcmc_steps < 0:
@@ -198,6 +199,8 @@ def proj_samp_vLLM(
     solutions = [solution] if single else solution
     seeds = [seed] if single else seed
     rngs = [random.Random(s) for s in seeds]
+    ground_truths = None if ground_truth is None else ([ground_truth] if single else ground_truth)
+    best_response = {}
     states = [
         dict(
             response_ids=[],
@@ -228,6 +231,20 @@ def proj_samp_vLLM(
             return [get_logprobs_vLLM(p, questions[indices[0]], responses[0])]
         return get_logprobs_vLLM(p, [questions[i] for i in indices], responses)
 
+    def record_complete(index, response, value):
+        if ground_truths is None:
+            return
+        from skyrl_gym.envs.gsm8k.utils import compute_strict_score
+
+        reward, _ = compute_strict_score(
+            p.tokenizer.decode(response, skip_special_tokens=True),
+            ground_truths[index],
+            ended_eod=True,
+            truncated=False,
+        )
+        if reward and (index not in best_response or value > best_response[index][1]):
+            best_response[index] = (response, value)
+
     for block in range(block_num):
         proposals = propose(
             active,
@@ -246,6 +263,8 @@ def proj_samp_vLLM(
         scores = score(active, [states[i]["response_ids"] for i in active])
         for i, value in zip(active, scores, strict=True):
             states[i]["target_log_prob_cur"] = value
+            if finished[i]:
+                record_complete(i, states[i]["response_ids"], value)
         for _ in range(mcmc_steps):
             cuts = [rngs[i].randrange(len(states[i]["response_ids"])) for i in active]
             proposals = propose(
@@ -263,6 +282,8 @@ def proj_samp_vLLM(
             if candidates:
                 values = score([i for i, _, _ in candidates], [gen for _, gen, _ in candidates])
                 for (i, gen, ended), value in zip(candidates, values, strict=True):
+                    if ended:
+                        record_complete(i, gen, value)
                     if value > states[i]["target_log_prob_cur"]:
                         states[i]["response_ids"] = gen
                         states[i]["target_log_prob_cur"] = value
@@ -287,4 +308,11 @@ def proj_samp_vLLM(
         active = [i for i in active if states[i]["finish_reason"] == "length"]
         if not active:
             break
+    if ground_truths is not None:
+        for i, state in enumerate(states):
+            if i in best_response:
+                state["response_ids"], state["target_log_prob_cur"] = best_response[i]
+                state["finish_reason"] = "stop"
+            elif state["finish_reason"] == "stop":
+                state["finish_reason"] = "incorrect"
     return states[0] if single else states

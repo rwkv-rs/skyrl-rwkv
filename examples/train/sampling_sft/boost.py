@@ -42,6 +42,11 @@ def boost_record(p, row, args):
         block_num=args.block_num,
         seed=seeds[0] if single else seeds,
         skip_repetition=args.skip_repetition,
+        ground_truth=(
+            (rows[0]["ground_truth"] if single else [item["ground_truth"] for item in rows])
+            if args.verify_math
+            else None
+        ),
     )
     records = []
     for item, result in zip(rows, [results] if single else results, strict=True):
@@ -134,6 +139,9 @@ def run(args):
     }
     if is_rwkv:
         config["sampling_params"] = sampling_params
+    if args.verify_math:
+        config["final_selection"] = "best_correct_complete_encountered"
+        config["verifier"] = "skyrl_gym.envs.gsm8k.utils.compute_strict_score"
     with open_output(
         args.output,
         config,
@@ -277,6 +285,11 @@ def parse_args(argv=None):
         "--skip-repetition",
         action="store_true",
         help="Discard trajectories with three adjacent copies of any span of at least 16 tokens",
+    )
+    parser.add_argument(
+        "--verify-math",
+        action="store_true",
+        help="Keep the highest-scoring complete candidate passing the native mathematics verifier",
     )
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
     parser.add_argument("--enforce-eager", action=argparse.BooleanOptionalAction, default=True)

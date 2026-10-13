@@ -429,6 +429,44 @@ def test_sampler_eos_ends_blocks_and_zero_step_rewrite(monkeypatch):
     assert result["finish_reason"] == "stop"
 
 
+@pytest.mark.parametrize("verify_math", [False, True])
+def test_math_selection_recovers_correct_completion_displaced_by_higher_likelihood(monkeypatch, verify_math):
+    responses = {
+        1: ">2 + 2 = 4.</think>\\boxed{4}",
+        2: ">2 + 2 = 5.</think>\\boxed{5}",
+        3: ">Let us compute 2 + 2.",
+    }
+    p = SimpleNamespace(tokenizer=SimpleNamespace(eos_token_id=0, decode=lambda ids, **kwargs: responses[ids[0]]))
+    proposals = iter([([3], False), ([1, 0], True), ([2, 0], True)])
+    scores = iter([-0.1, -2.0, -0.05])
+    monkeypatch.setattr(sampling, "proposal_vLLM", lambda *args: next(proposals))
+    monkeypatch.setattr(sampling, "get_logprobs_vLLM", lambda *args: next(scores))
+    result = sampling.proj_samp_vLLM(
+        p,
+        "What is 2 + 2?",
+        "2 + 2 = 4",
+        max_new_tokens=4,
+        block_num=1,
+        mcmc_steps=2,
+        ground_truth="4" if verify_math else None,
+    )
+    assert result["response_ids"] == ([1, 0] if verify_math else [2, 0])
+    assert result["target_log_prob_cur"] == (-2.0 if verify_math else -0.05)
+    assert result["finish_reason"] == "stop"
+
+
+def test_math_selection_excludes_wrong_terminal_response(monkeypatch):
+    p = SimpleNamespace(
+        tokenizer=SimpleNamespace(eos_token_id=0, decode=lambda ids, **kwargs: ">2 + 2 = 5.</think>\\boxed{5}")
+    )
+    monkeypatch.setattr(sampling, "proposal_vLLM", lambda *args: ([2, 0], True))
+    monkeypatch.setattr(sampling, "get_logprobs_vLLM", lambda *args: -0.1)
+    result = sampling.proj_samp_vLLM(
+        p, "What is 2 + 2?", "2 + 2 = 4", max_new_tokens=4, block_num=1, mcmc_steps=0, ground_truth="4"
+    )
+    assert result["finish_reason"] == "incorrect"
+
+
 def test_repetition_requires_three_adjacent_token_spans():
     span = list(range(32))
     assert not sampling.has_repetition(span * 2)

@@ -239,6 +239,10 @@ class OptimizerConfig(BaseConfig):
     scheduler: str = "constant_with_warmup"
     """Learning rate scheduler. Intended to align with ``transformers.SchedulerType``:
     https://huggingface.co/docs/transformers/main/en/main_classes/optimizer_schedules#transformers.SchedulerType"""
+    scheduler_specific_kwargs: Dict[str, Any] = field(default_factory=dict)
+    """Extra scheduler arguments forwarded to Transformers by the FSDP backend.
+    For ``cosine_with_min_lr``, use ``min_lr_rate`` for a fraction of the peak
+    learning rate, or ``min_lr`` for an absolute decay floor."""
 
 
 @dataclass

@@ -199,6 +199,7 @@ class TestOptimizerConfigOverrides:
         [
             ("lr", "1e-4", 1e-4),
             ("scheduler", "cosine", "cosine"),
+            ("scheduler_specific_kwargs", "{min_lr_rate: 0.1}", {"min_lr_rate": 0.1}),
             ("num_warmup_steps", "100", 100),
         ],
     )
@@ -207,6 +208,84 @@ class TestOptimizerConfigOverrides:
         skyrl_cfg = build_skyrl_config_for_sft(cfg)
         actual = getattr(skyrl_cfg.trainer.policy.optimizer_config, field)
         assert actual == expected
+
+    @pytest.mark.parametrize(
+        "scheduler_name,kwargs,final_lr",
+        [
+            ("cosine", {}, 0.0),
+            ("cosine_with_min_lr", {"min_lr_rate": 0.1}, 1e-7),
+            ("constant_with_warmup", {}, 1e-6),
+        ],
+    )
+    def test_fsdp_scheduler_decay_floor(self, monkeypatch, scheduler_name, kwargs, final_lr):
+        import torch
+
+        from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
+        from skyrl.train.config import FSDPConfig, OptimizerConfig
+
+        strategy = FSDPStrategy(
+            FSDPConfig(),
+            OptimizerConfig(lr=1e-6, scheduler=scheduler_name, scheduler_specific_kwargs=kwargs, num_warmup_steps=2),
+            num_training_steps=10,
+        )
+        monkeypatch.setattr(strategy, "_fsdp_init_model", lambda model, **_kwargs: model)
+        model, optimizer, scheduler = strategy._fsdp_init_train_model(torch.nn.Linear(2, 1), None, None)
+        assert scheduler.get_last_lr() == [0.0]
+        for step in range(1, 11):
+            optimizer.step()
+            scheduler.step()
+            if step == 2:
+                assert scheduler.get_last_lr()[0] == pytest.approx(1e-6)
+            if step >= 2:
+                assert final_lr <= scheduler.get_last_lr()[0] <= 1e-6
+        assert scheduler.get_last_lr()[0] == pytest.approx(final_lr)
+
+    def test_fsdp_resume_applies_new_floor_without_resetting_optimizer(self, monkeypatch, tmp_path):
+        import torch
+
+        from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
+        from skyrl.train.config import FSDPConfig, OptimizerConfig
+
+        def make_strategy(scheduler_name, kwargs):
+            strategy = FSDPStrategy(
+                FSDPConfig(),
+                OptimizerConfig(
+                    lr=1e-6, scheduler=scheduler_name, scheduler_specific_kwargs=kwargs, num_warmup_steps=2
+                ),
+                num_training_steps=10,
+            )
+            strategy.world_size = 1
+            monkeypatch.setattr(strategy, "get_rank", lambda: 0)
+            monkeypatch.setattr(strategy, "is_rank_0", lambda: True)
+            monkeypatch.setattr(strategy, "_fsdp_init_model", lambda model, **_kwargs: model)
+            return strategy, *strategy._fsdp_init_train_model(torch.nn.Linear(2, 1), None, None)
+
+        _, old_model, old_optimizer, old_scheduler = make_strategy("cosine", {})
+        for parameter in old_model.parameters():
+            parameter.grad = torch.ones_like(parameter)
+        for _ in range(4):
+            old_optimizer.step()
+            old_scheduler.step()
+        torch.save(old_model.state_dict(), tmp_path / "model_world_size_1_rank_0.pt")
+        torch.save(old_optimizer.state_dict(), tmp_path / "optim_world_size_1_rank_0.pt")
+        torch.save({"lr_scheduler": old_scheduler.state_dict()}, tmp_path / "extra_state_world_size_1_rank_0.pt")
+
+        strategy, model, optimizer, scheduler = make_strategy("cosine_with_min_lr", {"min_lr_rate": 0.1})
+        monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+        strategy.load_checkpoint(model, str(tmp_path), optimizer=optimizer, scheduler=scheduler)
+        assert scheduler.last_epoch == 4
+        assert scheduler.get_last_lr() == old_scheduler.get_last_lr()
+        for old_parameter, parameter in zip(old_model.parameters(), model.parameters(), strict=True):
+            assert torch.equal(old_parameter, parameter)
+            for key, value in old_optimizer.state[old_parameter].items():
+                assert torch.equal(value, optimizer.state[parameter][key])
+            parameter.grad = torch.ones_like(parameter)
+        for _ in range(6):
+            optimizer.step()
+            scheduler.step()
+            assert scheduler.get_last_lr()[0] >= 1e-7
+        assert scheduler.last_epoch == 10
+        assert scheduler.get_last_lr()[0] == pytest.approx(1e-7)
 
 
 class TestLoraConfigOverrides:

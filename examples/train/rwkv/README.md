@@ -412,10 +412,11 @@ after excluding initialization:
 
 At each SFT loss evaluation, including the final pass, evaluate the same HF
 checkpoint with `rwkv-rs/lighteval-rwkv` on the full `aime24`, `aime25`,
-`aimo_progress_prize_1` and `math_500` tasks. Use exactly 16 generated responses
-per question and report avg@16: mean correctness across the 16 responses,
-then across questions. Configure the producer explicitly; its current default
-sampling policy does not guarantee 16 responses for these tasks.
+`aimo_progress_prize_1` and `math_500` tasks. Use 16 generated responses per
+question for AIME24, AIME25 and AIMO, and four for Math500. Report avg@16 and
+avg@4 respectively: mean correctness across the responses, then across
+questions. Configure the producer explicitly; its current default sampling
+policy does not guarantee these response counts.
 
 Use CoT with the `bot` template and `open_think`, a 24,576-token completion
 budget, temperature 0.96, top-p 0.76, top-k 32, presence penalty 1.0,

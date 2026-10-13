@@ -410,8 +410,8 @@ after excluding initialization:
 | 8 | 8 | 7 | enabled | 14.16 | 50,409 |
 | 8 | 1 | 7 | enabled | 13.35 | 53,440 |
 
-After the complete epoch, evaluate the original weights and the final HF export
-with `rwkv-rs/lighteval-rwkv` on the full `aime24`, `aime25`,
+At each SFT loss evaluation, including the final pass, evaluate the same HF
+checkpoint with `rwkv-rs/lighteval-rwkv` on the full `aime24`, `aime25`,
 `aimo_progress_prize_1` and `math_500` tasks. Use exactly 16 generated responses
 per question and report avg@16: mean correctness across the 16 responses,
 then across questions. Configure the producer explicitly; its current default
@@ -423,9 +423,16 @@ frequency penalty 0.1 and penalty decay 0.988. Save per-rollout results,
 question and completion counts, and truncation rates alongside aggregate
 scores. Invoke the existing producer checkout with its dedicated environment;
 SkyRL owns the final export and inference service. Set `LIGHTEVAL_PROJECT` to
-the producer checkout and `WANDB_RUN_PATH` to `entity/project/run_id` to queue
-this evaluation after training. `EVAL_ONLY=1` runs only the evaluation phase.
-The base and SFT models each use four independent one-GPU inference replicas
-and run concurrently. Scores are copied to the training run summary; separate
-evaluation runs in the same W&B project store curves and full result artifacts.
+the producer checkout and `WANDB_RUN_PATH` to `entity/project/run_id` to enable
+periodic benchmarks. The native `eval_command` hook waits for the benchmark
+and merges its metrics with eval loss at the same training step.
+`EVAL_ONLY=1 EVAL_STEP=<step>` evaluates an existing export independently.
+
+The original model is evaluated once. The first round allocates four inference
+replicas to each model; subsequent rounds use all eight replicas for SFT.
+Each replica supports 1,024 concurrent sequences. The training workers remain
+resident while their unused CUDA allocator memory is released. Inference uses
+65% of each GPU and terminates before training continues. Scores are logged
+to the training run and to evaluation curves keyed by the checkpoint step.
+Each checkpoint has a separate output directory and W&B result artifact.
 This workflow only uploads to W&B.

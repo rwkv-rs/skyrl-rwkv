@@ -375,9 +375,12 @@ def microbatches(rows, batch_size, max_batch_tokens):
 def extract_ftpo_pair(row, tokenizer, model, device, max_length, top_k=50, num_chosen=20):
     generated_ids = row["response_ids"]
     text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-    found, hit = find_inner_repetition(text)
-    if not found:
-        return None
+    if row.get("cached_text_provenance"):
+        hit = RepeatHit(**row["repeat_hit"])
+    else:
+        found, hit = find_inner_repetition(text)
+        if not found:
+            return None
     index = find_rejected_token_index(tokenizer, generated_ids, hit)
     if index is None:
         return None
@@ -404,7 +407,34 @@ def extract_ftpo_pair(row, tokenizer, model, device, max_length, top_k=50, num_c
         "rejected_token_index": index,
         "repeat_hit": asdict(hit),
         "source": row.get("source"),
+        **({"cached_text_provenance": row["cached_text_provenance"]} if row.get("cached_text_provenance") else {}),
     }
+
+
+def encode_cached_response(row, tokenizer):
+    """Reconstruct a text-only cache trajectory and verify its supplied exact loop."""
+    prompt, text = row["prompt_text"], row["response_text"]
+    hit = RepeatHit(**row["repeat_hit"])
+    pattern = text[hit.start : hit.start + hit.period]
+    if (
+        hit.start < 0
+        or hit.period < 1
+        or hit.repeats < 4
+        or not hit.start + 4 * hit.period <= hit.end <= len(text)
+        or text[hit.start : hit.start + hit.repeats * hit.period] != pattern * hit.repeats
+    ):
+        raise ValueError("Cached FTPO boundary must identify at least four consecutive exact repeats.")
+    prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
+    response_ids = tokenizer.encode(text, add_special_tokens=False)
+    if (
+        tokenizer.decode(prompt_ids, skip_special_tokens=True) != prompt
+        or tokenizer.decode(response_ids, skip_special_tokens=True) != text
+    ):
+        raise ValueError("Cached prompt and response must round-trip through the training tokenizer.")
+    provenance = row["cached_text_provenance"]
+    if hashlib.sha256(text.encode()).hexdigest() != provenance["response_sha256"]:
+        raise ValueError("Cached response SHA256 does not match the boundary provenance.")
+    return {**row, "prompt_ids": prompt_ids, "response_ids": response_ids}
 
 
 def ftpo_loss(
@@ -686,6 +716,8 @@ def prepare(args):
     ):
         for path in paths:
             for row in read_jsonl(path):
+                if args.cached_text:
+                    row = encode_cached_response(row, tokenizer)
                 if "model" in row and Path(row["model"]).resolve() != Path(args.model).resolve():
                     raise ValueError("FTPO extraction must use the checkpoint that generated the rollout.")
                 pair = extract_ftpo_pair(row, tokenizer, model, "cuda", args.max_length, args.top_k, args.num_chosen)
@@ -715,7 +747,13 @@ def prepare(args):
         dist.barrier()
         dist.destroy_process_group()
     if rank == 0:
-        manifest = {"model": args.model, "max_length": args.max_length, "seed": args.seed, **counts}
+        manifest = {
+            "model": args.model,
+            "max_length": args.max_length,
+            "seed": args.seed,
+            "trajectory_format": "retokenized_evaluation_cache" if args.cached_text else "original_rollout_ids",
+            **counts,
+        }
         (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         print(json.dumps(manifest), flush=True)
 
@@ -838,7 +876,13 @@ def train(args):
             total_steps = min(total_steps, args.max_steps)
         strategy = FSDPStrategy(
             FSDPConfig(fsdp_size=args.fsdp_size, reshard_after_forward=False),
-            OptimizerConfig(lr=args.learning_rate, weight_decay=0.01, scheduler="linear", offload_after_step=False),
+            OptimizerConfig(
+                lr=args.learning_rate,
+                weight_decay=0.01,
+                scheduler="linear",
+                num_warmup_steps=math.ceil(total_steps * args.warmup_ratio),
+                offload_after_step=False,
+            ),
             seed=args.seed,
             num_training_steps=total_steps,
         )
@@ -855,6 +899,7 @@ def train(args):
                 name=f"{Path(args.model).name}-antidoom-nora",
                 config={**vars(args), "model_name": Path(args.model).name, "nora_revision": NORA_REVISION},
             )
+            (args.output / "wandb.json").write_text(json.dumps({"id": run.id, "url": run.url}) + "\n")
 
         def save_and_evaluate(step, metrics):
             metrics.update(evaluate(model, eval_rows, device, args.micro_batch_size, args.max_batch_tokens))
@@ -1016,10 +1061,16 @@ def main():
     prepare_parser.add_argument("--top-k", type=int, default=50)
     prepare_parser.add_argument("--num-chosen", type=int, default=20)
     prepare_parser.add_argument("--validation-fraction", type=float, default=0.1)
+    prepare_parser.add_argument(
+        "--cached-text",
+        action="store_true",
+        help="Retokenize cached prompt/response text and use its verified repeat_hit",
+    )
     train_parser = commands.choices["train"]
     train_parser.add_argument("--data", type=Path, required=True)
     train_parser.add_argument("--rank", type=int, default=8)
     train_parser.add_argument("--learning-rate", type=float, default=1.5e-5)
+    train_parser.add_argument("--warmup-ratio", type=float, default=0.0)
     train_parser.add_argument("--epochs", type=int, default=1)
     train_parser.add_argument("--gradient-accumulation-steps", type=int, default=16)
     train_parser.add_argument("--micro-batch-size", type=int, default=1)
@@ -1054,6 +1105,8 @@ def main():
             parser.error("FTPO context and candidate sizes must be positive")
         prepare(args)
     else:
+        if not 0 <= args.warmup_ratio < 1:
+            parser.error("--warmup-ratio must be between 0 (inclusive) and 1 (exclusive)")
         if (
             min(
                 args.max_length,

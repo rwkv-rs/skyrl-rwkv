@@ -717,6 +717,17 @@ the same partition. Training
 requires non-empty train and validation partitions; inspect `data/manifest.json`
 and increase prompt coverage if too few loops were found.
 
+For a text-only evaluation cache, `prepare --cached-text` accepts JSONL rows
+with the server-rendered `prompt_text`, raw `response_text`, `repeat_hit`
+(`start`, `end`, `period`, `repeats`, `snippet`), `source` metadata, and
+`cached_text_provenance` containing `response_sha256` and the cache origin.
+Both texts must round-trip through the training tokenizer. Supplied boundaries
+must contain at least four consecutive exact repeats; long-period loops are
+supported without regenerating responses. These are reconstructed token
+sequences, recorded as `retokenized_evaluation_cache` in the data manifest.
+The cached decoding parameters and model alias remain in the provenance.
+FTPO alternatives are recomputed from the selected training checkpoint.
+
 NoRA uses `use_nora=True`, rank 8, alpha equal to rank, zero dropout, and the
 RWKV attention projections `r_proj`, `k_proj`, `v_proj`, and `o_proj`. Each FTPO
 sample scores a single next-token position. The loss keeps the notebook's
@@ -726,6 +737,8 @@ adapter disabled. AdamW's default LR is `1.5e-5`; the 13.3B teacher example
 uses `5e-6`. Weight decay is 0.01, with a linear schedule
 and gradient clipping 1.0. Set `--rank`, `--learning-rate`, `--epochs` and
 `--gradient-accumulation-steps` explicitly for other experiments.
+`--warmup-ratio` optionally reserves the initial fraction of optimizer steps
+for linear warmup (default 0).
 
 Training buckets FTPO contexts by length, right-pads each microbatch, and selects
 the final original token position of each row. Trailing padding does not enter

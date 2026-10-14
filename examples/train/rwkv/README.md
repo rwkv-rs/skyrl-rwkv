@@ -444,6 +444,12 @@ to the training run and to evaluation curves keyed by the checkpoint step.
 Each checkpoint has a separate output directory and W&B result artifact.
 This workflow only uploads to W&B.
 
+With RWKV and `fsdp_size=1`, save one complete model and Adam state on rank 0
+and retain each rank's scheduler and RNG state. The eight-replica experiment
+writes about 17.07 GiB per checkpoint instead of 136.57 GiB. Restore the full
+state through PyTorch's distributed state-dict APIs. Older checkpoints retain
+their per-rank loading path.
+
 Each phase records background upload progress in `upload_status.json` and
 `upload.log` alongside `eval_metrics.json`. Upload failures leave the saved
 scores and completions intact and do not fail training. To retry an upload

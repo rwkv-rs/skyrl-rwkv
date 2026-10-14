@@ -727,7 +727,8 @@ whole optimizer-step batches, keeping all ranks at similar sequence lengths.
 Gradients synchronize at the end of accumulation. With `--fsdp-size 1`, every
 GPU retains the frozen model and only adapter gradients are synchronized. Use
 `--profile --max-steps 3 --report-to none` to measure real step time, token
-throughput, and peak allocation before a production run.
+throughput, and the maximum allocation across all ranks before a production
+run. Profiling visits the longest context groups first.
 
 Every 50 optimizer steps and at the final step, training writes adapter weights,
 per-rank optimizer/scheduler/RNG states, and held-out FTPO loss on a fixed

@@ -771,6 +771,41 @@ top-p 0.76, top-k 32, presence penalty 1.0, frequency penalty 0.1, and decay
 the saved completions. Held-out FTPO loss measures preference fit; free
 generation supplies the before/after repetition metric.
 
+For paired answer-quality evaluation, use the same ordered held-out input file
+and seed for both checkpoints. Each saved response records its actual seed
+(`seed + prompt_index`); verify prompt IDs, seeds and response budgets agree
+before comparing results. `score` accepts those responses and a JSONL containing
+`prompt_ids`, the captured `prompt_text`, `source`, and native LightEval `doc`
+metadata. GPQA gold letters must follow the choices in the captured prompt.
+The scorer reads the producer's native mathematical comparator, GPQA extractor,
+LiveCodeBench test harness and IFBench constraint checkers without modifying
+the producer project. It reports strict correctness separately from native
+GPQA missing-answer expectation, alongside extraction, truncation and exact-loop
+rates. Long-period loop scoring defaults to period 8192 and sampling interval 16.
+
+The native mathematical scorer uses ANTLR 4.13, while SkyRL's configuration
+parser uses ANTLR 4.9. Keep the scorer's two compatibility packages in an import
+directory inside the project's dedicated environment:
+
+```bash
+uv run --isolated --no-config --no-project uv pip install \
+  --python .venv/bin/python --target .venv/antidoom_eval --no-deps \
+  'antlr4-python3-runtime==4.13.2' 'latex2sympy2_extended==1.0.6' \
+  > /tmp/results_antidoom_eval_dependencies.log 2>&1
+
+PYTHONPATH="$PWD/.venv/antidoom_eval" \
+uv run --isolated --no-config --no-project .venv/bin/python \
+  -m examples.train.rwkv.antidoom score \
+  --input "$OUTPUT_ROOT/evaluation_inputs.jsonl" \
+  --rollouts "$OUTPUT_ROOT/eval_base" --output "$OUTPUT_ROOT/scores_base" \
+  --lighteval-project "$HOME/Projects/MachineLearning/lighteval-rwkv" \
+  > /tmp/results_antidoom_eval_score.log 2>&1
+```
+
+IFBench also needs its native `spacy`, `syllapy`, `emoji` and `langdetect`
+dependencies, the compatible `en_core_web_sm` model, and NLTK resources.
+Install them with `uv` in this same project environment before scoring.
+
 Restore the locked PEFT package after the NoRA experiment:
 
 ```bash

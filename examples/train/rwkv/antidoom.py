@@ -326,18 +326,18 @@ def find_rejected_token_index(tokenizer, generated_ids, hit):
     char_pos = hit.repeat_start
     while char_pos < len(text) and text[char_pos].isspace():
         char_pos += 1
-    for index in range(len(generated_ids)):
+    before = text[:char_pos]
+    low, high = 0, len(generated_ids)
+    while low < high:
+        index = (low + high) // 2
         prefix = tokenizer.decode(generated_ids[: index + 1], skip_special_tokens=True)
-        # An incomplete UTF-8 prefix ends in a replacement character. Count
-        # only the prefix shared with the complete decoded response.
-        shared = 0
-        for left, right in zip(prefix, text):
-            if left != right:
-                break
-            shared += 1
-        if shared > char_pos or (shared == char_pos and len(prefix) > shared):
-            return index
-    return None
+        # Prefixes grow monotonically. A partial UTF-8 character at this
+        # boundary belongs to its first byte token, even before completion.
+        if len(prefix) > char_pos and prefix.startswith(before):
+            high = index
+        else:
+            low = index + 1
+    return low if low < len(generated_ids) else None
 
 
 def last_logits(model, prompt_ids, device):

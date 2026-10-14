@@ -323,6 +323,21 @@ def test_utf8_boundary_chooses_first_token_of_character():
     assert antidoom.find_rejected_token_index(Tokenizer(), ids, hit) == 6
 
 
+def test_long_context_boundary_avoids_decoding_every_prefix():
+    class CountingTokenizer(Tokenizer):
+        calls = 0
+
+        def decode(self, ids, skip_special_tokens=True):
+            self.calls += 1
+            return super().decode(ids, skip_special_tokens)
+
+    ids = list(("x" * 24000 + " \n界界界界").encode())
+    hit = antidoom.RepeatHit(24002, 24006, 1, 4, "界")
+    tokenizer = CountingTokenizer()
+    assert antidoom.find_rejected_token_index(tokenizer, ids, hit) == 24005
+    assert tokenizer.calls <= math.ceil(math.log2(len(ids))) + 1
+
+
 def test_pair_uses_exact_rollout_context_and_model_candidates():
     text = "Wait, let me reconsider this approach. " * 5
     row = {"prompt_ids": [17, 19], "response_ids": list(text.encode())}

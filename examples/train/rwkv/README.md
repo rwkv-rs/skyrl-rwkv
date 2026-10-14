@@ -450,3 +450,12 @@ scores and completions intact and do not fail training. To retry an upload
 without running inference, set `OUTPUT_ROOT`, `WANDB_RUN_PATH`,
 `UPLOAD_ONLY=1 UPLOAD_PHASE=sft EVAL_STEP=<step>` and invoke the same launcher.
 For the original model, use `UPLOAD_PHASE=base` and its evaluated step.
+
+For the final AIME24, AIME25 and AIMO avg@256 evaluation, use
+`EVAL_ONLY=1 EVAL_STEP=4847 EVAL_PHASES=sft EVAL_AVG_K=256`,
+`EVAL_TASKS="aime24 aime25 aimo_progress_prize_1"` and
+`EVAL_ROOT="$OUTPUT_ROOT/evaluation/lighteval_avg256"`. This generates
+7,680, 7,680 and 2,560 completions respectively. The separate output root
+preserves the periodic avg@16 and Math500 avg@4 results; scores and artifacts
+are labeled avg@256 in the same W&B experiment. Upload-only retries must
+use the same `EVAL_ROOT`.

@@ -14,6 +14,7 @@ import json
 import math
 import os
 import random
+import resource
 import signal
 import shutil
 import sys
@@ -456,6 +457,9 @@ async def generate(args):
     from transformers import AutoConfig
     from examples.train.rwkv.rollout import ROLLOUT_SAMPLING_PARAMS, SAMPLING_PARAMS, start_servers
 
+    soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft_limit < args.concurrency + 1024:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (args.concurrency + 1024, hard_limit))
     args.output.mkdir(parents=True, exist_ok=args.resume)
     tokenizer = get_tokenizer(args.model, trust_remote_code=False)
     eos_token_id = AutoConfig.from_pretrained(args.model).eos_token_id

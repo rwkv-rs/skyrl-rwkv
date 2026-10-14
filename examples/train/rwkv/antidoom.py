@@ -897,7 +897,15 @@ def train(args):
             run = wandb.init(
                 project="rwkv_antidoom",
                 name=f"{Path(args.model).name}-antidoom-nora",
-                config={**vars(args), "model_name": Path(args.model).name, "nora_revision": NORA_REVISION},
+                config={
+                    **vars(args),
+                    "model_name": Path(args.model).name,
+                    "nora_revision": NORA_REVISION,
+                    "train_samples": len(train_rows),
+                    "validation_samples": len(val_rows),
+                    "total_steps": total_steps,
+                    "trajectory_format": manifest.get("trajectory_format") if manifest_path.exists() else None,
+                },
             )
             (args.output / "wandb.json").write_text(json.dumps({"id": run.id, "url": run.url}) + "\n")
 
@@ -926,6 +934,14 @@ def train(args):
 
         step = 0
         model.train()
+        if not args.profile:
+            baseline = evaluate(model, eval_rows, device, args.micro_batch_size, args.max_batch_tokens)
+            if dist.get_rank() == 0:
+                print(f"step=0 {baseline}", flush=True)
+                with (args.output / "metrics.jsonl").open("a") as handle:
+                    write_json(handle, {"step": 0, **baseline})
+                if run:
+                    run.log(baseline, step=0)
         for epoch in range(args.epochs):
             order = (
                 [len(groups) - 1]

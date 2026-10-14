@@ -465,3 +465,291 @@ For the final AIME24, AIME25 and AIMO avg@256 evaluation, use
 preserves the periodic avg@16 and Math500 avg@4 results; scores and artifacts
 are labeled avg@256 in the same W&B experiment. Upload-only retries must
 use the same `EVAL_ROOT`.
+
+## Antidoom FTPO with NoRA
+
+`antidoom.py` adapts the repetition detector and final-token preference loss from
+[Liquid's TRL notebook](https://github.com/Liquid4All/cookbook/blob/main/finetuning/notebooks/antidoom_with_trl.ipynb)
+and [Antidoom](https://github.com/Liquid4All/antidoom) (Apache-2.0). It generates
+completions with the selected RWKV checkpoint, extracts preferences at the first
+repeated token, and trains with SkyRL's native `FSDPStrategy`.
+
+The experiment combines **complete benchmarks selected by G1k truncation rate**
+on [the RWKV scoreboard](https://eval.rwkv.rs/scoreboard) with untested sources
+from [LiquidAI/antidoom-mix-v1.0](https://huggingface.co/datasets/LiquidAI/antidoom-mix-v1.0).
+The benchmark selection uses active G1k 1.5B scores with truncation rate at least 50%:
+
+| Benchmark | Recorded questions | Truncation rate | Response budget |
+| --- | ---: | ---: | ---: |
+| `aime25` | 30 | 90.00% | 24576 |
+| `aimo_progress_prize_1` | 10 | 90.00% | 24576 |
+| `gpqa:diamond` | 198 | 87.88% | 24576 |
+| `aime24` | 30 | 83.33% | 24576 |
+| `gpqa:main` | 448 | 82.14% | 24576 |
+| `olympiad_bench` | 2673 | 78.15% | 24576 |
+| `lcb:codegeneration` | 268 | 77.24% | 24576 |
+| `ifbench_multiturn` | 1387 | 53.64% | 4096 |
+| `ifbench_test` | 300 | 52.33% | 4096 |
+
+The recorded total is 5,344 benchmark rows; GPQA main and diamond overlap.
+These are question counts, not counts of loops or FTPO examples. The loader
+exports every native task Doc and records its actual count, which can differ
+from an older scoreboard dataset revision. `--param-size` and
+`--min-truncation-rate` change the benchmark selection.
+
+The mix supplement selects entire component sources with no recorded scoreboard
+evaluation, considering scores across all models, including expired records.
+GSM8K, MMLU, MATH and
+[MetaMathQA's GSM8K/MATH derivatives](https://huggingface.co/datasets/meta-math/MetaMathQA)
+are explicitly excluded. MathQA and CommonsenseQA are excluded by their existing
+scoreboard evaluations. The current untested components are:
+
+| Mix source ID | Original mix rows | Response budget |
+| --- | ---: | ---: |
+| `pubmedqa_artificial_train` | 50000 | 4096 |
+| `apps_train` | 5000 | 24576 |
+| `open_perfectblend_ultrainteract` | 49540 | 24576 |
+| `open_perfectblend_ultrachat200k` | 49958 | 4096 |
+| `open_perfectblend_evol_codealpaca` | 49981 | 24576 |
+| `open_perfectblend_autoif` | 49995 | 4096 |
+| `open_perfectblend_lmsys_arena` | 49206 | 4096 |
+| `ifstruct_train_generated` | 20000 | 4096 |
+
+These components contain 323,680 candidate prompts before deduplication.
+The mix contains training prompts; adding it does not export the full upstream
+benchmark test splits. `export-mix` keeps every benchmark row, then appends
+unique mix prompts, deduplicating against the benchmarks and earlier mix rows.
+It preserves component source, split, sample ID, license, and the pinned mix
+revision in the output. Its manifest records exclusions and actual counts.
+With the current benchmark export and pinned mix revision, 38,986 repeated
+prompts are removed and 284,694 mix prompts are appended. The combined input
+contains 290,038 rows, including all 5,344 original benchmark rows.
+
+Export active score metadata from `scoreboard_production` on `rwkv-rs-server`
+with a read-only transaction. The query reads models, tasks, sampling budgets,
+and aggregate scores:
+
+```bash
+ssh rwkv-rs-server \
+  'sudo -n -u postgres psql -X -q -A -t -v ON_ERROR_STOP=1 -d scoreboard_production' \
+  > /tmp/antidoom_g1k_scores.jsonl 2> /tmp/results_antidoom_scores.log <<'SQL'
+BEGIN READ ONLY;
+SET LOCAL statement_timeout = '15s';
+SELECT json_build_object(
+  'model', row_to_json(m), 'score_id', s.id,
+  'benchmark', b.name, 'field', b.field, 'framework', b.framework,
+  'num_samples', b.num_samples, 'avg_k', b.avg_k,
+  'cot_mode', s.cot_mode, 'score', s.score,
+  'truncation_rate', s.truncation_rate, 'sampling', row_to_json(c))
+FROM scores s
+JOIN rwkv_models m ON m.id = s.model_id
+JOIN benchmarks b ON b.id = s.benchmark_id
+JOIN sampling_configs c ON c.id = s.sampling_config_id
+WHERE lower(m.data_version) = 'g1k' AND NOT s.is_expired;
+ROLLBACK;
+SQL
+```
+
+`export-benchmarks` reads the producer's
+[native RWKV task registry](https://github.com/rwkv-rs/lighteval-rwkv/tree/c5475e27a1e58184c9a6cdbd30572ec1ae601dd7)
+using **this project's interpreter**. Keep that source checkout at the stated
+revision. Install its dataset-loader dependencies in the SkyRL `.venv`, with
+existing package versions constrained:
+
+```bash
+uv run --isolated --no-config --no-project uv pip freeze \
+  --python .venv/bin/python --exclude-editable \
+  > /tmp/antidoom_existing_constraints.txt 2> /tmp/results_antidoom_constraints.log
+rg '^(antlr4-python3-runtime|latex2sympy2-extended)==' \
+  /tmp/antidoom_existing_constraints.txt > /tmp/antidoom_math_constraints.txt
+uv run --isolated --no-config --no-project uv pip install \
+  --python .venv/bin/python --constraint /tmp/antidoom_existing_constraints.txt \
+  'inspect-ai>=0.3.140' 'GitPython>=3.1.41' 'termcolor==2.3.0' \
+  pytablewriter colorlog 'aenum==3.1.15' 'nltk==3.10.3' scikit-learn \
+  sacrebleu 'rouge-score==0.1.2' sentencepiece pycountry langcodes jsonlines \
+  aiolimiter diskcache more-itertools \
+  > /tmp/results_antidoom_export_install.log 2>&1
+uv run --isolated --no-config --no-project uv pip install \
+  --python .venv/bin/python --no-deps \
+  'lighteval @ git+https://github.com/rwkv-rs/lighteval-rwkv@c5475e27a1e58184c9a6cdbd30572ec1ae601dd7' \
+  > /tmp/results_antidoom_native_export_install.log 2>&1
+# Use the native registry's fixed math-parser versions while exporting.
+uv run --isolated --no-config --no-project uv pip install \
+  --python .venv/bin/python --no-deps \
+  'latex2sympy2-extended==1.0.6' 'antlr4-python3-runtime==4.13.2' \
+  > /tmp/results_antidoom_export_math_install.log 2>&1
+
+DATA_ROOT="$HOME/skyrl-rwkv-runs/antidoom-g1k-whole-benchmarks"
+LIGHTEVAL_PROJECT="$HOME/Projects/MachineLearning/lighteval-rwkv"
+uv run --isolated --no-config --no-project .venv/bin/python \
+  -m examples.train.rwkv.antidoom select-benchmarks \
+  --scoreboard-records /tmp/antidoom_g1k_scores.jsonl \
+  --param-size 1.5b --min-truncation-rate 0.5 --output "$DATA_ROOT/selection" \
+  > /tmp/results_antidoom_selection.log 2>&1
+uv run --isolated --no-config --no-project .venv/bin/python \
+  -m examples.train.rwkv.antidoom export-benchmarks \
+  --benchmarks "$DATA_ROOT/selection/benchmarks.json" \
+  --lighteval-project "$LIGHTEVAL_PROJECT" --output "$DATA_ROOT/questions" \
+  > /tmp/results_antidoom_questions.log 2>&1
+
+# Restore the original SkyRL math-parser versions before rollout/training.
+uv run --isolated --no-config --no-project uv pip install \
+  --python .venv/bin/python --no-deps --requirements /tmp/antidoom_math_constraints.txt \
+  > /tmp/results_antidoom_export_restore.log 2>&1
+```
+
+The exporter calls `task.get_docs(None)` for every selected task, preserving
+native dataset splits, filters, question formatting, and source metadata.
+It loads original datasets from Hugging Face and writes question-only JSONL.
+No evaluation pipeline or response-cache reader runs. The raw dataset download
+cache is independent of model-generated evaluation answers. GPQA access requires
+the dataset's Hugging Face authorization.
+
+Fetch the set of benchmarks ever evaluated, then append the untested mix
+components. This step uses the standard SkyRL dependencies:
+
+```bash
+ssh rwkv-rs-server \
+  'sudo -n -u postgres psql -X -q -A -t -v ON_ERROR_STOP=1 -d scoreboard_production' \
+  > /tmp/antidoom_tested_benchmarks.jsonl 2> /tmp/results_antidoom_tested_benchmarks.log <<'SQL'
+BEGIN READ ONLY;
+SET LOCAL statement_timeout = '15s';
+SELECT json_build_object('benchmark', b.name)
+FROM benchmarks b
+WHERE EXISTS (SELECT 1 FROM scores s WHERE s.benchmark_id = b.id)
+ORDER BY b.name;
+ROLLBACK;
+SQL
+uv run --isolated --no-config --no-project .venv/bin/python \
+  -m examples.train.rwkv.antidoom export-mix \
+  --benchmark-data "$DATA_ROOT/questions" \
+  --tested-benchmarks /tmp/antidoom_tested_benchmarks.jsonl \
+  --output "$DATA_ROOT/combined" \
+  > /tmp/results_antidoom_combined_questions.log 2>&1
+```
+
+The mix revision defaults to `79ff2d479c5e59ea9973a66a7ca9ce8b703f9c7b`.
+Every added row contains only its original prompt and source metadata. All
+model responses are generated with the selected RWKV checkpoint in the next step.
+
+Install [Joluck/NoRA](https://github.com/Joluck/NoRA)'s PEFT fork in the project's
+existing RWKV `.venv`. Its fixed revision is
+`4669c35ce0ffd027456272ee5050c0f58ac8d22a`. This replaces PEFT with
+`0.19.2.dev0` without changing the other installed packages. The project lock
+continues to pin the standard PEFT dependency. Run this example through the
+explicit project interpreter so a project sync does not replace NoRA.
+
+```bash
+uv run --isolated --no-config --no-project uv pip install \
+  --python .venv/bin/python --no-deps \
+  'peft @ git+https://github.com/Joluck/NoRA@4669c35ce0ffd027456272ee5050c0f58ac8d22a#subdirectory=peft' \
+  > /tmp/results_antidoom_install.log 2>&1
+
+MODEL_DIR="$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600"
+OUTPUT_ROOT="$HOME/skyrl-rwkv-runs/$(basename "$MODEL_DIR")-antidoom-nora"
+
+# On rwkv-sha-pro6000x8, reroll every question with the original G1k 13.3B model.
+uv run --isolated --no-config --no-project .venv/bin/python \
+  -m examples.train.rwkv.antidoom generate \
+  --model "$MODEL_DIR" --input "$DATA_ROOT/combined/prompts.jsonl" \
+  --output "$OUTPUT_ROOT/rollout" --limit 0 --max-model-len 1048576 \
+  --concurrency 4096 --max-num-seqs 256 --gpu-memory-utilization 0.9 \
+  --shard-rollouts \
+  > /tmp/results_antidoom_rollout.log 2>&1
+
+# Use exact rollout IDs and the same checkpoint to choose alternative tokens.
+uv run --isolated --no-config --no-project .venv/bin/torchrun \
+  --standalone --nproc-per-node=8 \
+  -m examples.train.rwkv.antidoom prepare \
+  --model "$MODEL_DIR" --rollouts "$OUTPUT_ROOT/rollout" \
+  --output "$OUTPUT_ROOT/data" \
+  > /tmp/results_antidoom_prepare.log 2>&1
+
+# Native FSDP2; replicated frozen weights, token-bounded microbatches, one epoch.
+PYTHON_EXEC="$PWD/.venv/bin/python" \
+XDG_CACHE_HOME="$HOME/.cache/skyrl-rwkv" \
+TORCH_EXTENSIONS_DIR="$HOME/.cache/skyrl-rwkv/torch_extensions" \
+uv run --isolated --no-config --no-project .venv/bin/torchrun \
+  --standalone --nproc-per-node=8 -m examples.train.rwkv.antidoom train \
+  --model "$MODEL_DIR" --data "$OUTPUT_ROOT/data" --output "$OUTPUT_ROOT/train" \
+  --fsdp-size 1 --micro-batch-size 2 --max-batch-tokens 32768 \
+  --gradient-accumulation-steps 8 --eval-max-samples 1024 \
+  > /tmp/results_antidoom_train.log 2>&1
+```
+
+Generation starts fresh TP1 vLLM engines with the explicitly selected
+checkpoint and requires a new output directory. All questions are generated
+with temperature 1, top-p 1, top-k -1, and disabled penalties. Source metadata
+selects the checkpoint's `bot` + `open_think` template for mathematics, coding,
+and GPQA, and `assistant` + `open_think` for IFBench. Each source keeps its
+recorded response budget (24576 or 4096); `--max-tokens` can reduce the budget.
+If the prompt consumes some of the context budget, the shortened generation
+budget is recorded. A prompt exceeding the context limit stops the run.
+Use distinct output roots for different checkpoints or fresh repeats.
+Requests are continuously replenished as completions finish. `--shard-rollouts`
+writes one trajectory file per engine, allowing `prepare` to run on all eight
+GPUs without rereading every trajectory on every rank. Progress includes actual
+generated tokens and throughput.
+
+For explicit alternative prompt sources, `generate --input` also accepts
+OpenAI `messages`, ShareGPT `conversations`, or exact `prompt_ids`; `--dataset`
+accepts an explicitly named Hugging Face prompt dataset. `--base-url` can target
+an inference service already serving the same checkpoint.
+
+FTPO contexts and rejected IDs are slices of the original token sequence;
+decoded text is used only to locate repetition. Up to 20 non-whitespace
+alternatives come from the rollout model's top 50 logits. The detector selects
+actual repetition in the newly generated responses; truncation by itself
+does not create a preference example. Contexts longer than `--max-length`
+(32768 by default) are dropped as complete rows. A hash split assigns every
+sibling completion and every GPQA variant of the same original question to
+the same partition. Training
+requires non-empty train and validation partitions; inspect `data/manifest.json`
+and increase prompt coverage if too few loops were found.
+
+NoRA uses `use_nora=True`, rank 8, alpha equal to rank, zero dropout, and the
+RWKV attention projections `r_proj`, `k_proj`, `v_proj`, and `o_proj`. Each FTPO
+sample scores a single next-token position. The loss keeps the notebook's
+margin 2, non-target logit MSE coefficient 0.4, target coefficient 0.05 and
+target tolerance 0.5. Reference logits come from the frozen base with the
+adapter disabled. AdamW uses LR `1.5e-5`, weight decay 0.01, a linear schedule,
+and gradient clipping 1.0. Set `--rank`, `--learning-rate`, `--epochs` and
+`--gradient-accumulation-steps` explicitly for other experiments.
+
+Training buckets FTPO contexts by length, right-pads each microbatch, and selects
+the final original token position of each row. Trailing padding does not enter
+the selected causal prefixes. `--max-batch-tokens` bounds padded tokens per GPU;
+`--micro-batch-size` caps examples per forward. Length groups are shuffled as
+whole optimizer-step batches, keeping all ranks at similar sequence lengths.
+Gradients synchronize at the end of accumulation. With `--fsdp-size 1`, every
+GPU retains the frozen model and only adapter gradients are synchronized. Use
+`--profile --max-steps 3 --report-to none` to measure real step time, token
+throughput, and peak allocation before a production run.
+
+Every 50 optimizer steps and at the final step, training writes adapter weights,
+per-rank optimizer/scheduler/RNG states, and held-out FTPO loss on a fixed
+`--eval-max-samples` subset. The frozen base is identified by the exact model
+path instead of being copied into every checkpoint. W&B receives training and
+evaluation curves under `rwkv_antidoom`, plus the FTPO data and metrics artifact.
+Use `--report-to none` for a local smoke run. After training, the final NoRA
+adapter is automatically absorbed with `merge_and_unload(safe_merge=True)`.
+`train/merged` contains full HF weights, tokenizer, generation configurations
+and `merge_metrics.json`. The merge checks the next-token log probabilities
+before and after absorption, allowing for BF16 weight rounding.
+
+For a held-out before/after doom-loop comparison, run `generate` on
+`data/validation_prompts.jsonl` once with `MODEL_DIR` and once with
+`$OUTPUT_ROOT/train/merged`, using distinct output directories and the same
+seed and token budget. Set `--sampling eval` for both runs: temperature 0.96,
+top-p 0.76, top-k 32, presence penalty 1.0, frequency penalty 0.1, and decay
+0.988. Compare `doom_loop_rate` and `truncated` in each `summary.json` alongside
+the saved completions. Held-out FTPO loss measures preference fit; free
+generation supplies the before/after repetition metric.
+
+Restore the locked PEFT package after the NoRA experiment:
+
+```bash
+uv run --isolated --no-config --no-project uv pip install \
+  --python .venv/bin/python --no-deps 'peft==0.18.1' \
+  > /tmp/results_antidoom_restore_peft.log 2>&1
+```

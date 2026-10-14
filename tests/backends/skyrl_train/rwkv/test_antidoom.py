@@ -31,7 +31,7 @@ def test_generate_requests_original_ids_and_rollout_sampling(tmp_path, monkeypat
 
     class Session:
         def __init__(self, **kwargs):
-            pass
+            assert kwargs["connector"].limit == 1
 
         async def __aenter__(self):
             return self

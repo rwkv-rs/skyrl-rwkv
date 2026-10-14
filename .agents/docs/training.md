@@ -5,6 +5,7 @@
 - **`skyrl/train/entrypoints/main_base.py`** — Primary training entrypoint. Handles inference server setup, training loop, weight sync.
 - **`skyrl/train/entrypoints/main_generate.py`** — Generation-only entrypoint (no training).
 - **`skyrl/train/entrypoints/main_opd.py`** — On-policy distillation entrypoint: a frozen teacher on an inference engine scores the student's rollouts (library code in `skyrl/train/opd/`, run scripts in `examples/train/on_policy_distillation/`).
+- **`examples/train/rwkv/antidoom.py`** — Select complete benchmarks by active G1k truncation rate, export all original native LightEval questions, append untested AntiDoom mix components with `export-mix` (excluding GSM8K/MMLU/MATH and MetaMathQA), and generate fresh rollouts with an explicit RWKV checkpoint. Extract FTPO data from new repetitions, then train NoRA in length-bucketed microbatches with native `FSDPStrategy` via `torchrun` and automatically merge the final adapter into full HF weights. See the RWKV README (Antidoom FTPO with NoRA) for selection/export commands and pinned dependencies.
 
 ## Running Training
 

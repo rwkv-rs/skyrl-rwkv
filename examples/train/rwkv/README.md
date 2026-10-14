@@ -652,7 +652,7 @@ OUTPUT_ROOT="$HOME/skyrl-rwkv-runs/$(basename "$MODEL_DIR")-antidoom-nora"
 uv run --isolated --no-config --no-project .venv/bin/python \
   -m examples.train.rwkv.antidoom generate \
   --model "$MODEL_DIR" --input "$DATA_ROOT/combined/prompts.jsonl" \
-  --output "$OUTPUT_ROOT/rollout" --limit 0 --max-model-len 1048576 \
+  --output "$OUTPUT_ROOT/rollout" --limit 0 --max-model-len 32768 \
   --concurrency 4096 --max-num-seqs 256 --gpu-memory-utilization 0.9 \
   --shard-rollouts \
   > /tmp/results_antidoom_rollout.log 2>&1
@@ -690,6 +690,9 @@ Requests are continuously replenished as completions finish. `--shard-rollouts`
 writes one trajectory file per engine, allowing `prepare` to run on all eight
 GPUs without rereading every trajectory on every rank. Progress includes actual
 generated tokens and throughput.
+`--resume` continues a partially completed run from this same checkpoint,
+skipping its saved prompt indices. This uses the current experiment's own new
+rollouts. Resume accepts one completion per prompt.
 
 For explicit alternative prompt sources, `generate --input` also accepts
 OpenAI `messages`, ShareGPT `conversations`, or exact `prompt_ids`; `--dataset`

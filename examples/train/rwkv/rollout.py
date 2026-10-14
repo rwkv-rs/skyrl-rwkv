@@ -28,6 +28,14 @@ DOMAINS = ("Math", "Code", "Long_Context", "Knowledge")
 STATUSES = ("correct", "wrong", "unanswered")
 ROLLOUTS_PER_QUESTION = 64
 SCORING_VERSION = 2
+ROLLOUT_SAMPLING_PARAMS = {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": -1,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "penalty_decay": 1.0,
+}
 SAMPLING_PARAMS = {
     "temperature": 0.96,
     "top_p": 0.76,
@@ -312,7 +320,9 @@ def write_output(output: Path, groups, candidates, config, *, plot: bool = False
                 handle.write(orjson.dumps(value, option=orjson.OPT_APPEND_NEWLINE))
 
 
-async def start_servers(args, processes):
+async def start_servers(
+    args, processes, *, enforce_eager=False, gpu_memory_utilization=0.8, max_num_batched_tokens=8192
+):
     import aiohttp
     import torch
 
@@ -371,15 +381,17 @@ async def start_servers(args, processes):
             "--max-num-seqs",
             str(args.max_num_seqs),
             "--max-num-batched-tokens",
-            "8192",
+            str(max_num_batched_tokens),
             "--gpu-memory-utilization",
-            "0.8",
+            str(gpu_memory_utilization),
             "--mamba-ssm-cache-dtype",
             "float32",
             "--enable-prefix-caching",
             "--enable-chunked-prefill",
             "--disable-uvicorn-access-log",
         ]
+        if enforce_eager:
+            command.append("--enforce-eager")
         with log_path.open("wb") as log:
             processes.append(
                 await asyncio.create_subprocess_exec(

@@ -632,6 +632,7 @@ async def generate(args):
                             {
                                 "model": args.model,
                                 "prompt_index": index,
+                                "seed": args.seed + index,
                                 "prompt_ids": prompt_ids,
                                 "response_ids": response_ids,
                                 "finish_reason": choice["finish_reason"],
@@ -756,6 +757,107 @@ def prepare(args):
         }
         (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
         print(json.dumps(manifest), flush=True)
+
+
+def score(args):
+    """Score fresh paired generations using the producer's native benchmark metrics."""
+    sys.path.insert(0, str(args.lighteval_project / "src"))
+    sys.path.insert(0, str(args.lighteval_project))
+    from lighteval.models.model_output import ModelResponse
+    from lighteval.tasks.requests import Doc
+    from lighteval.tasks.tasks.ifbench.main import RWKVIFBench
+    from lighteval.tasks.tasks.lcb.main import CodegenMetric
+    from src.rwkv_eval.answer_extract.free_response import answer_extractor_for_benchmark, extract_answer
+    from src.rwkv_eval.main import RWKVExactMatches
+
+    inputs = list(read_jsonl(args.input))
+    paths = sorted(args.rollouts.glob("rollouts*.jsonl"))
+    responses = {}
+    for path in paths:
+        for row in read_jsonl(path):
+            index = row["prompt_index"]
+            if index in responses:
+                raise ValueError("Paired evaluation requires one fresh response per question.")
+            responses[index] = row
+    if set(responses) != set(range(len(inputs))):
+        raise ValueError("Evaluation responses do not cover the exact input question set.")
+    args.output.mkdir(parents=True, exist_ok=False)
+    totals, benchmarks = Counter(), {}
+    with (args.output / "scores.jsonl").open("x") as handle:
+        for index, sample in enumerate(inputs):
+            row = responses[index]
+            if row["prompt_ids"] != sample["prompt_ids"]:
+                raise ValueError("Evaluation must retain the original held-out prompt IDs.")
+            doc = Doc(**sample["doc"])
+            name = sample["source"]["benchmark"]
+            extractor = answer_extractor_for_benchmark(name)
+            pred = extract_answer(row["text"], extractor, len(doc.choices), rendered_prompt=sample["prompt_text"])
+            response = ModelResponse(
+                text=[row["text"]], text_post_processed=[pred or ""], rendered_prompt=sample["prompt_text"]
+            )
+            if name.startswith("ifbench"):
+                quality = RWKVIFBench().compute(doc=doc, model_response=response)
+                native_score = quality["prompt_level_strict_acc"]
+            elif extractor == "code":
+                # CodegenMetric retains the native timeout and reliability guard.
+                native_score = CodegenMetric().compute(doc=doc, model_response=response) if pred else 0.0
+                quality = {"pass_at_1": float(native_score)}
+            else:
+                native_score = RWKVExactMatches(choice=extractor == "choice").compute(doc, response)
+                quality = {"exact_match": float(native_score)}
+            found, hit = find_inner_repetition(
+                row["text"], max_period=args.max_period, sample_interval=args.sample_interval
+            )
+            values = {
+                "questions": 1,
+                "doom_loops": int(found),
+                "truncated": int(row["finish_reason"] == "length"),
+                "answer_extracted": int(bool(pred)),
+                "strict_correct": int(native_score == 1),
+                "native_score_sum": float(native_score),
+                "generated_tokens": len(row["response_ids"]),
+            }
+            for key, value in quality.items():
+                if isinstance(value, list):
+                    values[key + "_passed"] = sum(value)
+                    values[key + "_count"] = len(value)
+                else:
+                    values[key + "_sum"] = float(value)
+            totals.update(values)
+            benchmarks.setdefault(name, Counter()).update(values)
+            write_json(
+                handle,
+                {
+                    **row,
+                    "parsed_answer": pred,
+                    "gold_answers": doc.get_golds(),
+                    "strict_correct": bool(native_score == 1),
+                    "native_score": float(native_score),
+                    "quality": quality,
+                    "repeat_hit": asdict(hit) if hit else None,
+                },
+            )
+            handle.flush()
+            print(f"scored={index + 1}/{len(inputs)} benchmark={name} score={native_score}", flush=True)
+
+    def summary(values):
+        count = values["questions"]
+        return {
+            **values,
+            "doom_loop_rate": values["doom_loops"] / count,
+            "truncation_rate": values["truncated"] / count,
+            "answer_extraction_rate": values["answer_extracted"] / count,
+            "strict_correct_rate": values["strict_correct"] / count,
+            "native_score": values["native_score_sum"] / count,
+        }
+
+    result = {
+        "overall": summary(totals),
+        "benchmarks": {name: summary(values) for name, values in benchmarks.items()},
+        "detector": {"max_period": args.max_period, "sample_interval": args.sample_interval, "min_repeats": 4},
+    }
+    (args.output / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result), flush=True)
 
 
 def load_ftpo_data(path, vocab_size, max_length):
@@ -1045,6 +1147,13 @@ def main():
     mix_parser.add_argument("--tested-benchmarks", type=Path, required=True)
     mix_parser.add_argument("--mix-revision", default=ANTIDOOM_REVISION)
     mix_parser.add_argument("--output", type=Path, required=True)
+    score_parser = commands.add_parser("score")
+    score_parser.add_argument("--input", type=Path, required=True, help="Held-out prompt IDs and native Doc metadata")
+    score_parser.add_argument("--rollouts", type=Path, required=True)
+    score_parser.add_argument("--lighteval-project", type=Path, required=True)
+    score_parser.add_argument("--output", type=Path, required=True)
+    score_parser.add_argument("--max-period", type=int, default=8192)
+    score_parser.add_argument("--sample-interval", type=int, default=16)
     for name in ("generate", "prepare", "train"):
         command = commands.add_parser(name)
         command.add_argument("--model", required=True, help="Exact RWKV checkpoint to roll out and adapt")
@@ -1125,6 +1234,10 @@ def main():
         if min(args.max_length, args.top_k, args.num_chosen) <= 0:
             parser.error("FTPO context and candidate sizes must be positive")
         prepare(args)
+    elif args.command == "score":
+        if min(args.max_period, args.sample_interval) <= 0:
+            parser.error("Repetition period and sampling interval must be positive")
+        score(args)
     else:
         if not 0 <= args.warmup_ratio < 1:
             parser.error("--warmup-ratio must be between 0 (inclusive) and 1 (exclusive)")

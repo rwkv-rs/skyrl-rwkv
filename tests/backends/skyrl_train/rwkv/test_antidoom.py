@@ -107,6 +107,7 @@ def test_generate_requests_original_ids_and_rollout_sampling(tmp_path, monkeypat
     assert row["response_ids"] == [65, 66]
     assert row["source"] == source
     assert row["prompt_index"] == 0
+    assert row["seed"] == 42
     assert json.loads((output / "summary.json").read_text())["truncated"] == 1
 
     args = SimpleNamespace(
@@ -417,6 +418,79 @@ def test_cached_long_loop_keeps_supplied_boundary_and_utf8_context():
 
     with pytest.raises(ValueError, match="round-trip"):
         antidoom.encode_cached_response(row, ChangedTokenizer())
+
+
+def test_scoring_long_loops_and_missing_choice_expectation(tmp_path, monkeypatch):
+    import random
+
+    class Doc(SimpleNamespace):
+        def get_golds(self):
+            return [self.choices[self.gold_index]]
+
+    class Comparator:
+        def __init__(self, **kwargs):
+            pass
+
+        def compute(self, doc, response):
+            pred = response.text_post_processed[0]
+            return float(pred == doc.get_golds()[0]) if pred else 0.25
+
+    monkeypatch.setitem(sys.modules, "lighteval.tasks.requests", SimpleNamespace(Doc=Doc))
+    monkeypatch.setitem(sys.modules, "lighteval.models.model_output", SimpleNamespace(ModelResponse=SimpleNamespace))
+    monkeypatch.setitem(sys.modules, "lighteval.tasks.tasks.ifbench.main", SimpleNamespace(RWKVIFBench=None))
+    monkeypatch.setitem(sys.modules, "lighteval.tasks.tasks.lcb.main", SimpleNamespace(CodegenMetric=None))
+    monkeypatch.setitem(sys.modules, "src.rwkv_eval.main", SimpleNamespace(RWKVExactMatches=Comparator))
+    monkeypatch.setitem(
+        sys.modules,
+        "src.rwkv_eval.answer_extract.free_response",
+        SimpleNamespace(
+            answer_extractor_for_benchmark=lambda _: "choice",
+            extract_answer=lambda text, *args, **kwargs: "C" if text == "Answer: C" else None,
+        ),
+    )
+    source = {"benchmark": "gpqa:diamond"}
+    sample = {
+        "prompt_ids": [7, 9],
+        "prompt_text": "original prompt",
+        "source": source,
+        "doc": {"choices": ["A", "B", "C", "D"], "gold_index": 2},
+    }
+    inputs = tmp_path / "inputs.jsonl"
+    inputs.write_text((json.dumps(sample) + "\n") * 2)
+    pattern = "".join(random.Random(7).choices("abcdefghijklmnopqrstuvwxyz", k=1200))
+    texts = [pattern * 5, "Answer: C"]
+    rollouts = tmp_path / "rollouts"
+    rollouts.mkdir()
+    rows = [
+        {
+            "prompt_index": i,
+            "prompt_ids": [7, 9],
+            "response_ids": list(text.encode()),
+            "text": text,
+            "finish_reason": "length" if i == 0 else "stop",
+            "source": source,
+            "seed": 42 + i,
+        }
+        for i, text in enumerate(texts)
+    ]
+    (rollouts / "rollouts_gpu_0.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    output = tmp_path / "scores"
+    args = SimpleNamespace(
+        input=inputs, rollouts=rollouts, lighteval_project=tmp_path, output=output, max_period=8192, sample_interval=16
+    )
+    antidoom.score(args)
+    result = json.loads((output / "summary.json").read_text())["overall"]
+    assert result["doom_loops"] == result["truncated"] == result["strict_correct"] == 1
+    assert result["strict_correct_rate"] == result["answer_extraction_rate"] == 0.5
+    assert result["native_score"] == 0.625
+    scores = list(antidoom.read_jsonl(output / "scores.jsonl"))
+    assert scores[0]["repeat_hit"]["period"] == 1200
+    assert not scores[0]["strict_correct"] and scores[0]["native_score"] == 0.25
+    rows[0]["prompt_ids"] = [8, 9]
+    (rollouts / "rollouts_gpu_0.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    args.output = tmp_path / "mismatched"
+    with pytest.raises(ValueError, match="prompt IDs"):
+        antidoom.score(args)
 
 
 def test_ftpo_matches_notebook_loss_and_gradient_direction():

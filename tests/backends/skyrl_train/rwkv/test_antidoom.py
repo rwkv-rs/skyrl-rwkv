@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import math
 import sys
@@ -16,6 +17,9 @@ from examples.train.rwkv import antidoom
 
 class Tokenizer:
     eos_token_id = 0
+
+    def encode(self, text, add_special_tokens=False):
+        return list(text.encode())
 
     def decode(self, ids, skip_special_tokens=True):
         return bytes(ids).decode("utf-8", errors="replace")
@@ -367,6 +371,54 @@ def test_pair_uses_exact_rollout_context_and_model_candidates():
     assert len(calls) == 1
 
 
+def test_cached_long_loop_keeps_supplied_boundary_and_utf8_context():
+    import random
+
+    pattern = "思考" + "".join(random.Random(7).choices("abcdefghijklmnopqrstuvwxyz", k=1200))
+    prefix = "先推理。"
+    text = prefix + pattern * 5
+    row = {
+        "prompt_text": "User: 原题\nAssistant: <think>",
+        "response_text": text,
+        "repeat_hit": {
+            "start": len(prefix),
+            "end": len(text),
+            "period": len(pattern),
+            "repeats": 5,
+            "snippet": pattern[:100],
+        },
+        "cached_text_provenance": {"response_sha256": hashlib.sha256(text.encode()).hexdigest()},
+    }
+    encoded = antidoom.encode_cached_response(row, Tokenizer())
+    contexts = []
+
+    def forward(ids, **kwargs):
+        contexts.append(ids.tolist()[0])
+        logits = torch.zeros(1, 1, 256)
+        logits[0, 0, [65, 66, 32]] = torch.tensor([10.0, 9.0, 8.0])
+        return SimpleNamespace(logits=logits)
+
+    pair = antidoom.extract_ftpo_pair(encoded, Tokenizer(), forward, "cpu", 10000, top_k=3)
+    boundary = len((prefix + pattern).encode())
+    assert pair["rejected_token_index"] == boundary
+    assert contexts == [list(row["prompt_text"].encode()) + list(text.encode())[:boundary]]
+    assert pair["cached_text_provenance"] == row["cached_text_provenance"]
+    assert pair["chosen_ids"] == [65, 66]
+    bad = {**row, "cached_text_provenance": {"response_sha256": "wrong"}}
+    with pytest.raises(ValueError, match="SHA256"):
+        antidoom.encode_cached_response(bad, Tokenizer())
+    bad = {**row, "repeat_hit": {**row["repeat_hit"], "period": len(pattern) + 1}}
+    with pytest.raises(ValueError, match="exact repeats"):
+        antidoom.encode_cached_response(bad, Tokenizer())
+
+    class ChangedTokenizer(Tokenizer):
+        def encode(self, text, add_special_tokens=False):
+            return super().encode(text + "!", add_special_tokens)
+
+    with pytest.raises(ValueError, match="round-trip"):
+        antidoom.encode_cached_response(row, ChangedTokenizer())
+
+
 def test_ftpo_matches_notebook_loss_and_gradient_direction():
     logits = torch.tensor([[0.0, 0.5, -0.5, 1.0, 0.0]], requires_grad=True)
     reference = torch.zeros_like(logits)
@@ -471,6 +523,7 @@ def test_prepare_groups_siblings_and_keeps_original_validation_prompts(tmp_path,
             num_chosen=20,
             seed=42,
             validation_fraction=0.25,
+            cached_text=False,
         )
     )
     train = list(antidoom.read_jsonl(output / "train.jsonl"))

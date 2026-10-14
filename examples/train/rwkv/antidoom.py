@@ -456,7 +456,7 @@ async def generate(args):
     from transformers import AutoConfig
     from examples.train.rwkv.rollout import ROLLOUT_SAMPLING_PARAMS, SAMPLING_PARAMS, start_servers
 
-    args.output.mkdir(parents=True, exist_ok=False)
+    args.output.mkdir(parents=True, exist_ok=args.resume)
     tokenizer = get_tokenizer(args.model, trust_remote_code=False)
     eos_token_id = AutoConfig.from_pretrained(args.model).eos_token_id
     if args.input:
@@ -464,7 +464,40 @@ async def generate(args):
     else:
         samples = load_dataset(args.dataset, split=args.split).shuffle(seed=args.seed)
     sampling = ROLLOUT_SAMPLING_PARAMS if args.sampling == "rollout" else SAMPLING_PARAMS
+    input_digest = None
+    if args.input:
+        with args.input.open("rb") as handle:
+            input_digest = hashlib.file_digest(handle, "sha256").hexdigest()
+    run_config = {
+        "model": str(Path(args.model).resolve()),
+        "input_sha256": input_digest,
+        "sampling": sampling,
+        "seed": args.seed,
+        "max_tokens": args.max_tokens,
+        "max_model_len": args.max_model_len,
+        "samples_per_prompt": args.samples_per_prompt,
+        "prompt_template": args.prompt_template,
+        "generation_prompt": args.generation_prompt,
+    }
+    manifest_path = args.output / "generation.json"
+    if args.resume:
+        if json.loads(manifest_path.read_text()) != run_config:
+            raise ValueError("Resume requires the same checkpoint, input prompts, seed and decoding settings.")
+    else:
+        manifest_path.write_text(json.dumps(run_config, indent=2) + "\n")
     processes, counts = [], Counter()
+    completed = set()
+    if args.resume:
+        for path in sorted(args.output.glob("rollouts*.jsonl")):
+            for row in read_jsonl(path):
+                if Path(row["model"]).resolve() != Path(args.model).resolve():
+                    raise ValueError("Resume requires rollouts from the same checkpoint.")
+                completed.add(row["prompt_index"])
+                counts["rollouts"] += 1
+                counts["generated_tokens"] += len(row["response_ids"])
+                counts["doom_loops"] += int(row["repeat_hit"] is not None)
+                counts["truncated"] += int(row["finish_reason"] == "length")
+    tokens_before_resume = counts["generated_tokens"]
     started = time.monotonic()
     try:
         urls = (
@@ -484,7 +517,7 @@ async def generate(args):
             handles = [
                 stack.enter_context(
                     (args.output / (f"rollouts_gpu_{index}.jsonl" if args.shard_rollouts else "rollouts.jsonl")).open(
-                        "x"
+                        "a" if args.resume else "x"
                     )
                 )
                 for index in range(len(urls) if args.shard_rollouts else 1)
@@ -554,6 +587,7 @@ async def generate(args):
                             handle,
                             {
                                 "model": args.model,
+                                "prompt_index": index,
                                 "prompt_ids": prompt_ids,
                                 "response_ids": response_ids,
                                 "finish_reason": choice["finish_reason"],
@@ -573,7 +607,7 @@ async def generate(args):
                             progress = {
                                 **counts,
                                 "elapsed_seconds": elapsed,
-                                "tokens_per_second": counts["generated_tokens"] / elapsed,
+                                "tokens_per_second": (counts["generated_tokens"] - tokens_before_resume) / elapsed,
                             }
                             (args.output / "progress.json").write_text(json.dumps(progress) + "\n")
                             print(json.dumps(progress), flush=True)
@@ -582,6 +616,8 @@ async def generate(args):
                 for index, sample in enumerate(samples):
                     if args.limit and index >= args.limit:
                         break
+                    if index in completed:
+                        continue
                     if len(tasks) >= args.concurrency:
                         done, tasks = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                         for task in done:
@@ -944,6 +980,9 @@ def main():
     generate_parser.add_argument("--base-url", help="Comma-separated vLLM endpoints; otherwise start local engines")
     generate_parser.add_argument("--concurrency", type=int, default=64)
     generate_parser.add_argument("--shard-rollouts", action="store_true", help="One JSONL shard per inference engine")
+    generate_parser.add_argument(
+        "--resume", action="store_true", help="Continue this checkpoint's own fresh rollout run"
+    )
     generate_parser.add_argument("--max-tokens", type=int, default=24576)
     generate_parser.add_argument("--max-model-len", type=int, default=32768)
     generate_parser.add_argument("--max-num-seqs", type=int, default=128)
@@ -983,6 +1022,8 @@ def main():
     elif args.command == "generate":
         if not args.input and not args.dataset:
             parser.error("Provide the whole-benchmark --input export or an explicit --dataset")
+        if args.resume and (args.samples_per_prompt != 1 or not args.input):
+            parser.error("Rollout resume requires --input and --samples-per-prompt 1")
         if min(args.concurrency, args.samples_per_prompt, args.max_tokens, args.max_model_len) <= 0 or args.limit < 0:
             parser.error("Generation sizes must be positive; --limit must be non-negative")
         asyncio.run(generate(args))

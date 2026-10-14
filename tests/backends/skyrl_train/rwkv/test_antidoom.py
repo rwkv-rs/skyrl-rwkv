@@ -22,7 +22,8 @@ class Tokenizer:
 
 
 @pytest.mark.parametrize("source", [None, {"benchmark": "ifbench_test", "max_generated_tokens": 8}])
-def test_generate_requests_original_ids_and_rollout_sampling(tmp_path, monkeypatch, source):
+@pytest.mark.parametrize("disconnect", [False, True])
+def test_generate_requests_original_ids_and_rollout_sampling(tmp_path, monkeypatch, source, disconnect):
     import aiohttp
 
     input_path = tmp_path / "prompts.jsonl"
@@ -32,6 +33,7 @@ def test_generate_requests_original_ids_and_rollout_sampling(tmp_path, monkeypat
     class Session:
         def __init__(self, **kwargs):
             assert kwargs["connector"].limit == 1
+            assert kwargs["connector"].force_close
 
         async def __aenter__(self):
             return self
@@ -41,6 +43,8 @@ def test_generate_requests_original_ids_and_rollout_sampling(tmp_path, monkeypat
 
         def post(self, url, json):
             requests.append((url, json))
+            if disconnect and len(requests) == 1:
+                raise aiohttp.ServerDisconnectedError("connection closed")
             return self
 
         def raise_for_status(self):
@@ -76,6 +80,8 @@ def test_generate_requests_original_ids_and_rollout_sampling(tmp_path, monkeypat
         )
     )
     url, payload = requests[0]
+    assert len(requests) == (2 if disconnect else 1)
+    assert all(request == requests[0] for request in requests)
     assert url == "http://example.test/v1/completions"
     assert payload["prompt"] == [7, 9]
     assert payload["return_token_ids"] is True
@@ -90,7 +96,9 @@ def test_generate_requests_original_ids_and_rollout_sampling(tmp_path, monkeypat
         "presence_penalty": 0.0,
         "frequency_penalty": 0.0,
     }
-    row = next(antidoom.read_jsonl(output / "rollouts.jsonl"))
+    rows = list(antidoom.read_jsonl(output / "rollouts.jsonl"))
+    assert len(rows) == 1
+    row = rows[0]
     assert row["prompt_ids"] == [7, 9]
     assert row["response_ids"] == [65, 66]
     assert row["source"] == source

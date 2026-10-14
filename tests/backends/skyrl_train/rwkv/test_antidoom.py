@@ -664,6 +664,7 @@ def test_nora_reference_and_merged_logits_after_optimizer_step(tmp_path):
     torch.testing.assert_close(actual, adapted, atol=0.003, rtol=0.01)
     assert not any("lora_" in name for name, _ in merged.named_parameters())
     assert merged.dtype == torch.float16
-    reloaded = LlamaForCausalLM.from_pretrained(output, dtype=torch.float16).eval()
+    reloaded = LlamaForCausalLM.from_pretrained(output, dtype="auto").eval()
+    assert reloaded.dtype == torch.float16
     torch.testing.assert_close(antidoom.last_logits(reloaded, prompt_ids, "cpu"), actual)
     assert json.loads((output / "merge_metrics.json").read_text())["merge_dtype"] == "float32"

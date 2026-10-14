@@ -645,6 +645,13 @@ uv run --isolated --no-config --no-project uv pip install \
   'peft @ git+https://github.com/Joluck/NoRA@4669c35ce0ffd027456272ee5050c0f58ac8d22a#subdirectory=peft' \
   > /tmp/results_antidoom_install.log 2>&1
 
+# Download the original Transformers checkpoint from the official RWKV repo.
+uv run --isolated --no-config --no-project .venv/bin/hf download \
+  rwkv-rs/rwkv7-g1-st --revision b672701cccf4bddcc66f65c8c9a468b776c9836a \
+  --include 'rwkv7-g1k-13.3b-20260930-ctx25600/*' \
+  --local-dir "$HOME/Weights/RWKV/hf" --max-workers 4 \
+  > /tmp/results_antidoom_model_download.log 2>&1
+
 MODEL_DIR="$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600"
 OUTPUT_ROOT="$HOME/skyrl-rwkv-runs/$(basename "$MODEL_DIR")-antidoom-nora"
 
@@ -654,7 +661,7 @@ uv run --isolated --no-config --no-project .venv/bin/python \
   --model "$MODEL_DIR" --input "$DATA_ROOT/combined/prompts.jsonl" \
   --output "$OUTPUT_ROOT/rollout" --limit 0 --max-model-len 32768 \
   --concurrency 4096 --max-num-seqs 256 --gpu-memory-utilization 0.9 \
-  --shard-rollouts \
+  --shard-rollouts --timeout 7200 \
   > /tmp/results_antidoom_rollout.log 2>&1
 
 # Use exact rollout IDs and the same checkpoint to choose alternative tokens.
@@ -669,11 +676,11 @@ uv run --isolated --no-config --no-project .venv/bin/torchrun \
 PYTHON_EXEC="$PWD/.venv/bin/python" \
 XDG_CACHE_HOME="$HOME/.cache/skyrl-rwkv" \
 TORCH_EXTENSIONS_DIR="$HOME/.cache/skyrl-rwkv/torch_extensions" \
-uv run --isolated --no-config --no-project .venv/bin/torchrun \
+uv run --isolated --no-config --no-project --env-file .env .venv/bin/torchrun \
   --standalone --nproc-per-node=8 -m examples.train.rwkv.antidoom train \
   --model "$MODEL_DIR" --data "$OUTPUT_ROOT/data" --output "$OUTPUT_ROOT/train" \
-  --fsdp-size 1 --micro-batch-size 2 --max-batch-tokens 32768 \
-  --gradient-accumulation-steps 8 --eval-max-samples 1024 \
+  --learning-rate 5e-6 --fsdp-size 1 --micro-batch-size 8 --max-batch-tokens 32768 \
+  --gradient-accumulation-steps 2 --eval-max-samples 1024 \
   > /tmp/results_antidoom_train.log 2>&1
 ```
 
@@ -715,7 +722,8 @@ RWKV attention projections `r_proj`, `k_proj`, `v_proj`, and `o_proj`. Each FTPO
 sample scores a single next-token position. The loss keeps the notebook's
 margin 2, non-target logit MSE coefficient 0.4, target coefficient 0.05 and
 target tolerance 0.5. Reference logits come from the frozen base with the
-adapter disabled. AdamW uses LR `1.5e-5`, weight decay 0.01, a linear schedule,
+adapter disabled. AdamW's default LR is `1.5e-5`; the 13.3B teacher example
+uses `5e-6`. Weight decay is 0.01, with a linear schedule
 and gradient clipping 1.0. Set `--rank`, `--learning-rate`, `--epochs` and
 `--gradient-accumulation-steps` explicitly for other experiments.
 

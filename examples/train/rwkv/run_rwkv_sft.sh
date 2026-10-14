@@ -24,6 +24,7 @@ fi
 : "${LOGGER:=wandb}"
 : "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-nemotron-cot-sft}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
+: "${EVAL_ROOT:=$OUTPUT_ROOT/evaluation/lighteval_avg16}"
 export RAY_ADDRESS=local
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 export SKYRL_PYTHONPATH_EXPORT=1
@@ -39,7 +40,7 @@ fi
 if [[ "${UPLOAD_ONLY:-0}" == 1 ]]; then
   unset WANDB_RUN_ID WANDB_RESUME WANDB_SERVICE
   uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
-    - "$OUTPUT_ROOT/evaluation/lighteval_avg16" "$EVAL_STEP" "$UPLOAD_PHASE" "$WANDB_RUN_PATH" <<'PY'
+    - "$EVAL_ROOT" "$EVAL_STEP" "$UPLOAD_PHASE" "$WANDB_RUN_PATH" <<'PY'
 import fcntl
 import json
 import os
@@ -52,13 +53,12 @@ evaluation_root, step, phase, run_path = sys.argv[1:]
 evaluation_root = Path(evaluation_root)
 root = evaluation_root / (f"global_step_{step}/sft" if phase == "sft" else "base")
 status = root / "upload_status.json"
-with (evaluation_root / f".{phase}.upload.lock").open("a") as lock:
+with (evaluation_root.parent / f".{phase}.upload.lock").open("a") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     status.write_text(json.dumps({"state": "uploading", "global_step": int(step), "pid": os.getpid()}) + "\n")
     try:
         model_name = json.loads((root / "completed.json").read_text())["model_name"]
-        scores = {selector: json.loads((root / selector / "scores.json").read_text())
-                  for selector in ["aime24", "aime25", "aimo_progress_prize_1", "math_500"]}
+        scores = {path.parent.name: json.loads(path.read_text()) for path in root.glob("*/scores.json")}
         samples = {selector: next(iter(rows.values()))["num_completions"] //
                    next(iter(rows.values()))["num_questions"] for selector, rows in scores.items()}
         entity, project, run_id = run_path.split("/")
@@ -156,7 +156,6 @@ if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" == 1 ]]; then
   : "${EVAL_GPU_MEMORY_UTILIZATION:=0.65}"
   : "${EVAL_STEP:=$TOTAL_STEPS}"
   : "${BENCHMARK_INTERVAL:=500}"
-  EVAL_ROOT="$OUTPUT_ROOT/evaluation/lighteval_avg16"
   if (( EVAL_STEP % BENCHMARK_INTERVAL != 0 && EVAL_STEP != TOTAL_STEPS )); then
     mkdir -p "$EVAL_ROOT/global_step_$EVAL_STEP/sft"
     printf '{}\n' > "$EVAL_ROOT/global_step_$EVAL_STEP/sft/eval_metrics.json"
@@ -289,8 +288,9 @@ root = Path(root)
 eval_metrics = {}
 endpoint = ModelEndpoint(f"http://127.0.0.1:{port}", "unused", model_name,
                          int(gpu_count) * int(capacity) + 32, 25600)
-for selector in ["aime24", "aime25", "aimo_progress_prize_1", "math_500"]:
-    avg_k = 4 if selector == "math_500" else 16
+selectors = os.environ.get("EVAL_TASKS", "aime24 aime25 aimo_progress_prize_1 math_500").split()
+for selector in selectors:
+    avg_k = int(os.environ.get("EVAL_AVG_K", 4 if selector == "math_500" else 16))
     config = _litelm_model(endpoint, [endpoint], "CoT", "bot", 24576, 42,
                           cache_dir=str(root / ".lighteval_cache"))
     config.max_model_length = 32768
@@ -325,7 +325,8 @@ for selector in ["aime24", "aime25", "aimo_progress_prize_1", "math_500"]:
         eval_metrics.update({f"{phase}/{selector}/{key}": value for key, value in row.items()})
     (root / selector / "scores.json").write_text(json.dumps(rows, indent=2) + "\n")
     (root / "eval_metrics.json").write_text(json.dumps(eval_metrics, indent=2) + "\n")
-(root / "completed.json").write_text(json.dumps({"global_step": int(step), "model_name": model_name}) + "\n")
+(root / "completed.json").write_text(json.dumps({"global_step": int(step), "model_name": model_name,
+                                               "benchmarks": selectors}) + "\n")
 (root / "upload_status.json").write_text(json.dumps({"state": "queued", "global_step": int(step)}) + "\n")
 evaluation_root = root.parent.parent if phase == "sft" else root.parent
 try:
@@ -334,6 +335,7 @@ try:
             "bash", str(Path(skyrl_project) / "examples/train/rwkv/run_rwkv_sft.sh"),
         ], cwd=skyrl_project, env={**os.environ, "UPLOAD_ONLY": "1", "UPLOAD_PHASE": phase,
                                   "EVAL_STEP": step, "OUTPUT_ROOT": str(evaluation_root.parent.parent),
+                                  "EVAL_ROOT": str(evaluation_root),
                                   "WANDB_RUN_PATH": run_path, "CUDA_VISIBLE_DEVICES": ""},
            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
 except OSError as error:

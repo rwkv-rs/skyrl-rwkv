@@ -613,7 +613,11 @@ def test_prepare_groups_siblings_and_keeps_original_validation_prompts(tmp_path,
 
 
 @pytest.mark.skipif("use_nora" not in LoraConfig.__dataclass_fields__, reason="requires Joluck/NoRA")
-def test_nora_reference_and_merged_logits_after_optimizer_step():
+def test_nora_reference_and_merged_logits_after_optimizer_step(tmp_path):
+    from tokenizers import Tokenizer as RustTokenizer
+    from tokenizers.models import WordLevel
+    from transformers import PreTrainedTokenizerFast
+
     torch.manual_seed(7)
     base = LlamaForCausalLM(
         LlamaConfig(
@@ -625,6 +629,13 @@ def test_nora_reference_and_merged_logits_after_optimizer_step():
             num_key_value_heads=2,
         )
     ).eval()
+    base_path = tmp_path / "base"
+    base.save_pretrained(base_path)
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=RustTokenizer(WordLevel({str(i): i for i in range(32)}, unk_token="0")),
+        unk_token="0",
+    )
+    tokenizer.save_pretrained(base_path)
     prompt_ids = [1, 2, 3, 4]
     reference = antidoom.last_logits(base, prompt_ids, "cpu").detach()
     model = get_peft_model(
@@ -647,6 +658,12 @@ def test_nora_reference_and_merged_logits_after_optimizer_step():
     model.eval()
     adapted = antidoom.last_logits(model, prompt_ids, "cpu").detach()
     assert not torch.allclose(adapted, reference)
-    merged = model.merge_and_unload(safe_merge=True)
-    torch.testing.assert_close(antidoom.last_logits(merged, prompt_ids, "cpu"), adapted, atol=1e-6, rtol=1e-5)
+    output = tmp_path / "merged"
+    merged = antidoom.merge_and_save(model, tokenizer, base_path, output, prompt_ids, "cpu")
+    actual = antidoom.last_logits(merged, prompt_ids, "cpu")
+    torch.testing.assert_close(actual, adapted, atol=0.003, rtol=0.01)
     assert not any("lora_" in name for name, _ in merged.named_parameters())
+    assert merged.dtype == torch.float16
+    reloaded = LlamaForCausalLM.from_pretrained(output, dtype=torch.float16).eval()
+    torch.testing.assert_close(antidoom.last_logits(reloaded, prompt_ids, "cpu"), actual)
+    assert json.loads((output / "merge_metrics.json").read_text())["merge_dtype"] == "float32"

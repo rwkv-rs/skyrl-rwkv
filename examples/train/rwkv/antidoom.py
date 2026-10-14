@@ -928,7 +928,12 @@ def train(args):
         model.train()
         for epoch in range(args.epochs):
             order = (
-                list(reversed(range(len(groups))))
+                [len(groups) - 1]
+                + sorted(
+                    range(len(groups) - 1),
+                    key=lambda index: max(len(batch) * len(batch[-1]["prompt_ids"]) for batch in groups[index]),
+                    reverse=True,
+                )
                 if args.profile
                 else torch.randperm(len(groups), generator=torch.Generator().manual_seed(args.seed + epoch)).tolist()
             )

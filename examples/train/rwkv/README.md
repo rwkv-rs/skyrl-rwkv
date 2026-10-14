@@ -759,8 +759,11 @@ evaluation curves under `rwkv_antidoom`, plus the FTPO data and metrics artifact
 Use `--report-to none` for a local smoke run. After training, the final NoRA
 adapter is automatically absorbed with `merge_and_unload(safe_merge=True)`.
 `train/merged` contains full HF weights, tokenizer, generation configurations
-and `merge_metrics.json`. The merge checks the next-token log probabilities
-before and after absorption, allowing for BF16 weight rounding.
+and `merge_metrics.json`. NoRA's column normalization is computed in FP32,
+then the updates are absorbed in FP32 and the complete model is exported in
+FP16 for vLLM inference. The merge checks the FP16 adapter and absorbed model's
+next-token log probabilities and records their KL divergence. This preserves
+updates that would be lost when added directly to BF16 base weights.
 
 For a held-out before/after doom-loop comparison, run `generate` on
 `data/validation_prompts.jsonl` once with `MODEL_DIR` and once with

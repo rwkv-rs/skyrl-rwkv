@@ -522,7 +522,9 @@ async def generate(args):
                 )
                 for index in range(len(urls) if args.shard_rollouts else 1)
             ]
-            async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with aiohttp.ClientSession(
+                timeout=timeout, connector=aiohttp.TCPConnector(limit=args.concurrency)
+            ) as session:
 
                 async def request(index, sample):
                     handle = handles[index % len(handles)]

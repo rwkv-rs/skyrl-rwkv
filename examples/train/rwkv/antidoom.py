@@ -527,7 +527,7 @@ async def generate(args):
                 for index in range(len(urls) if args.shard_rollouts else 1)
             ]
             async with aiohttp.ClientSession(
-                timeout=timeout, connector=aiohttp.TCPConnector(limit=args.concurrency)
+                timeout=timeout, connector=aiohttp.TCPConnector(limit=args.concurrency, force_close=True)
             ) as session:
 
                 async def request(index, sample):
@@ -569,22 +569,30 @@ async def generate(args):
                     max_tokens = min(budget, args.max_model_len - len(prompt_ids))
                     counts["shortened_budgets"] += int(max_tokens < budget)
                     async with semaphore:
-                        async with session.post(
-                            urls[index % len(urls)].rstrip("/") + "/v1/completions",
-                            json={
-                                "model": args.model,
-                                "prompt": prompt_ids,
-                                "max_tokens": max_tokens,
-                                "n": args.samples_per_prompt,
-                                "seed": args.seed + index,
-                                "stream": False,
-                                "return_token_ids": True,
-                                "stop_token_ids": [eos_token_id],
-                                **sampling,
-                            },
-                        ) as response:
-                            response.raise_for_status()
-                            payload = await response.json()
+                        for attempt in range(3):
+                            try:
+                                async with session.post(
+                                    urls[index % len(urls)].rstrip("/") + "/v1/completions",
+                                    json={
+                                        "model": args.model,
+                                        "prompt": prompt_ids,
+                                        "max_tokens": max_tokens,
+                                        "n": args.samples_per_prompt,
+                                        "seed": args.seed + index,
+                                        "stream": False,
+                                        "return_token_ids": True,
+                                        "stop_token_ids": [eos_token_id],
+                                        **sampling,
+                                    },
+                                ) as response:
+                                    response.raise_for_status()
+                                    payload = await response.json()
+                                break
+                            except (aiohttp.ServerDisconnectedError, aiohttp.ClientOSError) as exc:
+                                if attempt == 2:
+                                    raise
+                                print(f"prompt_index={index} POST retry={attempt + 1}: {exc}", flush=True)
+                                await asyncio.sleep(1)
                     for choice in payload["choices"]:
                         response_ids = choice["token_ids"]
                         text = tokenizer.decode(response_ids, skip_special_tokens=True)

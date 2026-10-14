@@ -870,7 +870,11 @@ def train(args):
         step = 0
         model.train()
         for epoch in range(args.epochs):
-            order = torch.randperm(len(groups), generator=torch.Generator().manual_seed(args.seed + epoch)).tolist()
+            order = (
+                list(reversed(range(len(groups))))
+                if args.profile
+                else torch.randperm(len(groups), generator=torch.Generator().manual_seed(args.seed + epoch)).tolist()
+            )
             for group_index in order:
                 if step == total_steps:
                     break
@@ -894,6 +898,8 @@ def train(args):
                 grad_norm = strategy.optimizer_step(optimizer, model, scheduler)
                 values = torch.tensor([stats[key] for key in metrics], device=device, dtype=torch.float64)
                 dist.all_reduce(values)
+                peak_memory = torch.tensor(torch.cuda.max_memory_allocated(device), device=device, dtype=torch.float64)
+                dist.all_reduce(peak_memory, op=dist.ReduceOp.MAX)
                 step += 1
                 log = {f"train/{key}": value.item() / count for key, value in zip(metrics, values, strict=True)}
                 log["train/lr"] = scheduler.get_last_lr()[0]
@@ -906,7 +912,7 @@ def train(args):
                         "train/samples": count,
                         "train/tokens_per_second": sum(len(row["prompt_ids"]) for batch in group for row in batch)
                         / elapsed,
-                        "train/peak_memory_GiB": torch.cuda.max_memory_allocated(device) / 2**30,
+                        "train/peak_memory_GiB": peak_memory.item() / 2**30,
                     }
                 )
                 if not args.profile and (step % args.save_steps == 0 or step == total_steps):

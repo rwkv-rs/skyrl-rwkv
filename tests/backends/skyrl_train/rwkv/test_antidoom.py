@@ -71,6 +71,7 @@ def test_generate_requests_original_ids_and_rollout_sampling(tmp_path, monkeypat
                 prompt_template="bot",
                 generation_prompt="open_think",
                 shard_rollouts=False,
+                resume=False,
             )
         )
     )
@@ -93,7 +94,34 @@ def test_generate_requests_original_ids_and_rollout_sampling(tmp_path, monkeypat
     assert row["prompt_ids"] == [7, 9]
     assert row["response_ids"] == [65, 66]
     assert row["source"] == source
+    assert row["prompt_index"] == 0
     assert json.loads((output / "summary.json").read_text())["truncated"] == 1
+
+    args = SimpleNamespace(
+        output=output,
+        model="rwkv7-test",
+        input=input_path,
+        sampling="rollout",
+        base_url="http://example.test",
+        concurrency=1,
+        timeout=10,
+        seed=42,
+        limit=1,
+        samples_per_prompt=1,
+        max_tokens=32,
+        max_model_len=100,
+        prompt_template="bot",
+        generation_prompt="open_think",
+        shard_rollouts=False,
+        resume=True,
+    )
+    requests.clear()
+    asyncio.run(antidoom.generate(args))
+    assert requests == []
+    assert len(list(antidoom.read_jsonl(output / "rollouts.jsonl"))) == 1
+    args.sampling = "eval"
+    with pytest.raises(ValueError, match="decoding settings"):
+        asyncio.run(antidoom.generate(args))
 
 
 def test_selects_whole_benchmarks_by_truncation(tmp_path):

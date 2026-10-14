@@ -941,6 +941,9 @@ def merge_and_save(model, tokenizer, model_path, output, probe_ids, device):
     before_logp, after_logp = F.log_softmax(before, -1), F.log_softmax(after, -1)
     torch.testing.assert_close(after_logp, before_logp, atol=0.15, rtol=0.01)
     kl = (before_logp.exp() * (before_logp - after_logp)).sum(-1).item()
+    # RWKV inference temporarily casts its embedding to BF16; restore FP16
+    # so save_pretrained records the export dtype for dtype="auto" readers.
+    merged.half()
     merged.save_pretrained(output, safe_serialization=True)
     tokenizer.save_pretrained(output)
     for path in [*Path(model_path).glob("*generation_config.json"), *Path(model_path).glob("tokenizer_config.json")]:

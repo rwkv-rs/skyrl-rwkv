@@ -913,28 +913,57 @@ def evaluate(model, rows, device, batch_size=1, max_batch_tokens=32768):
 
 def merge_and_save(model, tokenizer, model_path, output, probe_ids, device):
     """Check the adapter/merged next-token distribution and export complete HF weights."""
-    model.train()
+    from peft.tuners.lora import LoraLayer
+
     with torch.no_grad():
+        # Normalize NoRA in FP32 before using the vanilla LoRA inference path.
+        # Keep these FP32 factors for merging: BF16 base-weight rounding can
+        # erase small updates, whereas rollout uses FP16 projections.
+        factors = {}
+        for layer in model.modules():
+            if isinstance(layer, LoraLayer):
+                weight_a = layer.lora_A["default"].weight.data.float()
+                weight_b = layer.lora_B["default"].weight.data.float()
+                if layer.use_nora.get("default") is True:
+                    weight_a = weight_a / (weight_a.norm(dim=0, keepdim=True) + 1e-6)
+                    layer.use_nora["default"] = False
+                factors[layer] = (weight_a, weight_b)
+                layer.lora_A["default"].weight.data = weight_a
+        model.half().eval()
         before = last_logits(model, probe_ids, device)
-        merged = model.merge_and_unload(safe_merge=True)
+        for layer, (weight_a, weight_b) in factors.items():
+            layer.get_base_layer().weight.data = layer.get_base_layer().weight.data.float()
+            layer.lora_A["default"].weight.data = weight_a
+            layer.lora_B["default"].weight.data = weight_b
+        merged = model.merge_and_unload(safe_merge=True).half().to(device).eval()
         after = last_logits(merged, probe_ids, device)
     max_error = (before - after).abs().max().item()
-    # BF16 merging rounds the weight update into the base weights.
-    torch.testing.assert_close(F.log_softmax(after, -1), F.log_softmax(before, -1), atol=0.15, rtol=0.01)
+    before_logp, after_logp = F.log_softmax(before, -1), F.log_softmax(after, -1)
+    torch.testing.assert_close(after_logp, before_logp, atol=0.15, rtol=0.01)
+    kl = (before_logp.exp() * (before_logp - after_logp)).sum(-1).item()
     merged.save_pretrained(output, safe_serialization=True)
     tokenizer.save_pretrained(output)
     for path in [*Path(model_path).glob("*generation_config.json"), *Path(model_path).glob("tokenizer_config.json")]:
         (output / path.name).write_bytes(path.read_bytes())
-    (output / "merge_metrics.json").write_text(json.dumps({"max_logit_error": max_error}) + "\n")
+    (output / "merge_metrics.json").write_text(
+        json.dumps(
+            {
+                "max_logit_error": max_error,
+                "kl_reference_merged": kl,
+                "merge_dtype": "float32",
+                "export_dtype": "float16",
+            }
+        )
+        + "\n"
+    )
     return merged
 
 
 def train(args):
     import torch.distributed as dist
-    from peft import LoraConfig, TaskType, get_peft_model
+    from peft import LoraConfig, PeftModel, TaskType, get_peft_model
     from safetensors.torch import save_file
     from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
-    from skyrl.backends.skyrl_train.distributed.fsdp_utils import fsdp2_get_full_state_dict
     from skyrl.backends.skyrl_train.distributed.fsdp_utils import layered_summon_lora_params
     from skyrl.train.config import FSDPConfig, OptimizerConfig
 
@@ -1105,16 +1134,14 @@ def train(args):
                         run.log(log, step=step)
         if args.profile:
             return
-        full_state = fsdp2_get_full_state_dict(model, cpu_offload=True, rank0_only=True)
         del model, optimizer, scheduler
         gc.collect()
         torch.cuda.empty_cache()
         dist.barrier()
         if dist.get_rank() == 0:
-            config = LoraConfig.from_pretrained(args.output / "adapters" / f"step_{step}")
-            model = get_peft_model(load_model(args.model), config)
-            model.load_state_dict(full_state)
-            del full_state
+            model = PeftModel.from_pretrained(
+                load_model(args.model), args.output / "adapters" / f"step_{step}", is_trainable=True
+            )
             model.to(device)
             merge_and_save(model, tokenizer, args.model, args.output / "merged", val_rows[0]["prompt_ids"], device)
             if run:
@@ -1123,6 +1150,11 @@ def train(args):
                 artifact.add_file(str(args.output / "metrics.jsonl"))
                 run.log_artifact(artifact)
         dist.barrier()
+    except BaseException:
+        import traceback
+
+        traceback.print_exc()
+        raise
     finally:
         if run:
             run.finish()

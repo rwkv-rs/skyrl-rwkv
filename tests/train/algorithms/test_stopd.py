@@ -410,6 +410,7 @@ def test_actual_training_input_preserves_generated_prefix_and_ipw(tmp_path, corr
     data["action_log_probs"] = data["rollout_logprobs"].clone()
     data["base_action_log_probs"] = data["action_log_probs"] + 0.1 * data["loss_mask"]
     data["rewards"] = -(data["action_log_probs"] - data["base_action_log_probs"]) * data["loss_mask"]
+    data["returns"] = data["rewards"].clone()
     stopd = STOPD(8, 2, 0, 11)
     data["advantages"] = data["rewards"] * stopd.multiplier(data["loss_mask"], data["loss_mask"].sum())
     rows = [
@@ -418,6 +419,7 @@ def test_actual_training_input_preserves_generated_prefix_and_ipw(tmp_path, corr
     ]
     if corrupt:
         data[corrupt][0, -1] += 1
+    data.pop("rewards")
     directory = tmp_path / "exports/dumped_data"
     directory.mkdir(parents=True)
     data.save(directory / "global_step_51_training_input.pkl")

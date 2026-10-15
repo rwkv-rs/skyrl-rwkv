@@ -30,6 +30,8 @@ fi
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
 # Share the exact interpreter/cache identity with torchrun across worktrees.
 export UV_PROJECT_ENVIRONMENT="$(realpath .venv)"
+# Workers inherit this prepared environment, including AntiDoom's PEFT fork.
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 # FlashRWKV2 uses get_default_build_root() (XDG_CACHE_HOME), not TORCH_EXTENSIONS_DIR.
 export XDG_CACHE_HOME="$HOME/.cache/skyrl-rwkv"
 export TORCH_EXTENSIONS_DIR="$XDG_CACHE_HOME/torch_extensions"

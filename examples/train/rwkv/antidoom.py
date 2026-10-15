@@ -1317,6 +1317,7 @@ def train(args):
             dist.barrier()
 
         step = 0
+        samples_seen = 0
         model.train()
         if not args.profile:
             baseline = evaluate(model, eval_rows, device, args.micro_batch_size, args.max_batch_tokens)
@@ -1357,12 +1358,14 @@ def train(args):
                     if valid:
                         for key, value in metrics.items():
                             stats[key] += value.item() * len(rows)
+                learning_rate = optimizer.param_groups[0]["lr"]
                 grad_norm = strategy.optimizer_step(optimizer, model, scheduler)
                 values = torch.tensor([stats[key] for key in metrics], device=device, dtype=torch.float64)
                 dist.all_reduce(values)
                 peak_memory = torch.tensor(torch.cuda.max_memory_allocated(device), device=device, dtype=torch.float64)
                 dist.all_reduce(peak_memory, op=dist.ReduceOp.MAX)
                 step += 1
+                samples_seen += count
                 log = {f"train/{key}": value.item() / count for key, value in zip(metrics, values, strict=True)}
                 log["train/lr"] = scheduler.get_last_lr()[0]
                 if grad_norm is not None:
@@ -1372,6 +1375,9 @@ def train(args):
                     {
                         "train/step_seconds": elapsed,
                         "train/samples": count,
+                        "train/samples_seen": samples_seen,
+                        "train/epoch": samples_seen / len(train_rows),
+                        "train/lr_used": learning_rate,
                         "train/tokens_per_second": sum(len(row["prompt_ids"]) for batch in group for row in batch)
                         / elapsed,
                         "train/peak_memory_GiB": peak_memory.item() / 2**30,
@@ -1387,7 +1393,8 @@ def train(args):
                         run.log(log, step=step)
         if args.profile:
             return
-        del model, optimizer, scheduler
+        del model
+        optimizer = scheduler = None
         gc.collect()
         torch.cuda.empty_cache()
         dist.barrier()
@@ -1396,9 +1403,9 @@ def train(args):
             model.to(device)
             merge_and_save(model, tokenizer, args.model, args.output / "merged", val_rows[0]["prompt_ids"], device)
             if run:
-                artifact = wandb.Artifact(f"{run.id}-ftpo", type="dataset")
-                artifact.add_dir(str(args.data))
+                artifact = wandb.Artifact(f"{run.id}-training-results", type="training-results")
                 artifact.add_file(str(args.output / "metrics.jsonl"))
+                artifact.add_file(str(args.output / "merged" / "merge_metrics.json"))
                 run.log_artifact(artifact)
         dist.barrier()
     except BaseException:

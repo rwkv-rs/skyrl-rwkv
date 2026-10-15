@@ -374,11 +374,18 @@ def test_benchmark_replays_complete_configuration_and_checkpoint(tmp_path, monke
     assert original["trainer"]["resume_path"] is None
 
 
-def test_benchmark_requires_complete_finite_updates_and_native_state_restore(tmp_path):
+@pytest.mark.parametrize(
+    "backend_message",
+    [
+        "Successfully loaded optimizer state",
+        "Checkpoint weights, optimizer and scheduler restored on 8 ranks",
+    ],
+)
+def test_benchmark_requires_complete_finite_updates_and_native_state_restore(tmp_path, backend_message):
     lines = ["Successfully loaded dataloader state"]
     (tmp_path / "logs").mkdir()
     infra = tmp_path / "logs/infra-test.log"
-    infra.write_text("Successfully loaded optimizer state")
+    infra.write_text(backend_message)
     for _ in range(3):
         for stage in ("step", "generate", "fwd_logprobs_values_reward", "policy_train", "sync_weights"):
             lines.append(f"Finished: '{stage}', time cost: 3.00s")

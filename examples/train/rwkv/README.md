@@ -749,7 +749,14 @@ containing EOS or RWKV protocol tokens.
 
 NoRA uses `use_nora=True`, rank 8, alpha equal to rank, zero dropout, and the
 RWKV attention projections `r_proj`, `k_proj`, `v_proj`, `o_proj`, and the
-`lm_head` output projection. `--target-modules` can select the adaptation scope. Each FTPO
+`lm_head` output projection. `--target-modules` can select the adaptation scope.
+The attention training path calls these projection modules, so PEFT computes
+NoRA's normalized low-rank update outside the FlashRWKV2 recurrent operators;
+the WKV kernels do not need adapter-specific changes. ChannelMix `key` and
+`value` use fused weight-based training operators and are not adaptation targets
+in this example. Native fused inference requires absorbing the adapter first;
+the export below normalizes attention factors and absorbs the output head before
+checking the fused inference path. Each FTPO
 sample scores a single next-token position. The loss keeps the notebook's
 margin 2, non-target logit MSE coefficient 0.4, target coefficient 0.05 and
 target tolerance 0.5. Reference logits come from the frozen base with the
@@ -777,7 +784,7 @@ throughput, and the maximum allocation across all ranks before a production
 run. Profiling visits the longest context groups first.
 
 For `rwkv7-g1k-13.3b-20260930-ctx25600` on eight 96-GB RTX PRO 6000 GPUs,
-the validated production configuration uses `--rank 256 --lora-alpha 256`,
+the resource-benchmarked production configuration uses `--rank 256 --lora-alpha 256`,
 `--learning-rate 2e-6 --warmup-ratio 0.05 --epochs 3 --max-steps 0`,
 `--micro-batch-size 16 --max-batch-tokens 32768`, and
 `--gradient-accumulation-steps 1 --fsdp-size 1`. Keep the output head and
@@ -810,9 +817,12 @@ For a held-out before/after doom-loop comparison, run `generate` on
 `$OUTPUT_ROOT/train/merged`, using distinct output directories and the same
 seed and token budget. Set `--sampling eval` for both runs: temperature 0.96,
 top-p 0.76, top-k 32, presence penalty 1.0, frequency penalty 0.1, and decay
-0.988. Compare `doom_loop_rate` and `truncated` in each `summary.json` alongside
-the saved completions. Held-out FTPO loss measures preference fit; free
-generation supplies the before/after repetition metric.
+0.988. `doom_loop_rate` in `summary.json` measures consecutive exact text-block
+repetition only. Compare it with `truncated` and answer quality, and inspect
+truncated completions for paraphrased reasoning loops, repeated draft/check
+cycles and task drift. Zero exact repetitions does not establish zero semantic
+repetition. Held-out FTPO loss measures preference fit; free generation and
+completion review supply the before/after behavioral evaluation.
 
 For paired answer-quality evaluation, use the same ordered held-out input file
 and seed for both checkpoints. Each saved response records its actual seed

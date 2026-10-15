@@ -28,15 +28,16 @@ fi
 : "${LOGGER:=wandb}"
 : "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-ultradata-opd-nora-from-rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
-export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+# Share the exact interpreter/cache identity with torchrun across worktrees.
+export UV_PROJECT_ENVIRONMENT="$(realpath .venv)"
 # FlashRWKV2 uses get_default_build_root() (XDG_CACHE_HOME), not TORCH_EXTENSIONS_DIR.
 export XDG_CACHE_HOME="$HOME/.cache/skyrl-rwkv"
 export TORCH_EXTENSIONS_DIR="$XDG_CACHE_HOME/torch_extensions"
 
 # Check the exact native cache key before loading.
-uv run --isolated --no-config --no-project .venv/bin/python examples/train/rwkv/prepare_flashrwkv2.py --check
+uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" examples/train/rwkv/prepare_flashrwkv2.py --check
 
-uv run --isolated --no-config --no-project .venv/bin/python -m examples.train.on_policy_distillation.main_on_policy_distill \
+uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" -m examples.train.on_policy_distillation.main_on_policy_distill \
   data.train_data="['$TRAIN_FILE']" \
   data.val_data="['$TEST_FILE']" \
   trainer.algorithm.advantage_estimator=no_op \

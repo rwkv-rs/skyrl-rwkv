@@ -679,7 +679,7 @@ TORCH_EXTENSIONS_DIR="$HOME/.cache/skyrl-rwkv/torch_extensions" \
 uv run --isolated --no-config --no-project --env-file .env .venv/bin/torchrun \
   --standalone --nproc-per-node=8 -m examples.train.rwkv.antidoom train \
   --model "$MODEL_DIR" --data "$OUTPUT_ROOT/data" --output "$OUTPUT_ROOT/train" \
-  --learning-rate 5e-6 --fsdp-size 1 --micro-batch-size 8 --max-batch-tokens 32768 \
+  --learning-rate 5e-7 --epochs 1 --fsdp-size 1 --micro-batch-size 8 --max-batch-tokens 32768 \
   --gradient-accumulation-steps 2 --eval-max-samples 1024 \
   > /tmp/results_antidoom_train.log 2>&1
 ```
@@ -728,15 +728,39 @@ sequences, recorded as `retokenized_evaluation_cache` in the data manifest.
 The cached decoding parameters and model alias remain in the provenance.
 FTPO alternatives are recomputed from the selected training checkpoint.
 
+Data construction follows the full
+[Antidoom reference](https://github.com/Liquid4All/antidoom/tree/bd6a126476e18554b0cacaea3fd9f258fdde1f97/src/antidoom),
+including token-aware loop-boundary refinement, ascending-probability candidate
+selection within top-50 and `--chosen-min-p 0.01`, rejected-token frequency
+normalisation (strength 0.3), and chosen-surface deduplication/pruning (strength
+0.5; reference count is the larger of 50 and the 95th percentile). RWKV-specific
+filtering excludes EOS and the `✿` protocol delimiter from both preference
+targets. Incomplete UTF-8 byte tokens retain their distinct token IDs.
+The notebook's simplified from-scratch, highest-probability-first extraction omits these
+reference pipeline steps.
+
+By default `prepare` retains 70% of the training pool so rejected-token
+normalisation can downsample frequent targets; `--max-train-examples` overrides
+that limit. The held-out problem split and generation prompts are fixed before
+training-row regularisation. Validation rows are not frequency-downsampled.
+The manifest records the reference revision and construction parameters.
+Rebuild existing FTPO data with `prepare`; `train` rejects preference targets
+containing EOS or RWKV protocol tokens.
+
 NoRA uses `use_nora=True`, rank 8, alpha equal to rank, zero dropout, and the
 RWKV attention projections `r_proj`, `k_proj`, `v_proj`, and `o_proj`. Each FTPO
 sample scores a single next-token position. The loss keeps the notebook's
 margin 2, non-target logit MSE coefficient 0.4, target coefficient 0.05 and
 target tolerance 0.5. Reference logits come from the frozen base with the
-adapter disabled. AdamW's default LR is `1.5e-5`; the 13.3B teacher example
-uses `5e-6`. Weight decay is 0.01, with a linear schedule
+adapter disabled. Batched MSE terms are averaged across the masked token
+positions, matching the reference even after chosen counts vary per example.
+AdamW's default LR is `5e-7`, a conservative starting point for the normalized
+NoRA update. The reference notebook's `1.5e-5` uses ordinary LoRA and is not a
+scale-equivalent NoRA setting. Weight decay is 0.01, with a linear schedule
 and gradient clipping 1.0. Set `--rank`, `--learning-rate`, `--epochs` and
-`--gradient-accumulation-steps` explicitly for other experiments.
+`--gradient-accumulation-steps` explicitly for other experiments. `--lora-alpha`
+can override NoRA's default alpha equal to rank. Check free-generation answer
+quality during a short pilot before extending training.
 `--warmup-ratio` optionally reserves the initial fraction of optimizer steps
 for linear warmup (default 0).
 

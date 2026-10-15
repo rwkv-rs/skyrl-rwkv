@@ -150,6 +150,8 @@ class SFTConfig(BaseConfig):
     the full ``[T, vocab]`` logits (Megatron). Maps to ``trainer.fused_lm_head_logprob``."""
     logprobs_chunk_size: Optional[int] = 1024
     """Token chunk size for the fused LM head. Maps to ``trainer.logprobs_chunk_size``."""
+    rwkv_chunk_size: int = 0
+    """Checkpoint RWKV training in recurrent chunks with full cross-chunk gradients; 0 disables chunking."""
     record_memory: bool = False
     """Save memory snapshots to ``{ckpt_path}/memory_snapshots/``.
     Visualize by dragging pickle files to https://docs.pytorch.org/memory_viz."""
@@ -221,6 +223,19 @@ class SFTConfig(BaseConfig):
     when an eval dataset is configured. ``0`` disables periodic eval."""
     eval_before_train: bool = False
     """If True, run a baseline eval pass before training begins (logged at step 0)."""
+    eval_command: Optional[List[str]] = None
+    """Run an external benchmark command after each eval loss pass.
+
+    Arguments may contain ``{global_step}`` and ``{export_path}``. The current
+    policy is exported first and training waits for the command to finish.
+    Unused CUDA allocator memory is released before starting the command.
+    """
+    eval_command_metrics_path: str = ""
+    """Read external benchmark metrics from this JSON file after eval_command.
+
+    Supports ``{global_step}`` and ``{export_path}``. Metrics are merged with
+    eval loss and logged at the same training step, under the ``eval/`` prefix.
+    """
     max_length: Optional[int] = None
     """Maximum length of tokenized sequences. If specified, all sequences will be truncated to this value
     By default, no truncation is performed"""
@@ -557,6 +572,8 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
         raise ValueError(f"micro_train_batch_size_per_gpu must be > 0, got {cfg.micro_train_batch_size_per_gpu}")
     if cfg.batch_size <= 0:
         raise ValueError(f"batch_size must be > 0, got {cfg.batch_size}")
+    if cfg.rwkv_chunk_size < 0:
+        raise ValueError("rwkv_chunk_size must be non-negative")
     if cfg.num_steps is not None and cfg.num_steps <= 0:
         raise ValueError(f"num_steps must be > 0, got {cfg.num_steps}")
     if cfg.num_steps is None:
@@ -589,6 +606,8 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
         raise ValueError("eval_interval > 0 requires eval_datasets or eval_pretokenized_dataset_paths to be set")
     if cfg.eval_before_train and not has_eval_dataset:
         raise ValueError("eval_before_train=True requires eval_datasets or eval_pretokenized_dataset_paths to be set")
+    if cfg.eval_command and not cfg.eval_command_metrics_path:
+        raise ValueError("eval_command requires eval_command_metrics_path")
 
     #  checks for megatron
     if cfg.strategy == "megatron":
@@ -668,6 +687,7 @@ def build_skyrl_config_for_sft(sft_cfg: SFTConfig) -> SkyRLTrainConfig:
     cfg.trainer.policy.language_model_only = sft_cfg.language_model_only
     cfg.trainer.fused_lm_head_logprob = sft_cfg.fused_lm_head_logprob
     cfg.trainer.logprobs_chunk_size = sft_cfg.logprobs_chunk_size
+    cfg.trainer.rwkv_chunk_size = sft_cfg.rwkv_chunk_size
     cfg.trainer.policy.torch_profiler_config = sft_cfg.torch_profiler_config
 
     # SFT doesn't use KL/ref model

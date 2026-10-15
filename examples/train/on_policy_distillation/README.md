@@ -13,6 +13,9 @@ In `main_on_policy_distill.py` we provide a simple example for modifying SkyRL t
 
 We provide a full writeup at https://novasky-ai.notion.site/on-policy-distillation.
 
+For RWKV7 G1k-13.3B to G1k-1.5B distillation using this same entry point, see the
+[RWKV recipe](../rwkv/README.md#on-policy-distillation).
+
 ## Quickstart
 To get started, first set up the dataset from the DAPO example:
 

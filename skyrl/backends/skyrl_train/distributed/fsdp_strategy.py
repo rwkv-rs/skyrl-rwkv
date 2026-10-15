@@ -210,7 +210,12 @@ class FSDPStrategy(DistributedStrategy):
             reduce_dtype = torch.float32
 
         assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
-        mp_policy = MixedPrecisionPolicy(param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=True)
+        # Recurrent RWKV chunks carry FP32 WKV states between decoder layers.
+        # Their hidden states already follow the BF16 compute parameters.
+        rwkv_infctx = is_wrapped and model.is_rwkv and model.rwkv_chunk_size > 0
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=not rwkv_infctx
+        )
 
         cpu_offload = CPUOffloadPolicy(pin_memory=True) if self.fsdp_config.cpu_offload else None
 
@@ -272,6 +277,7 @@ class FSDPStrategy(DistributedStrategy):
                 new_optimizer,
                 num_warmup_steps=optim_config.num_warmup_steps,
                 num_training_steps=self.total_training_steps,
+                scheduler_specific_kwargs=optim_config.scheduler_specific_kwargs,
             )
         else:
             new_optimizer = None
@@ -387,6 +393,7 @@ class FSDPStrategy(DistributedStrategy):
         # Define paths for saving individual rank files
         rank = self.get_rank()
         world_size = self.world_size
+        replicated_rwkv = isinstance(model, HFModelWrapper) and model.is_rwkv and self.fsdp_config.fsdp_size == 1
 
         with io.local_work_dir(ckpt_dir) as work_dir:
             model_path = os.path.join(work_dir, f"model_world_size_{world_size}_rank_{rank}.pt")
@@ -397,17 +404,30 @@ class FSDPStrategy(DistributedStrategy):
                 warnings.simplefilter("ignore")
                 # FSDP2 state_dict returns DTensors directly; no state_dict_type context needed.
                 model_state_dict = save_model.state_dict()
-                self.print(f"[rank-{rank}]: Saving model to {model_path}")
-                with io.open_file(model_path, "wb") as f:
-                    torch.save(model_state_dict, f)
-
                 # Get and save optimizer state dict if optimizer is provided
                 optimizer_state_dict = {}
                 if optimizer is not None:
                     optimizer_state_dict = optimizer.state_dict()
-                self.print(f"[rank-{rank}]: Saving optim to {optim_path}")
-                with io.open_file(optim_path, "wb") as f:
-                    torch.save(optimizer_state_dict, f)
+                if not replicated_rwkv or rank == 0:
+                    if replicated_rwkv:
+                        from torch.distributed.tensor import DTensor
+                        from torch.utils._pytree import tree_map
+
+                        # fsdp_size=1: every local tensor is the complete parameter/state.
+                        model_state_dict = tree_map(
+                            lambda value: value.to_local() if isinstance(value, DTensor) else value,
+                            model_state_dict,
+                        )
+                        optimizer_state_dict = tree_map(
+                            lambda value: value.to_local() if isinstance(value, DTensor) else value,
+                            optimizer_state_dict,
+                        )
+                    self.print(f"[rank-{rank}]: Saving model to {model_path}")
+                    with io.open_file(model_path, "wb") as f:
+                        torch.save(model_state_dict, f)
+                    self.print(f"[rank-{rank}]: Saving optim to {optim_path}")
+                    with io.open_file(optim_path, "wb") as f:
+                        torch.save(optimizer_state_dict, f)
 
                 # Get scheduler state dict if scheduler is provided
                 lr_scheduler_state_dict = {}
@@ -441,7 +461,15 @@ class FSDPStrategy(DistributedStrategy):
                 # Also save runtime FSDP config
                 fsdp_config_path = os.path.join(work_dir, "fsdp_config.json")
                 with io.open_file(fsdp_config_path, "w") as f:
-                    json.dump({"fsdp_strategy": self.fsdp_strategy, "world_size": self.world_size}, f, indent=4)
+                    json.dump(
+                        {
+                            "fsdp_strategy": self.fsdp_strategy,
+                            "world_size": self.world_size,
+                            "replicated_rwkv": replicated_rwkv,
+                        },
+                        f,
+                        indent=4,
+                    )
 
         # Save LoRA adapters if using LoRA
         if self.is_lora and hasattr(save_model, "peft_config"):
@@ -475,6 +503,24 @@ class FSDPStrategy(DistributedStrategy):
         load_model = model
         if isinstance(model, HFModelWrapper):
             load_model = model.model
+
+        config_path = os.path.join(ckpt_dir, "fsdp_config.json")
+        if io.exists(config_path):
+            with io.open_file(config_path, "r") as f:
+                saved_config = json.load(f)
+                saved_world_size = saved_config["world_size"]
+            if saved_world_size != self.world_size or saved_config.get("replicated_rwkv", False):
+                return self._load_resharded_checkpoint(
+                    load_model,
+                    ckpt_dir,
+                    saved_world_size,
+                    optimizer,
+                    scheduler,
+                    load_module_strict,
+                    load_optimizer_states,
+                    load_lr_scheduler_states,
+                    replicated_rwkv=saved_config.get("replicated_rwkv", False),
+                )
 
         # Define paths for loading individual rank files
         rank = self.get_rank()
@@ -552,6 +598,103 @@ class FSDPStrategy(DistributedStrategy):
         self.print(f"[rank-{rank}]: Checkpoint loaded successfully from {ckpt_dir}")
 
         return ckpt_dir, states
+
+    def _load_resharded_checkpoint(
+        self,
+        model,
+        ckpt_dir,
+        saved_world_size,
+        optimizer,
+        scheduler,
+        load_module_strict,
+        load_optimizer_states,
+        load_lr_scheduler_states,
+        replicated_rwkv=False,
+    ):
+        """Restore a replicated checkpoint or reshard a one-dimensional FSDP checkpoint.
+
+        Read the full replica or reconstruct saved shards on rank 0, then use
+        PyTorch's distributed state-dict APIs to distribute weights and Adam state.
+        """
+        from torch.distributed.checkpoint.state_dict import (
+            StateDictOptions,
+            set_model_state_dict,
+            set_optimizer_state_dict,
+        )
+        from torch.distributed.tensor import DTensor, Shard
+        from torch.utils._pytree import tree_map
+
+        def merge_shards(*values):
+            first = values[0]
+            if not isinstance(first, DTensor):
+                return first
+            if first.device_mesh.ndim != 1 or not isinstance(first.placements[0], Shard):
+                raise ValueError("Changing GPU count requires a one-dimensional sharded FSDP checkpoint")
+            dim = first.placements[0].dim
+            return torch.cat([value.to_local() for value in values], dim=dim).narrow(dim, 0, first.shape[dim])
+
+        def load_full_state(prefix):
+            ranks = [0] if replicated_rwkv else range(saved_world_size)
+            files = [f"{prefix}_world_size_{saved_world_size}_rank_{rank}.pt" for rank in ranks]
+            with io.local_read_files(ckpt_dir, files) as read_dir:
+                shards = [
+                    torch.load(
+                        os.path.join(read_dir, name),
+                        map_location="cpu",
+                        weights_only=False,
+                    )
+                    for name in files
+                ]
+            return shards[0] if replicated_rwkv else tree_map(merge_shards, *shards)
+
+        rank = self.get_rank()
+        self.print(f"Restoring FSDP checkpoint from {saved_world_size} to {self.world_size} ranks")
+        full_model_state = load_full_state("model") if rank == 0 else {}
+        options = StateDictOptions(full_state_dict=True, broadcast_from_rank0=True, strict=load_module_strict)
+        set_model_state_dict(model, full_model_state, options=options)
+        del full_model_state
+
+        if optimizer is not None and load_optimizer_states:
+            full_optimizer_state = {}
+            if rank == 0:
+                full_optimizer_state = load_full_state("optim")
+                # Native optimizer.state_dict uses integer IDs; DCP uses parameter names.
+                names = {id(parameter): name for name, parameter in model.named_parameters()}
+                id_to_name = {}
+                for saved_group, group in zip(
+                    full_optimizer_state["param_groups"],
+                    optimizer.param_groups,
+                    strict=True,
+                ):
+                    for parameter_id, parameter in zip(saved_group["params"], group["params"], strict=True):
+                        id_to_name[parameter_id] = names[id(parameter)]
+                    saved_group["params"] = [id_to_name[parameter_id] for parameter_id in saved_group["params"]]
+                full_optimizer_state["state"] = {
+                    id_to_name[parameter_id]: state for parameter_id, state in full_optimizer_state["state"].items()
+                }
+            set_optimizer_state_dict(model, optimizer, full_optimizer_state, options=options)
+            del full_optimizer_state
+
+        # Rank-local random streams cannot be bitwise preserved when ranks change.
+        extra_file = f"extra_state_world_size_{saved_world_size}_rank_{rank % saved_world_size}.pt"
+        with io.local_read_files(ckpt_dir, [extra_file]) as read_dir:
+            extra = torch.load(
+                os.path.join(read_dir, extra_file),
+                map_location="cpu",
+                weights_only=False,
+            )
+        if scheduler is not None and load_lr_scheduler_states:
+            scheduler.load_state_dict(extra["lr_scheduler"])
+        self.load_rng_state(extra["rng"])
+        dist.barrier()
+        self.print(f"Checkpoint weights, optimizer and scheduler restored on {self.world_size} ranks")
+        return ckpt_dir, {
+            "client_state": extra.get("client_state", {}),
+            "tag": extra.get("tag"),
+            "fsdp_strategy": self.fsdp_strategy,
+            "world_size": self.world_size,
+            "rank": rank,
+        }
 
     # TODO (erictang000): Test in multi-node setting
     def save_hf_model(self, model: Union[HFModelWrapper, nn.Module], output_dir: str, tokenizer=None, **kwargs) -> None:

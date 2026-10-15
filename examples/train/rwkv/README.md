@@ -759,8 +759,8 @@ NoRA update. The reference notebook's `1.5e-5` uses ordinary LoRA and is not a
 scale-equivalent NoRA setting. Weight decay is 0.01, with a linear schedule
 and gradient clipping 1.0. Set `--rank`, `--learning-rate`, `--epochs` and
 `--gradient-accumulation-steps` explicitly for other experiments. `--lora-alpha`
-can override NoRA's default alpha equal to rank. Check free-generation answer
-quality during a short pilot before extending training.
+can override NoRA's default alpha equal to rank. For a complete training cycle,
+use `--max-steps 0` so the learning-rate schedule spans all requested epochs.
 `--warmup-ratio` optionally reserves the initial fraction of optimizer steps
 for linear warmup (default 0).
 
@@ -779,7 +779,10 @@ Every 50 optimizer steps and at the final step, training writes adapter weights,
 per-rank optimizer/scheduler/RNG states, and held-out FTPO loss on a fixed
 `--eval-max-samples` subset. The frozen base is identified by the exact model
 path instead of being copied into every checkpoint. W&B receives training and
-evaluation curves under `rwkv_antidoom`, plus the FTPO data and metrics artifact.
+evaluation curves under `rwkv_antidoom`, plus training and merge metrics artifacts.
+Training logs include cumulative examples, completed epoch fraction and the
+learning rate actually used by each optimizer update. Preference data and
+generation text remain in the experiment output directory.
 Use `--report-to none` for a local smoke run. After training, the final NoRA
 adapter is automatically absorbed with `merge_and_unload(safe_merge=True)`.
 `train/merged` contains full HF weights, tokenizer, generation configurations

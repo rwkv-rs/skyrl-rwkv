@@ -111,6 +111,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   trainer.export_path="$OUTPUT_ROOT/exports" \
   generator.inference_engine.backend=vllm \
   generator.inference_engine.model_dtype=float16 \
+  generator.inference_engine.engine_init_kwargs.logprobs_mode=raw_logprobs \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.num_engines="$NUM_GPUS" \
   generator.inference_engine.tensor_parallel_size=1 \

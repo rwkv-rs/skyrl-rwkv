@@ -1,16 +1,118 @@
+import copy
+import os
 import sys
+from dataclasses import dataclass, field
 
-import torch
 import ray
-from skyrl.train.config import SkyRLTrainConfig
-from skyrl.train.entrypoints.main_base import BasePPOExp
-from skyrl.train.trainer import RayPPOTrainer
-from skyrl.train.utils import initialize_ray
-from skyrl.train.entrypoints.main_base import validate_cfg
+import torch
+
+from examples.train.on_policy_distillation.stopd import STOPD, STOPDConfig, request_seed
+from skyrl.backends.skyrl_train.inference_servers.utils import resolve_policy_model_name
+from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from skyrl.backends.skyrl_train.utils.io import io
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
     register_advantage_estimator,
 )
-from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from skyrl.train.config import AlgorithmConfig, SkyRLTrainConfig, make_config
+from skyrl.train.entrypoints.main_base import BasePPOExp, validate_cfg
+from skyrl.train.generators.base import TRAINING_PHASE_EVAL
+from skyrl.train.generators.skyrl_gym_generator import SkyRLGymGenerator
+from skyrl.train.trainer import RayPPOTrainer
+from skyrl.train.utils import initialize_ray
+
+
+@dataclass
+class OnPolicyDistillationAlgorithmConfig(AlgorithmConfig):
+    stopd: STOPDConfig = field(default_factory=STOPDConfig)
+    """Optional stochastic truncation, inverse-probability weights, and lagged normalization."""
+
+
+OnPolicyDistillationConfig = make_config(algorithm_cls=OnPolicyDistillationAlgorithmConfig)
+
+
+def validate_stopd_cfg(cfg):
+    if not cfg.trainer.algorithm.stopd.enabled:
+        return
+    algorithm = cfg.trainer.algorithm
+    generator = cfg.generator
+    if generator.apply_overlong_filtering:
+        raise ValueError("STOPD requires apply_overlong_filtering=false to retain sampled prefixes")
+    generator.preserve_truncated_action_mask = True
+    if (
+        algorithm.advantage_estimator != "no_op"
+        or algorithm.policy_loss_type != "importance_sampling"
+        or not algorithm.use_kl_in_reward
+        or algorithm.use_kl_loss
+        or algorithm.use_entropy_loss
+        or algorithm.advantage_batch_normalize
+        or algorithm.loss_reduction != "token_mean"
+    ):
+        raise ValueError("STOPD requires token-mean OPD with no_op advantages and importance_sampling loss")
+    if (
+        generator.max_turns != 1
+        or generator.batched
+        or generator.step_wise_trajectories
+        or not generator.use_conversation_multi_turn
+        or generator.vision_language_generator
+        or generator.n_samples_per_prompt != 1
+        or cfg.trainer.fully_async.enabled
+        or algorithm.dynamic_sampling.type is not None
+        or cfg.trainer.update_epochs_per_batch != 1
+        or cfg.trainer.policy_mini_batch_size != cfg.trainer.train_batch_size
+    ):
+        raise ValueError("STOPD requires synchronous single-turn rollouts and one optimizer step per rollout batch")
+    if algorithm.stopd.block > generator.sampling_params.max_generate_length:
+        raise ValueError("STOPD block must not exceed max_generate_length")
+
+
+class STOPDGenerator(SkyRLGymGenerator):
+    """Use native trajectory generation with independent per-request token budgets."""
+
+    def __init__(self, *args, stopd_cfg, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.stopd = STOPD(
+            self.generator_cfg.sampling_params.max_generate_length,
+            **{key: value for key, value in vars(stopd_cfg).items() if key != "enabled"},
+        )
+
+    async def generate(self, input_batch, disable_tqdm=False):
+        metadata = input_batch["batch_metadata"]
+        if metadata.training_phase == TRAINING_PHASE_EVAL:
+            return await super().generate(input_batch, disable_tqdm=disable_tqdm)
+        self.stopd.step = metadata.global_step - 1
+        budgets = self.stopd.budgets(len(input_batch["prompts"]))
+        input_batch = {**input_batch, "env_extras": copy.deepcopy(input_batch["env_extras"])}
+        for index, (extras, budget) in enumerate(zip(input_batch["env_extras"], budgets, strict=True)):
+            extras["_stopd_budget"] = budget
+            extras["_stopd_seed"] = request_seed(self.stopd.seed, metadata.global_step, index, 0, "rollout")
+        return await super().generate(input_batch, disable_tqdm=disable_tqdm)
+
+    async def agent_loop(
+        self,
+        prompt,
+        env_class,
+        env_extras,
+        max_tokens,
+        max_input_length,
+        sampling_params=None,
+        trajectory_id=None,
+        cache_salt=None,
+        training_phase="train",
+    ):
+        if training_phase != TRAINING_PHASE_EVAL:
+            max_tokens = env_extras.pop("_stopd_budget")
+            sampling_params = {**sampling_params, "max_tokens": max_tokens, "seed": env_extras.pop("_stopd_seed")}
+        return await super().agent_loop(
+            prompt,
+            env_class,
+            env_extras,
+            max_tokens,
+            max_input_length,
+            sampling_params=sampling_params,
+            trajectory_id=trajectory_id,
+            cache_salt=cache_salt,
+            training_phase=training_phase,
+        )
 
 
 class OnPolicyDistillationTrainer(RayPPOTrainer):
@@ -19,6 +121,71 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
 
     Overrides the apply_reward_kl_penalty method to set the rewards just to the kl penalty
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        stopd_cfg = self.cfg.trainer.algorithm.stopd
+        self.stopd = (
+            STOPD(
+                self.cfg.generator.sampling_params.max_generate_length,
+                **{key: value for key, value in vars(stopd_cfg).items() if key != "enabled"},
+            )
+            if stopd_cfg.enabled
+            else None
+        )
+
+    @staticmethod
+    def _stopd_mask(data):
+        mask = data["loss_mask"].bool() & data["response_mask"].bool()
+        pad_size = data.metadata.get("pad_size", 0)
+        if pad_size:
+            mask[-pad_size:] = False
+        return mask
+
+    def compute_advantages_and_returns(self, data):
+        data = super().compute_advantages_and_returns(data)
+        if self.stopd is not None and self.stopd.truncating:
+            # Native token_mean divides by the complete mini-batch's loss mask
+            # before DP sharding. Cancel that divisor in favor of C_k.
+            mask = self._stopd_mask(data)
+            data["advantages"] = data["advantages"] * self.stopd.multiplier(mask, data["loss_mask"].sum().item())
+        return data
+
+    def train_critic_and_policy(self, data):
+        status = super().train_critic_and_policy(data)
+        if self.stopd is not None:
+            metrics = self.stopd.end_step(self._stopd_mask(data))
+            self.all_metrics.update({f"stopd/{key}": value for key, value in metrics.items()})
+        return status
+
+    def save_checkpoints(self):
+        if self.stopd is not None:
+            checkpoint_path = os.path.join(self.cfg.trainer.ckpt_path, f"global_step_{self.global_step}")
+            io.makedirs(checkpoint_path, exist_ok=True)
+            with io.open_file(os.path.join(checkpoint_path, "stopd_state.pt"), "wb") as handle:
+                torch.save(self.stopd.state_dict(), handle)
+        # The native writer publishes latest_ckpt_global_step.txt last, after
+        # the STOPD state and the complete model/optimizer/data state exist.
+        return super().save_checkpoints()
+
+    def load_checkpoints(self):
+        global_step, checkpoint_path = super().load_checkpoints()
+        if self.stopd is not None and checkpoint_path is not None:
+            # A STOPD continuation must restore the exact data position; propagate
+            # a load failure rather than the native best-effort dataloader fallback.
+            with io.open_file(os.path.join(checkpoint_path, "data.pt"), "rb") as handle:
+                self.train_dataloader.load_state_dict(torch.load(handle, map_location="cpu", weights_only=False))
+            state_path = os.path.join(checkpoint_path, "stopd_state.pt")
+            if io.exists(state_path):
+                with io.open_file(state_path, "rb") as handle:
+                    self.stopd.load_state_dict(torch.load(handle, map_location="cpu", weights_only=False))
+                if self.stopd.step != global_step:
+                    raise ValueError("STOPD state and trainer checkpoint steps do not match")
+            else:
+                self.stopd.step = global_step
+                if self.stopd.truncating and self.stopd.denominator is None:
+                    raise ValueError("Importing a Vanilla OPD checkpoint requires stopd.initial_denominator")
+        return global_step, checkpoint_path
 
     def apply_reward_kl_penalty(
         self,
@@ -36,14 +203,24 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
         return data
 
 
-# Using the decorator
-@register_advantage_estimator("no_op")
 def compute_no_op_advantage(token_level_rewards: torch.Tensor, **kwargs):
     # just pass through the rewards
     return token_level_rewards, token_level_rewards
 
 
 class OnPolicyDistillationExp(BasePPOExp):
+    def get_generator(self, cfg, tokenizer, inference_engine_client):
+        if not cfg.trainer.algorithm.stopd.enabled:
+            return super().get_generator(cfg, tokenizer, inference_engine_client)
+        return STOPDGenerator(
+            generator_cfg=cfg.generator,
+            skyrl_gym_cfg=cfg.environment.skyrl_gym,
+            inference_engine_client=inference_engine_client,
+            tokenizer=tokenizer,
+            policy_model_name=resolve_policy_model_name(cfg),
+            stopd_cfg=cfg.trainer.algorithm.stopd,
+        )
+
     def get_trainer(self, *args, **kwargs):
         return OnPolicyDistillationTrainer(*args, **kwargs)
 
@@ -55,9 +232,13 @@ def skyrl_entrypoint(cfg: SkyRLTrainConfig):
 
 
 def main() -> None:
-    cfg = SkyRLTrainConfig.from_cli_overrides(sys.argv[1:])
+    # Registry actors may import this module while unpickling the estimator.
+    # Register from the entrypoint so that import never calls back into them.
+    register_advantage_estimator("no_op")(compute_no_op_advantage)
+    cfg = OnPolicyDistillationConfig.from_cli_overrides(sys.argv[1:])
     # validate the arguments
     validate_cfg(cfg)
+    validate_stopd_cfg(cfg)
 
     initialize_ray(cfg)
     ray.get(skyrl_entrypoint.remote(cfg))

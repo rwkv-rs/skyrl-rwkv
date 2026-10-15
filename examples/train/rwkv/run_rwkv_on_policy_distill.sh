@@ -120,6 +120,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   generator.inference_engine.backend=vllm \
   generator.inference_engine.model_dtype=float16 \
   generator.inference_engine.served_model_name="${STUDENT_MODEL##*/}" \
+  generator.inference_engine.router_init_kwargs.policy=round_robin \
   generator.inference_engine.engine_init_kwargs.logprobs_mode=raw_logprobs \
   generator.inference_engine.engine_init_kwargs.kv_cache_memory_bytes=2147483648 \
   generator.inference_engine.run_engines_locally=true \

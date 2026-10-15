@@ -697,7 +697,9 @@ def test_adapter_reference_reload_and_merged_logits_after_optimizer_step(tmp_pat
     from tokenizers.models import WordLevel
     from transformers import AutoModelForCausalLM, PreTrainedTokenizerFast
 
-    from skyrl.backends.skyrl_train.distributed.fsdp_utils import layered_summon_lora_params
+    from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
+        layered_summon_lora_params,
+    )
 
     torch.manual_seed(7)
     base = LlamaForCausalLM(

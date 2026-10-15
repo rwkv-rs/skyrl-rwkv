@@ -385,7 +385,16 @@ RUN_NAME=rwkv7-g1k-1.5b-20260930-ctx25600-ultradata-opd-long \
 
 The launcher enables NoRA by default, using the same PEFT fork and FP32 normalization
 as AntiDoom. Install the pinned fork with the command in "Antidoom FTPO with NoRA"
-after preparing the RWKV environment. NoRA is selected through
+after preparing the RWKV environment, then warm the exact interpreter's native cache:
+
+```bash
+MAX_JOBS=2 bash examples/train/rwkv/run_rwkv_on_policy_distill.sh --prepare-flashrwkv2 \
+  > /tmp/results_rwkv_opd_prepare_flashrwkv2.log 2>&1
+```
+
+The launcher keeps Ray workers in the prepared project environment and shares the
+canonical `python3` identity with torchrun so worktrees reuse the native cache.
+NoRA is selected through
 `trainer.policy.model.lora.use_nora=true`; ordinary training defaults elsewhere remain
 unchanged. To run full-parameter OPD, set `USE_NORA=false LORA_RANK=0` and choose its
 learning rate explicitly with `LR`.

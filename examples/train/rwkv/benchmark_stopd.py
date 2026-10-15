@@ -128,7 +128,7 @@ def summarize(output, steps):
     return {"timings": timings, "updates": statuses}
 
 
-def validate_training_input(output, rows, stopd, step):
+def validate_training_input(output, rows, stopd, step, proximal_teacher_alpha=1.0):
     with (output / "exports/dumped_data" / f"global_step_{step}_training_input.pkl").open("rb") as handle:
         data = pickle.load(handle)
     for index, row in enumerate(rows):
@@ -149,6 +149,14 @@ def validate_training_input(output, rows, stopd, step):
     if pad_size:
         mask[-pad_size:] = False
     expected_rewards = -(data["action_log_probs"] - data["base_action_log_probs"]) * data["loss_mask"]
+    if proximal_teacher_alpha < 1:
+        expected_rewards = (
+            torch.logaddexp(
+                expected_rewards + math.log(proximal_teacher_alpha),
+                torch.full_like(expected_rewards, math.log1p(-proximal_teacher_alpha)),
+            )
+            * data["loss_mask"]
+        )
     torch.testing.assert_close(data["returns"], expected_rewards, rtol=0, atol=0)
     expected_advantages = expected_rewards
     if stopd.truncating:
@@ -160,7 +168,7 @@ def validate_training_input(output, rows, stopd, step):
     return {"rows": len(rows), "response_tokens": int(mask.sum()), "ipw_advantages_exact": True}
 
 
-def validate_rollouts(vanilla, truncated, max_len, block, step, denominator, seed):
+def validate_rollouts(vanilla, truncated, max_len, block, step, denominator, seed, proximal_teacher_alpha=1.0):
     full = read_rollouts(vanilla / "exports/dumped_rollouts" / f"global_step_{step}.jsonl")
     short = read_rollouts(truncated / "exports/dumped_rollouts" / f"global_step_{step}.jsonl")
     if [row["trajectory_id"] for row in full] != [row["trajectory_id"] for row in short]:
@@ -176,10 +184,10 @@ def validate_rollouts(vanilla, truncated, max_len, block, step, denominator, see
             raise ValueError("Truncated tokens, logprobs, and loss masks must remain aligned")
         if len(tokens) > budget or (retained["truncated"] and len(tokens) != budget):
             raise ValueError("Truncated rollout did not end at its block budget")
-    native = validate_training_input(truncated, short, stopd, step)
+    native = validate_training_input(truncated, short, stopd, step, proximal_teacher_alpha)
     vanilla_stopd = STOPD(max_len, block, step + 1, denominator, seed)
     vanilla_stopd.step = step - 1
-    native_full = validate_training_input(vanilla, full, vanilla_stopd, step)
+    native_full = validate_training_input(vanilla, full, vanilla_stopd, step, proximal_teacher_alpha)
     return {
         "full_response_tokens": sum(len(row["response_token_ids"]) for row in full),
         "truncated_response_tokens": sum(len(row["response_token_ids"]) for row in short),
@@ -255,6 +263,7 @@ def main():
     parser.add_argument("--steps", type=int, default=3)
     parser.add_argument("--block", type=int, default=128)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--proximal-teacher-alpha", type=float, default=1.0, help="TOP-D reward mixture in both arms")
     parser.add_argument("--wait", action="store_true")
     parser.add_argument("--baseline-pid", type=int)
     parser.add_argument("--baseline-log", type=Path, help="Wait for checkpoint-step evaluation and logging to finish")
@@ -262,6 +271,8 @@ def main():
     args = parser.parse_args()
     if args.steps < 1 or args.block < 1:
         parser.error("--steps and --block must be positive")
+    if not 0 < args.proximal_teacher_alpha <= 1:
+        parser.error("--proximal-teacher-alpha must be in (0, 1]")
     project = Path(__file__).resolve().parents[3]
     args.checkpoint = args.checkpoint.resolve()
     args.output = args.output.resolve()
@@ -277,6 +288,7 @@ def main():
         time.sleep(30)
     saved = load_checkpoint(args.checkpoint)
     original, step = saved["config"], saved["global_step"]
+    original["trainer"]["algorithm"]["proximal_teacher_alpha"] = args.proximal_teacher_alpha
     if args.block > original["generator"]["sampling_params"]["max_generate_length"]:
         parser.error("--block must not exceed the checkpoint's max_generate_length")
     # The export's atomic rename happens after the complete checkpoint save.
@@ -296,7 +308,12 @@ def main():
     if args.baseline_pid:
         stop_baseline(args.baseline_pid)
     args.output.mkdir(parents=True, exist_ok=False)
-    report = {"source_checkpoint": str(args.checkpoint), "source_step": step, "initial_denominator": denominator}
+    report = {
+        "source_checkpoint": str(args.checkpoint),
+        "source_step": step,
+        "initial_denominator": denominator,
+        "proximal_teacher_alpha": args.proximal_teacher_alpha,
+    }
     for mode in ("vanilla", "stopd"):
         output = args.output / mode
         run_config(
@@ -312,6 +329,7 @@ def main():
         step + 1,
         denominator,
         args.seed,
+        args.proximal_teacher_alpha,
     )
     next_checkpoint = validate_stopd_state(args.output / "stopd", step + args.steps)
     report["speedup"] = report["vanilla"]["timings"]["step"]["mean"] / report["stopd"]["timings"]["step"]["mean"]

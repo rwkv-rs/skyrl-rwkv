@@ -21,6 +21,7 @@ fi
 : "${USE_NORA:=true}"
 : "${USE_STOPD:=false}"
 : "${PROXIMAL_TEACHER_ALPHA:=1.0}"
+: "${LIGHTEVAL_PROJECT:=$HOME/Projects/MachineLearning/lighteval-rwkv}"
 : "${LORA_RANK:=256}"
 : "${LORA_ALPHA:=$LORA_RANK}"
 : "${MINI_BATCH_SIZE:=512}"
@@ -61,6 +62,8 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   trainer.algorithm.use_kl_loss=false \
   trainer.algorithm.stopd.enabled="$USE_STOPD" \
   trainer.algorithm.proximal_teacher_alpha="$PROXIMAL_TEACHER_ALPHA" \
+  trainer.algorithm.lighteval.project="$LIGHTEVAL_PROJECT" \
+  trainer.algorithm.lighteval.context_length=25600 \
   trainer.policy.model.path="$STUDENT_MODEL" \
   trainer.ref.model.path="$TEACHER_MODEL" \
   trainer.policy.model_config_kwargs.wkv_mode=fp32io16 \
@@ -102,6 +105,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   trainer.eval_before_train=true \
   trainer.dump_train_results=true \
   trainer.num_logger_train_samples=20 \
+  trainer.num_logger_eval_samples=20 \
   trainer.eval_interval=50 \
   trainer.ckpt_interval=50 \
   trainer.hf_save_interval=50 \
@@ -115,6 +119,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   trainer.export_path="$OUTPUT_ROOT/exports" \
   generator.inference_engine.backend=vllm \
   generator.inference_engine.model_dtype=float16 \
+  generator.inference_engine.served_model_name="${STUDENT_MODEL##*/}" \
   generator.inference_engine.engine_init_kwargs.logprobs_mode=raw_logprobs \
   generator.inference_engine.engine_init_kwargs.kv_cache_memory_bytes=2147483648 \
   generator.inference_engine.run_engines_locally=true \
@@ -133,7 +138,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   generator.sampling_params.top_p=1.0 \
   generator.sampling_params.top_k=-1 \
   generator.sampling_params.additional_kwargs="{presence_penalty: 0.0, frequency_penalty: 0.0, penalty_decay: 1.0}" \
-  generator.eval_sampling_params.max_generate_length=8192 \
+  generator.eval_sampling_params.max_generate_length=25600 \
   generator.eval_sampling_params.temperature=0.96 \
   generator.eval_sampling_params.top_p=0.76 \
   generator.eval_sampling_params.top_k=32 \

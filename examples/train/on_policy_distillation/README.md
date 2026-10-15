@@ -103,3 +103,53 @@ Use `--proximal-teacher-alpha 0.2` with `benchmark_stopd.py` to apply the same
 reward transformation to both full and truncated rollout arms and the resumed
 production run. The benchmark records the coefficient and verifies actual
 transformed rewards and IPW advantages before continuing training.
+
+## RWKV evaluation and metrics
+
+The RWKV launcher evaluates the synchronized student with the existing
+`lighteval-rwkv` producer, following `run_rwkv_sft.sh`. Its task registry,
+CoT prompts, boxed-answer extraction, and math verifier own the evaluation.
+The default task remains AIME 2024 with 32 independent completions per question
+(`avg@32`). All eight existing vLLM engines serve the producer through SkyRL's
+OpenAI router. Evaluation uses temperature 0.96, top-p 0.76, top-k 32,
+presence penalty 1.0, frequency penalty 0.1, penalty decay 0.988, and the
+`bot` / `open_think` prompt settings supplied by the producer.
+
+Set `LIGHTEVAL_PROJECT` to the existing producer checkout. The evaluation
+subprocess uses this project's interpreter. Install the producer's pinned
+math packages into a private directory inside this project's `.venv`:
+
+```bash
+uv run --isolated --no-project uv pip install \
+  --python .venv/bin/python3 --target .venv/rwkv-eval --no-deps \
+  'latex2sympy2_extended==1.0.6' 'antlr4-python3-runtime==4.13.2'
+```
+
+The evaluation subprocess prepends that directory and the producer's sources
+to `PYTHONPATH`. Training retains its existing dependencies. The producer's
+remaining runtime dependencies must be installed in this project's environment.
+
+`trainer.algorithm.lighteval.context_length=25600` is a **total** token budget.
+For each question, the adapter tokenizes the producer's actual messages with
+the inference tokenizer and sets completion tokens to `25600 - prompt_tokens`.
+This leaves the training rollout limit of 8192 and STOPD's truncation schedule
+unchanged. Set `trainer.algorithm.lighteval.project=null` to use native OPD
+evaluation instead. Non-RWKV OPD examples keep their native evaluator by default.
+
+Each evaluation saves the producer's completions, cache, details, scores, and
+producer commit under `<export_path>/lighteval/global_step_<N>/`. The native
+trainer logs `eval/lighteval/aime24/avg@32`, completion counts, and truncation
+rate to the experiment tracker at the checkpoint's actual global step.
+`trainer.num_logger_eval_samples` controls how many raw completions and native
+extracted answers are also uploaded to the W&B sample table (20 in the RWKV
+launcher). Complete evaluation records remain in the producer output.
+
+OPD replaces environment rewards with dense teacher/student log-ratio rewards;
+environment task reward is not part of its optimization objective. Track
+`opd/reward_mean`, `opd/reward_abs_mean`, and `opd/reverse_kl_mean` for
+token-normalized distillation diagnostics. With STOPD, these use the same
+inverse-probability weights and lagged denominator as the loss, excluding
+padding. The reverse-KL diagnostic is a signed Monte Carlo estimate and can
+be negative on an individual batch. Use the producer's task scores to assess
+capability, rather than interpreting environment rewards or sequence reward
+sums as evaluation accuracy.

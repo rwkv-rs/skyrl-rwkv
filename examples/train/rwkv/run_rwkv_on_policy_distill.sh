@@ -23,7 +23,7 @@ fi
 : "${LORA_ALPHA:=$LORA_RANK}"
 : "${MINI_BATCH_SIZE:=512}"
 : "${MICRO_BATCH_SIZE:=8}"
-: "${MICRO_FORWARD_BATCH_SIZE:=$MICRO_BATCH_SIZE}"
+: "${MICRO_FORWARD_BATCH_SIZE:=4}"
 : "${LR:=2e-6}"
 : "${LOGGER:=wandb}"
 : "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-ultradata-opd-nora-from-rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora}"

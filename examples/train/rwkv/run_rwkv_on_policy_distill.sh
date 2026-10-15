@@ -36,6 +36,17 @@ export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 export XDG_CACHE_HOME="$HOME/.cache/skyrl-rwkv"
 export TORCH_EXTENSIONS_DIR="$XDG_CACHE_HOME/torch_extensions"
 
+if [[ "${1:-}" == --prepare-flashrwkv2 ]]; then
+  shift
+  if (( $# )); then
+    printf 'Unexpected arguments to --prepare-flashrwkv2\n' >&2
+    exit 2
+  fi
+  export MAX_JOBS="${MAX_JOBS:-2}"
+  uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" examples/train/rwkv/prepare_flashrwkv2.py
+  exit 0
+fi
+
 # Check the exact native cache key before loading.
 uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" examples/train/rwkv/prepare_flashrwkv2.py --check
 

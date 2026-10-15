@@ -423,10 +423,15 @@ def is_control_token(tokenizer, token_id):
 def select_chosen_tokens(logits, rejected_id, tokenizer, top_k=50, max_tokens=20, min_p=0.01):
     """Reference sampling order/min-p, conditioned on readable non-control tokens."""
     values, indices = logits.topk(min(top_k, logits.numel()))
+    rejected_surface = tokenizer.decode([rejected_id], skip_special_tokens=False).lower()
     candidates = [
         (token, value)
         for token, value in zip(indices.tolist(), values.tolist(), strict=True)
         if token != rejected_id
+        and (
+            "\ufffd" in rejected_surface
+            or tokenizer.decode([token], skip_special_tokens=False).lower() != rejected_surface
+        )
         and not is_control_token(tokenizer, token)
         and tokenizer.decode([token], skip_special_tokens=True).strip()
     ]

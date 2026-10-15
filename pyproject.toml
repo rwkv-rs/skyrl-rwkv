@@ -140,7 +140,7 @@ rwkv = [
     "torch==2.13.0; sys_platform == 'linux'",
     "transformers==5.16.0.dev0; sys_platform == 'linux'",
     "vllm; sys_platform == 'linux'",
-    "FlashRWKV2==0.1.0a13; sys_platform == 'linux'",
+    "FlashRWKV2==0.1.0a15; sys_platform == 'linux'",
     "tokenizers; sys_platform == 'linux'",
 ]
 
@@ -318,6 +318,8 @@ override-dependencies = [
     "transformer-engine[pytorch]==2.19.0; sys_platform == 'linux'",
     # Widen Bridge's bound without overriding RWKV's direct Git requirement.
     { package = { name = "megatron-bridge" }, dependencies = ["transformers>=5.6.1,<=5.16.1; sys_platform == 'linux'"] },
+    # Keep the RWKV Transformers source selected by this project.
+    { package = { name = "vllm", version = "0.23.1rc1.dev5424+g670288acc.rwkv" }, dependencies = ["transformers==5.16.0.dev0; sys_platform == 'linux'"] },
     "megatron-core>=0.16.0; sys_platform == 'linux'",
     "ml_dtypes>=0.5.0; sys_platform == 'linux'",
     # `nixl` hard-depends on both nixl-cu12 and nixl-cu13; drop the cu12 variant
@@ -485,10 +487,9 @@ explicit = true
 [tool.uv.sources]
 skyrl-gym = { path = "./skyrl-gym", editable = true }
 skycap = { path = "./skycap", editable = true }
-transformers = { git = "https://github.com/rwkv-rs/transformers-rwkv", rev = "25674160e9786b191aa3642045f3615c05502af3", extra = "rwkv" }
-vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "c835a8beaebaf57174ef9f162e5ff24a32f933d9", extra = "rwkv" }
+transformers = { git = "https://github.com/rwkv-rs/transformers-rwkv", rev = "0a374cb01090d6352d07ca749d84768cf9621f0e", extra = "rwkv" }
+vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "670288acc58bd21dc8628d7d30650f0d25ce4bfa", extra = "rwkv" }
 tokenizers = { git = "https://github.com/rwkv-rs/tokenizers-rwkv", rev = "c5d8dde5ff49c70e4656199d5033a84e03c21b2b", subdirectory = "bindings/python", extra = "rwkv" }
-FlashRWKV2 = { git = "https://github.com/rwkv-rs/FlashRWKV2", rev = "0b1e13912f045c845e6bd5e490020bcaf5f2a1fe", extra = "rwkv" }
 # Match torch's CUDA variant (cu130).
 flashinfer-jit-cache = { index = "flashinfer-cu130", marker = "sys_platform == 'linux'" }
 flashinfer-cubin = { index = "flashinfer", marker = "sys_platform == 'linux'" }

@@ -114,6 +114,8 @@ The default task remains AIME 2024 with 32 independent completions per question
 OpenAI router. Evaluation uses temperature 0.96, top-p 0.76, top-k 32,
 presence penalty 1.0, frequency penalty 0.1, penalty decay 0.988, and the
 `bot` / `open_think` prompt settings supplied by the producer.
+The single-turn RWKV launcher uses the native router's `round_robin` policy,
+so independent OpenAI requests without session headers reach all engines.
 
 Set `LIGHTEVAL_PROJECT` to the existing producer checkout. The evaluation
 subprocess uses this project's interpreter. Install the producer's pinned

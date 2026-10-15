@@ -3,11 +3,11 @@
 import copy
 import itertools
 from dataclasses import asdict
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 import torch
-from skyrl_gym.envs.base_text_env import BaseTextEnvStepOutput
 
 from examples.train.on_policy_distillation.main_on_policy_distill import (
     OnPolicyDistillationConfig,
@@ -27,6 +27,7 @@ from examples.train.rwkv.benchmark_stopd import (
     summarize,
     validate_training_input,
 )
+from examples.train.rwkv.evaluate import set_generation_budgets
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
     AdvantageEstimatorRegistry,
@@ -36,6 +37,7 @@ from skyrl.train.dataset.preprocess import convert_prompts_responses_to_batch_te
 from skyrl.train.generators.skyrl_gym_generator import SkyRLGymGenerator
 from skyrl.train.generators.utils import prepare_generator_input
 from skyrl.train.trainer import RayPPOTrainer
+from skyrl_gym.envs.base_text_env import BaseTextEnvStepOutput
 
 
 def config(**overrides):
@@ -59,16 +61,125 @@ def config(**overrides):
     return cfg
 
 
+def test_lighteval_budgets_use_exact_producer_messages_and_rwkv_template():
+    docs = [SimpleNamespace(query="short"), SimpleNamespace(query="long")]
+    model = SimpleNamespace(
+        prompt_manager=SimpleNamespace(prepare_prompt_api=lambda doc: [{"role": "user", "content": doc.query}]),
+        config=SimpleNamespace(
+            extra_body={"chat_template_kwargs": {"rwkv_prompt_template": "bot", "rwkv_generation_prompt": "open_think"}}
+        ),
+    )
+    tokenizer = MagicMock()
+    tokenizer.apply_chat_template.side_effect = [list(range(100)), list(range(2400))]
+    strip_template = MagicMock(side_effect=lambda messages: messages)
+    set_generation_budgets(docs, model, tokenizer, 25600, strip_template)
+    assert [doc.generation_size for doc in docs] == [25500, 23200]
+    tokenizer.apply_chat_template.assert_any_call(
+        [{"role": "user", "content": "long"}],
+        tokenize=True,
+        return_dict=False,
+        add_generation_prompt=True,
+        rwkv_prompt_template="bot",
+        rwkv_generation_prompt="open_think",
+    )
+    assert strip_template.call_count == 2
+
+
+def test_lighteval_rejects_prompt_that_consumes_context():
+    model = MagicMock()
+    model.config.extra_body = {"chat_template_kwargs": {}}
+    tokenizer = MagicMock()
+    tokenizer.apply_chat_template.return_value = [1] * 25600
+    with pytest.raises(ValueError, match="prompt exceeds"):
+        set_generation_budgets([SimpleNamespace()], model, tokenizer, 25600, lambda value: value)
+
+
+@pytest.mark.asyncio
+async def test_native_opd_eval_is_preserved_when_lighteval_disabled(monkeypatch):
+    trainer = object.__new__(OnPolicyDistillationTrainer)
+    trainer.cfg = config()
+    native = AsyncMock(return_value={"eval/all/avg_score": 0.5})
+    monkeypatch.setattr(RayPPOTrainer, "eval", native)
+    assert await trainer.eval() == {"eval/all/avg_score": 0.5}
+    native.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("returncode", [0, 1])
+async def test_lighteval_uses_live_pool_without_changing_training_or_stopd(monkeypatch, tmp_path, returncode):
+    trainer = object.__new__(OnPolicyDistillationTrainer)
+    trainer.cfg = config(**{"trainer.algorithm.lighteval.project": "/producer"})
+    trainer.cfg.trainer.export_path = str(tmp_path)
+    trainer.cfg.trainer.num_logger_eval_samples = 1
+    trainer.global_step = 100
+    trainer.tracker = MagicMock()
+    trainer.inference_engine_client = SimpleNamespace(proxy_url="http://localhost:8000", model_name="rwkv7-test")
+    before = asdict(trainer.cfg)
+    output = tmp_path / "lighteval/global_step_100"
+
+    async def run(*args, **kwargs):
+        import json
+
+        (output / "eval_metrics.json").write_text(json.dumps({"eval/lighteval/aime24/avg@32": 0.5}))
+        completions = output / "completions.jsonl"
+        completions.write_text(
+            json.dumps(
+                {
+                    "task_name": "aime24|0",
+                    "doc": {"choices": ["25"]},
+                    "model_response": {
+                        "rendered_prompt": "prompt",
+                        "text": ["</think>\\boxed{25}"],
+                        "text_post_processed": ["25"],
+                        "finish_reasons": ["stop"],
+                    },
+                }
+            )
+            + "\n"
+        )
+        (output / "completed.json").write_text(json.dumps({"completions_path": str(completions)}))
+        return SimpleNamespace(wait=AsyncMock(return_value=returncode))
+
+    process = AsyncMock(side_effect=run)
+    monkeypatch.setattr(
+        "examples.train.on_policy_distillation.main_on_policy_distill.asyncio.create_subprocess_exec", process
+    )
+    scraper = MagicMock()
+    if returncode:
+        with pytest.raises(RuntimeError, match="producer.log"):
+            await trainer.eval(vllm_metrics_scraper=scraper)
+        trainer.tracker.log_samples_to_table.assert_not_called()
+    else:
+        assert await trainer.eval(vllm_metrics_scraper=scraper) == {"eval/lighteval/aime24/avg@32": 0.5}
+        sample_log = trainer.tracker.log_samples_to_table.call_args
+        assert sample_log.kwargs == {"step": 100, "incremental": True}
+        assert sample_log.args[2][0][-2:] == ("25", "stop")
+    scraper.resume.assert_called_once()
+    scraper.pause.assert_called_once()
+    args = process.call_args.args
+    assert args[args.index("--url") + 1] == "http://localhost:8000"
+    assert args[args.index("--context-length") + 1] == "25600"
+    assert args[args.index("--num-samples") + 1] == "32"
+    assert asdict(trainer.cfg) == before
+
+
 @pytest.mark.parametrize("alpha", [0.1, 0.2, 1.0])
 def test_proximal_teacher_rewards_match_probability_mixture(alpha):
     trainer = object.__new__(OnPolicyDistillationTrainer)
     trainer.cfg = config(**{"trainer.algorithm.proximal_teacher_alpha": alpha})
+    trainer.stopd, trainer.all_metrics = None, {}
     student = torch.tensor([[0.2, 0.3, 0.5]], dtype=torch.float64)
     teacher = torch.tensor([[0.05, 0.15, 0.8]], dtype=torch.float64)
     mask = torch.tensor([[1, 1, 0]])
     data = TrainingInputBatch(
-        {"loss_mask": mask, "action_log_probs": student.log(), "base_action_log_probs": teacher.log()}
+        {
+            "loss_mask": mask,
+            "response_mask": mask,
+            "action_log_probs": student.log(),
+            "base_action_log_probs": teacher.log(),
+        }
     )
+    data.metadata = {}
     actual = trainer.apply_reward_kl_penalty(data)["rewards"]
     expected = ((alpha * teacher + (1 - alpha) * student) / student).log() * mask
     torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
@@ -79,18 +190,43 @@ def test_proximal_teacher_rewards_match_probability_mixture(alpha):
 def test_proximal_teacher_extreme_ratios_are_finite_and_negative_reward_is_bounded():
     trainer = object.__new__(OnPolicyDistillationTrainer)
     trainer.cfg = config(**{"trainer.algorithm.proximal_teacher_alpha": 0.2})
+    trainer.stopd, trainer.all_metrics = None, {}
     data = TrainingInputBatch(
         {
             "loss_mask": torch.tensor([[1, 1, 0]]),
+            "response_mask": torch.tensor([[1, 1, 0]]),
             "action_log_probs": torch.tensor([[0.0, -1000.0, -4.0]]),
             "base_action_log_probs": torch.tensor([[-1000.0, 0.0, -8.0]]),
         }
     )
+    data.metadata = {}
     actual = trainer.apply_reward_kl_penalty(data)["rewards"]
     assert torch.isfinite(actual).all()
     assert actual[0, 0] == pytest.approx(torch.tensor(0.8).log().item())
     assert actual[0, 1] == pytest.approx(1000 + torch.tensor(0.2).log().item())
     assert actual[0, 2] == 0
+
+
+def test_opd_metrics_use_ipw_and_lagged_denominator_without_padding():
+    trainer = object.__new__(OnPolicyDistillationTrainer)
+    trainer.cfg = config()
+    trainer.stopd, trainer.all_metrics = STOPD(8, 2, 0, 11), {}
+    mask = torch.ones(2, 4)
+    data = TrainingInputBatch(
+        {
+            "loss_mask": mask,
+            "response_mask": mask,
+            "action_log_probs": torch.tensor([[-1.0, -2.0, -3.0, -4.0], [-100.0] * 4]),
+            "base_action_log_probs": torch.zeros(2, 4),
+        }
+    )
+    data.metadata = {"pad_size": 1}
+    trainer.apply_reward_kl_penalty(data)
+    expected = (1 + 2 + (3 + 4) * 8 / 6) / 11
+    assert trainer.all_metrics["opd/reward_mean"] == pytest.approx(expected)
+    assert trainer.all_metrics["opd/reward_abs_mean"] == pytest.approx(expected)
+    assert trainer.all_metrics["opd/reverse_kl_mean"] == pytest.approx(-expected)
+    assert trainer.stopd.denominator == 11
 
 
 @pytest.mark.parametrize("alpha", [0, -0.1, 1.1, float("nan"), float("inf")])
@@ -479,6 +615,7 @@ def test_actual_training_input_preserves_generated_prefix_and_ipw(tmp_path, corr
     data["base_action_log_probs"] = data["action_log_probs"] + 0.1 * data["loss_mask"]
     trainer = object.__new__(OnPolicyDistillationTrainer)
     trainer.cfg = config(**{"trainer.algorithm.proximal_teacher_alpha": alpha})
+    trainer.stopd, trainer.all_metrics = None, {}
     trainer.apply_reward_kl_penalty(data)
     data["returns"] = data["rewards"].clone()
     stopd = STOPD(8, 2, 0, 11)

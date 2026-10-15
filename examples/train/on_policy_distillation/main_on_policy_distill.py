@@ -148,7 +148,9 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
             # Native token_mean divides by the complete mini-batch's loss mask
             # before DP sharding. Cancel that divisor in favor of C_k.
             mask = self._stopd_mask(data)
-            data["advantages"] = data["advantages"] * self.stopd.multiplier(mask, data["loss_mask"].sum().item())
+            start, end = data.metadata["policy_mini_batch_boundaries"][0]
+            n_obs = data["loss_mask"][start:end].sum().item()
+            data["advantages"] = data["advantages"] * self.stopd.multiplier(mask, n_obs)
         return data
 
     def train_critic_and_policy(self, data):

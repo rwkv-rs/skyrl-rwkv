@@ -690,7 +690,8 @@ def test_prepare_groups_siblings_and_keeps_original_validation_prompts(tmp_path,
         ),
     ],
 )
-def test_adapter_reference_reload_and_merged_logits_after_optimizer_step(tmp_path, monkeypatch, use_nora):
+@pytest.mark.parametrize("adapt_head", [False, True])
+def test_adapter_reference_reload_and_merged_logits_after_optimizer_step(tmp_path, monkeypatch, use_nora, adapt_head):
     from tokenizers import Tokenizer as RustTokenizer
     from tokenizers.models import WordLevel
     from transformers import AutoModelForCausalLM, PreTrainedTokenizerFast
@@ -721,7 +722,7 @@ def test_adapter_reference_reload_and_merged_logits_after_optimizer_step(tmp_pat
             task_type=TaskType.CAUSAL_LM,
             r=2,
             lora_alpha=2,
-            target_modules=["q_proj", "v_proj"],
+            target_modules=["q_proj", "v_proj"] + (["lm_head"] if adapt_head else []),
             **({"use_nora": True} if use_nora else {}),
         ),
     )
@@ -729,6 +730,8 @@ def test_adapter_reference_reload_and_merged_logits_after_optimizer_step(tmp_pat
     loss, _ = antidoom.row_loss(model, {"prompt_ids": prompt_ids, "chosen_ids": [7, 8], "rejected_token_id": 9}, "cpu")
     loss.backward()
     assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters() if p.requires_grad)
+    if adapt_head:
+        assert model.get_output_embeddings().lora_B["default"].weight.grad.abs().sum() > 0
     optimizer.step()
     with torch.no_grad(), model.disable_adapter():
         torch.testing.assert_close(antidoom.last_logits(model, prompt_ids, "cpu"), reference)
@@ -736,7 +739,7 @@ def test_adapter_reference_reload_and_merged_logits_after_optimizer_step(tmp_pat
     adapted = antidoom.last_logits(model, prompt_ids, "cpu").detach()
     assert not torch.allclose(adapted, reference)
     adapter_path = tmp_path / "adapter"
-    model.save_pretrained(adapter_path)
+    model.save_pretrained(adapter_path, save_embedding_layers=False)
     original_load = AutoModelForCausalLM.from_pretrained
 
     def load_base(path, **kwargs):
@@ -749,6 +752,11 @@ def test_adapter_reference_reload_and_merged_logits_after_optimizer_step(tmp_pat
     torch.testing.assert_close(antidoom.last_logits(model, prompt_ids, "cpu"), adapted)
     if not use_nora:
         return
+    if adapt_head:
+        # Native RWKV inference reads the head weight instead of invoking
+        # PEFT's forward; reproduce that contract during the merge probe.
+        head = model.get_output_embeddings()
+        monkeypatch.setattr(head, "forward", lambda x: torch.nn.functional.linear(x, head.weight))
     output = tmp_path / "merged"
     merged = antidoom.merge_and_save(model, tokenizer, base_path, output, prompt_ids, "cpu")
     actual = antidoom.last_logits(merged, prompt_ids, "cpu")

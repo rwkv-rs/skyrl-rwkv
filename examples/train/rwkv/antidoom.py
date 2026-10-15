@@ -35,7 +35,7 @@ from skyrl.utils.tok import get_tokenizer
 
 NORA_REVISION = "4669c35ce0ffd027456272ee5050c0f58ac8d22a"
 ANTIDOOM_REFERENCE_REVISION = "bd6a126476e18554b0cacaea3fd9f258fdde1f97"
-TARGET_MODULES = ["r_proj", "k_proj", "v_proj", "o_proj"]
+TARGET_MODULES = ["r_proj", "k_proj", "v_proj", "o_proj", "lm_head"]
 ANTIDOOM_DATASET = "LiquidAI/antidoom-mix-v1.0"
 ANTIDOOM_REVISION = "79ff2d479c5e59ea9973a66a7ca9ce8b703f9c7b"
 # Dataset-card source IDs mapped to scoreboard benchmark names and task fields.
@@ -678,6 +678,8 @@ def ftpo_loss(
         "mse_target": mse_target.detach(),
         "chosen_win": (((delta_tok > 0) & chosen_mask).sum(-1) / counts).mean().detach(),
         "margin_win": (((delta_tok >= clip_epsilon_logits) & chosen_mask).sum() / chosen_mask.sum()).detach(),
+        "mean_delta": delta_tok[chosen_mask].mean().detach(),
+        "active_weight": weights[chosen_mask].mean().detach(),
     }
 
 
@@ -1147,18 +1149,22 @@ def row_loss(model, row, device):
 def evaluate(model, rows, device, batch_size=1, max_batch_tokens=32768):
     import torch.distributed as dist
 
-    stats = torch.zeros(2, device=device, dtype=torch.float64)
+    keys = ("loss", "pref_loss", "mse_elem", "mse_target", "chosen_win", "margin_win", "mean_delta", "active_weight")
+    stats = torch.zeros(len(keys) + 1, device=device, dtype=torch.float64)
     rank, world = dist.get_rank(), dist.get_world_size()
     batches = list(microbatches(rows, batch_size, max_batch_tokens))
     for start in range(0, len(batches), world):
         index = start + rank
         batch = batches[index] if index < len(batches) else [rows[0]]
-        loss, _ = batch_loss(model, batch, device)
+        _, metrics = batch_loss(model, batch, device)
         if index < len(batches):
-            stats[0] += loss * len(batch)
-            stats[1] += len(batch)
+            stats[:-1] += torch.stack([metrics[key] for key in keys]) * len(batch)
+            stats[-1] += len(batch)
     dist.all_reduce(stats)
-    return {"eval/loss": (stats[0] / stats[1]).item(), "eval/samples": stats[1].item()}
+    return {
+        **{f"eval/{key}": (stats[i] / stats[-1]).item() for i, key in enumerate(keys)},
+        "eval/samples": stats[-1].item(),
+    }
 
 
 def merge_and_save(model, tokenizer, model_path, output, probe_ids, device):
@@ -1180,6 +1186,25 @@ def merge_and_save(model, tokenizer, model_path, output, probe_ids, device):
                 factors[layer] = (weight_a, weight_b)
                 layer.lora_A["default"].weight.data = weight_a
         model.half().eval()
+        # RWKV's inference head reads lm_head.weight directly. Absorb its
+        # adapter before probing the native FP16 inference path.
+        head = model.get_output_embeddings()
+        head_error = None
+        if head in factors:
+            weight_a, weight_b = factors[head]
+            head.get_base_layer().weight.data = head.get_base_layer().weight.data.float()
+            head.lora_A["default"].weight.data = weight_a
+            head.lora_B["default"].weight.data = weight_b
+            hidden = torch.randn(1, head.in_features, device=device, dtype=torch.float32)
+            expected = (
+                F.linear(hidden, head.get_base_layer().weight)
+                + F.linear(F.linear(hidden, weight_a), weight_b) * head.scaling["default"]
+            )
+            head.merge(safe_merge=True)
+            actual = F.linear(hidden, head.get_base_layer().weight)
+            torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+            head_error = (actual - expected).abs().max().item()
+            head.get_base_layer().weight.data = head.get_base_layer().weight.data.half()
         before = last_logits(model, probe_ids, device)
         for layer, (weight_a, weight_b) in factors.items():
             layer.get_base_layer().weight.data = layer.get_base_layer().weight.data.float()
@@ -1205,6 +1230,7 @@ def merge_and_save(model, tokenizer, model_path, output, probe_ids, device):
                 "kl_reference_merged": kl,
                 "merge_dtype": "float32",
                 "export_dtype": "float16",
+                "head_max_logit_error": head_error,
             }
         )
         + "\n"
@@ -1246,7 +1272,7 @@ def train(args):
                 r=args.rank,
                 lora_alpha=args.lora_alpha if args.lora_alpha is not None else args.rank,
                 lora_dropout=0.0,
-                target_modules=TARGET_MODULES,
+                target_modules=args.target_modules,
                 bias="none",
                 use_nora=True,
             ),
@@ -1383,7 +1409,7 @@ def train(args):
                         "train/peak_memory_GiB": peak_memory.item() / 2**30,
                     }
                 )
-                if not args.profile and (step % args.save_steps == 0 or step == total_steps):
+                if not args.profile and (step % args.save_steps == 0 or step % len(groups) == 0 or step == total_steps):
                     save_and_evaluate(step, log)
                 if dist.get_rank() == 0:
                     print(f"step={step} {log}", flush=True)
@@ -1493,6 +1519,7 @@ def main():
     train_parser = commands.choices["train"]
     train_parser.add_argument("--data", type=Path, required=True)
     train_parser.add_argument("--rank", type=int, default=8)
+    train_parser.add_argument("--target-modules", nargs="+", default=TARGET_MODULES)
     train_parser.add_argument("--lora-alpha", type=int, help="Defaults to rank, the NoRA reference scaling")
     train_parser.add_argument("--learning-rate", type=float, default=5e-7)
     train_parser.add_argument("--warmup-ratio", type=float, default=0.0)

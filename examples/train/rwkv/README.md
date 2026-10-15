@@ -748,7 +748,8 @@ Rebuild existing FTPO data with `prepare`; `train` rejects preference targets
 containing EOS or RWKV protocol tokens.
 
 NoRA uses `use_nora=True`, rank 8, alpha equal to rank, zero dropout, and the
-RWKV attention projections `r_proj`, `k_proj`, `v_proj`, and `o_proj`. Each FTPO
+RWKV attention projections `r_proj`, `k_proj`, `v_proj`, `o_proj`, and the
+`lm_head` output projection. `--target-modules` can select the adaptation scope. Each FTPO
 sample scores a single next-token position. The loss keeps the notebook's
 margin 2, non-target logit MSE coefficient 0.4, target coefficient 0.05 and
 target tolerance 0.5. Reference logits come from the frozen base with the
@@ -775,7 +776,7 @@ GPU retains the frozen model and only adapter gradients are synchronized. Use
 throughput, and the maximum allocation across all ranks before a production
 run. Profiling visits the longest context groups first.
 
-Every 50 optimizer steps and at the final step, training writes adapter weights,
+Every 50 optimizer steps and at each epoch boundary, including the final step, training writes adapter weights,
 per-rank optimizer/scheduler/RNG states, and held-out FTPO loss on a fixed
 `--eval-max-samples` subset. The frozen base is identified by the exact model
 path instead of being copied into every checkpoint. W&B receives training and
@@ -789,7 +790,10 @@ adapter is automatically absorbed with `merge_and_unload(safe_merge=True)`.
 and `merge_metrics.json`. NoRA's column normalization is computed in FP32,
 then the updates are absorbed in FP32 and the complete model is exported in
 FP16 for vLLM inference. The merge checks the FP16 adapter and absorbed model's
-next-token log probabilities and records their KL divergence. This preserves
+next-token log probabilities and records their KL divergence. The output head
+is absorbed before the native RWKV inference probe, which reads its weight
+directly; a separate FP32 check verifies the head's adapter/merged projection.
+This preserves
 updates that would be lost when added directly to BF16 base weights.
 
 For a held-out before/after doom-loop comparison, run `generate` on

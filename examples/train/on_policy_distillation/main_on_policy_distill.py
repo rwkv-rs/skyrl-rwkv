@@ -1,8 +1,11 @@
+import asyncio
 import copy
+import json
 import math
 import os
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import ray
 import torch
@@ -14,7 +17,7 @@ from skyrl.backends.skyrl_train.utils.io import io
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
     register_advantage_estimator,
 )
-from skyrl.train.config import AlgorithmConfig, SkyRLTrainConfig, make_config
+from skyrl.train.config import AlgorithmConfig, BaseConfig, SkyRLTrainConfig, make_config
 from skyrl.train.entrypoints.main_base import BasePPOExp, validate_cfg
 from skyrl.train.generators.base import TRAINING_PHASE_EVAL
 from skyrl.train.generators.skyrl_gym_generator import SkyRLGymGenerator
@@ -23,7 +26,21 @@ from skyrl.train.utils import initialize_ray
 
 
 @dataclass
+class RWKVEvalConfig(BaseConfig):
+    project: str | None = None
+    """Existing lighteval-rwkv checkout; None keeps native OPD evaluation."""
+    task: str = "aime24"
+    num_samples: int = 32
+    context_length: int = 25600
+
+    def __post_init__(self):
+        if self.num_samples < 1 or self.context_length < 1:
+            raise ValueError("RWKV evaluation requires positive num_samples and context_length")
+
+
+@dataclass
 class OnPolicyDistillationAlgorithmConfig(AlgorithmConfig):
+    lighteval: RWKVEvalConfig = field(default_factory=RWKVEvalConfig)
     proximal_teacher_alpha: float = 1.0
     """TOP-D probability mixture weight for the teacher; 1.0 preserves native OPD."""
     stopd: STOPDConfig = field(default_factory=STOPDConfig)
@@ -141,6 +158,92 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
             else None
         )
 
+    async def eval(self, vllm_metrics_scraper=None):
+        config = self.cfg.trainer.algorithm.lighteval
+        if config.project is None:
+            return await super().eval(vllm_metrics_scraper=vllm_metrics_scraper)
+        output = Path(self.cfg.trainer.export_path) / "lighteval" / f"global_step_{self.global_step}"
+        output.mkdir(parents=True, exist_ok=True)
+        command = [
+            "uv",
+            "run",
+            "--isolated",
+            "--no-config",
+            "--no-project",
+            sys.executable,
+            "-m",
+            "examples.train.rwkv.evaluate",
+            "--project",
+            config.project,
+            "--url",
+            self.inference_engine_client.proxy_url,
+            "--model",
+            self.inference_engine_client.model_name,
+            "--tokenizer",
+            self.cfg.trainer.policy.model.path,
+            "--output",
+            str(output),
+            "--step",
+            str(self.global_step),
+            "--task",
+            config.task,
+            "--num-samples",
+            str(config.num_samples),
+            "--context-length",
+            str(config.context_length),
+            "--concurrency",
+            str(
+                self.cfg.generator.inference_engine.num_engines * self.cfg.generator.inference_engine.max_num_seqs + 32
+            ),
+        ]
+        # Keep the producer's pinned math dependency private to the evaluation
+        # subprocess, using this project's interpreter and virtual environment.
+        dependencies = Path(sys.executable).parent.parent / "rwkv-eval"
+        env = os.environ | {"PYTHONPATH": f"{dependencies}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"}
+        if vllm_metrics_scraper is not None:
+            vllm_metrics_scraper.resume()
+        try:
+            with (output / "producer.log").open("w") as handle:
+                process = await asyncio.create_subprocess_exec(*command, env=env, stdout=handle, stderr=handle)
+                if await process.wait() != 0:
+                    raise RuntimeError(f"lighteval-rwkv evaluation failed; see {output / 'producer.log'}")
+        finally:
+            if vllm_metrics_scraper is not None:
+                vllm_metrics_scraper.pause()
+        if self.cfg.trainer.num_logger_eval_samples > 0:
+            completed = json.loads((output / "completed.json").read_text())
+            samples = []
+            with Path(completed["completions_path"]).open() as handle:
+                for line in handle:
+                    record = json.loads(line)
+                    response = record["model_response"]
+                    for text, answer, reason in zip(
+                        response["text"], response["text_post_processed"], response["finish_reasons"], strict=True
+                    ):
+                        samples.append(
+                            (
+                                self.global_step,
+                                record["task_name"],
+                                response["rendered_prompt"],
+                                json.dumps(record["doc"]["choices"]),
+                                text,
+                                answer,
+                                reason,
+                            )
+                        )
+                        if len(samples) == self.cfg.trainer.num_logger_eval_samples:
+                            break
+                    if len(samples) == self.cfg.trainer.num_logger_eval_samples:
+                        break
+            self.tracker.log_samples_to_table(
+                "eval/lighteval/samples",
+                ["step", "task", "prompt", "choices", "response", "answer_extracted", "finish_reason"],
+                samples,
+                step=self.global_step,
+                incremental=True,
+            )
+        return json.loads((output / "eval_metrics.json").read_text())
+
     @staticmethod
     def _stopd_mask(data):
         mask = data["loss_mask"].bool() & data["response_mask"].bool()
@@ -217,6 +320,19 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
             rewards = torch.logaddexp(rewards + math.log(alpha), torch.full_like(rewards, math.log1p(-alpha)))
         rewards = rewards * loss_masks_all
         data["rewards"] = rewards
+        mask = self._stopd_mask(data)
+        if self.stopd is not None and self.stopd.truncating:
+            weights, denominator = self.stopd.weights(mask), self.stopd.denominator
+        else:
+            weights, denominator = mask, mask.sum().item()
+        self.all_metrics.update(
+            {
+                "opd/reward_mean": (rewards * weights).sum().item() / denominator,
+                "opd/reward_abs_mean": (rewards.abs() * weights).sum().item() / denominator,
+                "opd/reverse_kl_mean": ((action_log_probs - teacher_action_log_probs) * weights).sum().item()
+                / denominator,
+            }
+        )
         return data
 
 

@@ -11,6 +11,7 @@ import copy
 import json
 import math
 import os
+import pickle
 import re
 import statistics
 import subprocess
@@ -73,6 +74,7 @@ def run_config(project, config, output, mode, checkpoint, start_step, steps, blo
         eval_before_train=False,
         eval_interval=-1,
         dump_train_results=True,
+        dump_data_batch=True,
         num_logger_train_samples=0,
         logger="console",
         run_name=f"{Path(trainer['policy']['model']['path']).name}-ultradata-opd-nora-{mode}-from-step-{start_step}",
@@ -119,27 +121,62 @@ def summarize(output, steps):
     return {"timings": timings, "updates": statuses}
 
 
-def validate_rollouts(vanilla, truncated, max_len, block, step):
+def validate_training_input(output, rows, stopd, step):
+    with (output / "exports/dumped_data" / f"global_step_{step}_training_input.pkl").open("rb") as handle:
+        data = pickle.load(handle)
+    for index, row in enumerate(rows):
+        tokens = data["sequences"][index][data["attention_mask"][index].bool()].tolist()
+        if tokens != row["prompt_token_ids"] + row["response_token_ids"]:
+            raise ValueError("Trainer sequence tokens differ from the generated prompt and response")
+        mask = data["response_mask"][index].bool()
+        if data["loss_mask"][index][mask].tolist() != row["loss_mask"]:
+            raise ValueError("Trainer response loss mask differs from the generated prefix mask")
+        torch.testing.assert_close(
+            data["rollout_logprobs"][index][mask],
+            torch.tensor(row["rollout_logprobs"], dtype=data["rollout_logprobs"].dtype),
+            rtol=0,
+            atol=0,
+        )
+    mask = data["response_mask"].bool() & data["loss_mask"].bool()
+    pad_size = data.metadata.get("pad_size", 0)
+    if pad_size:
+        mask[-pad_size:] = False
+    expected_rewards = -(data["action_log_probs"] - data["base_action_log_probs"]) * data["loss_mask"]
+    torch.testing.assert_close(data["rewards"], expected_rewards, rtol=0, atol=0)
+    expected_advantages = expected_rewards
+    if stopd.truncating:
+        expected_advantages = expected_rewards * stopd.multiplier(mask, data["loss_mask"].sum().item())
+    torch.testing.assert_close(data["advantages"], expected_advantages, rtol=0, atol=0)
+    if not torch.isfinite(data["advantages"]).all():
+        raise ValueError("Native OPD advantages must be finite")
+    return {"rows": len(rows), "response_tokens": int(mask.sum()), "ipw_advantages_exact": True}
+
+
+def validate_rollouts(vanilla, truncated, max_len, block, step, denominator, seed):
     full = read_rollouts(vanilla / "exports/dumped_rollouts" / f"global_step_{step}.jsonl")
     short = read_rollouts(truncated / "exports/dumped_rollouts" / f"global_step_{step}.jsonl")
     if [row["trajectory_id"] for row in full] != [row["trajectory_id"] for row in short]:
         raise ValueError("Both benchmark arms must resume the same dataloader position and row order")
-    for original, retained in zip(full, short, strict=True):
+    stopd = STOPD(max_len, block, 25, denominator, seed)
+    stopd.step = step - 1
+    budgets = stopd.budgets(len(short))
+    for original, retained, budget in zip(full, short, budgets, strict=True):
         tokens = retained["response_token_ids"]
         if original["prompt_token_ids"] != retained["prompt_token_ids"]:
             raise ValueError("Benchmark prompt tokens differ")
-        if tokens != original["response_token_ids"][: len(tokens)]:
-            raise ValueError(f"Seeded rollout prefix mismatch: {retained['trajectory_id']}")
         if len(tokens) != len(retained["rollout_logprobs"]) or retained["loss_mask"] != [1] * len(tokens):
             raise ValueError("Truncated tokens, logprobs, and loss masks must remain aligned")
-        if retained["truncated"] and (
-            not tokens or len(tokens) > max_len or (len(tokens) != max_len and len(tokens) % block)
-        ):
+        if len(tokens) > budget or (retained["truncated"] and len(tokens) != budget):
             raise ValueError("Truncated rollout did not end at its block budget")
+    native = validate_training_input(truncated, short, stopd, step)
+    vanilla_stopd = STOPD(max_len, block, step + 1, denominator, seed)
+    vanilla_stopd.step = step - 1
+    native_full = validate_training_input(vanilla, full, vanilla_stopd, step)
     return {
         "full_response_tokens": sum(len(row["response_token_ids"]) for row in full),
         "truncated_response_tokens": sum(len(row["response_token_ids"]) for row in short),
-        "matched_prefixes": len(short),
+        "native_stopd_alignment": native,
+        "native_vanilla_alignment": native_full,
     }
 
 
@@ -265,6 +302,8 @@ def main():
         original["generator"]["sampling_params"]["max_generate_length"],
         args.block,
         step + 1,
+        denominator,
+        args.seed,
     )
     next_checkpoint = validate_stopd_state(args.output / "stopd", step + args.steps)
     report["speedup"] = report["vanilla"]["timings"]["step"]["mean"] / report["stopd"]["timings"]["step"]["mean"]

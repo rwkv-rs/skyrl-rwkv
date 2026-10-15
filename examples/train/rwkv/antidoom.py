@@ -681,12 +681,30 @@ def ftpo_loss(
     }
 
 
-def load_model(model_path):
+def load_model(model_path, adapter_path=None):
     from transformers import AutoModelForCausalLM
 
     model = AutoModelForCausalLM.from_pretrained(model_path, dtype=torch.bfloat16, wkv_mode="fp32io16")
     if model.config.model_type != "rwkv":
         raise ValueError("This example requires an RWKV model.")
+    if adapter_path is not None:
+        from peft import LoraConfig, get_peft_model
+        from safetensors.torch import load_file
+
+        model = get_peft_model(model, LoraConfig.from_pretrained(adapter_path))
+        weights = load_file(str(Path(adapter_path) / "adapter_model.safetensors"))
+        # These RWKV adapters have no tensor-parallel shards. Load their
+        # canonical PEFT keys directly, keeping NoRA's A/B factors unchanged.
+        parameters = {
+            name.replace(".default.", "."): param
+            for name, param in model.named_parameters()
+            if ".lora_A.default." in name or ".lora_B.default." in name
+        }
+        if parameters.keys() != weights.keys():
+            raise ValueError("Saved adapter parameters do not match its configured RWKV projections.")
+        with torch.no_grad():
+            for name, param in parameters.items():
+                param.copy_(weights[name])
     # RWKV's ordinary BF16 head is selected by training mode. Read-only
     # scoring uses no_grad; FP16 free generation is handled by vLLM.
     return model.train()
@@ -1196,7 +1214,7 @@ def merge_and_save(model, tokenizer, model_path, output, probe_ids, device):
 
 def train(args):
     import torch.distributed as dist
-    from peft import LoraConfig, PeftModel, TaskType, get_peft_model
+    from peft import LoraConfig, TaskType, get_peft_model
     from safetensors.torch import save_file
     from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
     from skyrl.backends.skyrl_train.distributed.fsdp_utils import layered_summon_lora_params
@@ -1374,9 +1392,7 @@ def train(args):
         torch.cuda.empty_cache()
         dist.barrier()
         if dist.get_rank() == 0:
-            model = PeftModel.from_pretrained(
-                load_model(args.model), args.output / "adapters" / f"step_{step}", is_trainable=True
-            )
+            model = load_model(args.model, args.output / "adapters" / f"step_{step}")
             model.to(device)
             merge_and_save(model, tokenizer, args.model, args.output / "merged", val_rows[0]["prompt_ids"], device)
             if run:

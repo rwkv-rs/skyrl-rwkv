@@ -680,11 +680,20 @@ def test_prepare_groups_siblings_and_keeps_original_validation_prompts(tmp_path,
     assert {row["source"]["problem_key"] for row in prompts} == {row["problem_key"] for row in val}
 
 
-@pytest.mark.skipif("use_nora" not in LoraConfig.__dataclass_fields__, reason="requires Joluck/NoRA")
-def test_nora_reference_and_merged_logits_after_optimizer_step(tmp_path):
+@pytest.mark.parametrize(
+    "use_nora",
+    [
+        False,
+        pytest.param(
+            True,
+            marks=pytest.mark.skipif("use_nora" not in LoraConfig.__dataclass_fields__, reason="requires Joluck/NoRA"),
+        ),
+    ],
+)
+def test_adapter_reference_reload_and_merged_logits_after_optimizer_step(tmp_path, monkeypatch, use_nora):
     from tokenizers import Tokenizer as RustTokenizer
     from tokenizers.models import WordLevel
-    from transformers import PreTrainedTokenizerFast
+    from transformers import AutoModelForCausalLM, PreTrainedTokenizerFast
 
     torch.manual_seed(7)
     base = LlamaForCausalLM(
@@ -713,7 +722,7 @@ def test_nora_reference_and_merged_logits_after_optimizer_step(tmp_path):
             r=2,
             lora_alpha=2,
             target_modules=["q_proj", "v_proj"],
-            use_nora=True,
+            **({"use_nora": True} if use_nora else {}),
         ),
     )
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=0.01)
@@ -726,6 +735,20 @@ def test_nora_reference_and_merged_logits_after_optimizer_step(tmp_path):
     model.eval()
     adapted = antidoom.last_logits(model, prompt_ids, "cpu").detach()
     assert not torch.allclose(adapted, reference)
+    adapter_path = tmp_path / "adapter"
+    model.save_pretrained(adapter_path)
+    original_load = AutoModelForCausalLM.from_pretrained
+
+    def load_base(path, **kwargs):
+        loaded = original_load(path, dtype=torch.float32)
+        loaded.config.model_type = "rwkv"
+        return loaded
+
+    monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", load_base)
+    model = antidoom.load_model(base_path, adapter_path).eval()
+    torch.testing.assert_close(antidoom.last_logits(model, prompt_ids, "cpu"), adapted)
+    if not use_nora:
+        return
     output = tmp_path / "merged"
     merged = antidoom.merge_and_save(model, tokenizer, base_path, output, prompt_ids, "cpu")
     actual = antidoom.last_logits(merged, prompt_ids, "cpu")

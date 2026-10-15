@@ -29,3 +29,52 @@ Then, just make sure to set the path to your desired teacher model, and you're r
 TEACHER_MODEL=<YOUR_MODEL_HERE>
 bash examples/train/on_policy_distillation/run_on_policy_distill_math_qwen3_4b.sh trainer.ref.mode.path=$TEACHER_MODEL
 ```
+
+## Optional STOPD
+
+[STOPD](https://github.com/YouAreSpecialToMe/STOPD) samples an independent token
+budget for each training rollout, rounded up to a block boundary. Retained
+response tokens receive inverse-probability weights. The weighted loss uses a
+fixed denominator from the previous update's estimated full token count; it
+does not divide by the current, randomly truncated token count. Evaluation
+continues to generate complete responses.
+
+STOPD is disabled by default. Enable it through the same OPD entry point:
+
+```bash
+bash examples/train/rwkv/run_rwkv_on_policy_distill.sh \
+  trainer.algorithm.stopd.enabled=true \
+  trainer.algorithm.stopd.block=128 \
+  trainer.algorithm.stopd.warmup_steps=25
+```
+
+Warmup counts completed global updates, including updates restored from a
+checkpoint. The supported configuration is synchronous, single-turn OPD with
+one response per prompt and one optimizer update per rollout batch. Sampled
+prefixes keep their actual tokens, logprobs, and action masks; no terminal token
+is appended at a sampled cutoff. Additional advantage normalization, entropy
+loss, KL loss, and overlong filtering must be disabled.
+
+Native checkpoints retain model, optimizer, scheduler, RNG, and dataloader state.
+With STOPD enabled they also contain `stopd_state.pt`, including the step,
+lagged denominator, budget seed, and truncation configuration. Resume one with
+`trainer.resume_mode=from_path trainer.resume_path=<global_step_directory>`.
+When importing a Vanilla OPD checkpoint after warmup, set
+`trainer.algorithm.stopd.initial_denominator` to the preceding update's full
+response-token count (the sum of its dumped rollout `loss_mask` values).
+
+To compare both modes from the same complete checkpoint and data position:
+
+```bash
+uv run --isolated --no-project .venv/bin/python3 \
+  examples/train/rwkv/benchmark_stopd.py \
+  --checkpoint <global_step_directory> --output <new_benchmark_directory>
+```
+
+This runs three updates per arm with the checkpoint's original training
+configuration and independent, reproducible sampling seeds. It checks restored
+optimizer/data state, retained rollout prefixes, finite updates, and the saved
+STOPD denominator, and reports end-to-end and per-stage timings. The optional
+`--continue-training` resumes the resulting STOPD checkpoint after these checks
+and at least 5% measured end-to-end acceleration. Periodic evaluation and
+checkpoint intervals then follow the original experiment configuration.

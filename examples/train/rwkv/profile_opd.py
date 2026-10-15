@@ -62,7 +62,17 @@ def main():
             torch.cuda.synchronize()
             start = time.perf_counter()
             with torch.set_grad_enabled(training):
-                logprobs = wrapper(ids, num_actions=8192, attention_mask=mask)
+                # Match PolicyWorkerBase._forward_backward_micro, including
+                # autocast's FP32 log-softmax and the entropy logging pass.
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=training):
+                    logprobs, output = wrapper(
+                        ids,
+                        num_actions=8192,
+                        attention_mask=mask,
+                        return_output=True,
+                        compute_entropy=training,
+                        entropy_requires_grad=False,
+                    )
                 if training:
                     loss = -logprobs.float().mean()
                     loss.backward()
@@ -73,7 +83,7 @@ def main():
             dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
             if step:
                 times.append(elapsed.item())
-            del logprobs
+            del logprobs, output
         peak = torch.tensor(torch.cuda.max_memory_allocated(), device="cuda", dtype=torch.float64)
         dist.all_reduce(peak, op=dist.ReduceOp.MAX)
         seconds = sum(times) / len(times)

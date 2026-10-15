@@ -142,7 +142,7 @@ def validate_training_input(output, rows, stopd, step):
     if pad_size:
         mask[-pad_size:] = False
     expected_rewards = -(data["action_log_probs"] - data["base_action_log_probs"]) * data["loss_mask"]
-    torch.testing.assert_close(data["rewards"], expected_rewards, rtol=0, atol=0)
+    torch.testing.assert_close(data["returns"], expected_rewards, rtol=0, atol=0)
     expected_advantages = expected_rewards
     if stopd.truncating:
         expected_advantages = expected_rewards * stopd.multiplier(mask, data["loss_mask"].sum().item())

@@ -5,6 +5,9 @@ This example trains models via On-Policy Distillation (following the
 In on-policy distillation (OPD), a student trains on its own rollouts while a frozen teacher grades every
 token: the advantage is the per-token reverse KL, `log π_teacher − log π_student`.
 
+For RWKV7 G1k-13.3B to G1k-1.5B distillation using this same entry point, see the
+[RWKV recipe](../rwkv/README.md#on-policy-distillation).
+
 ## Quickstart
 
 ```bash

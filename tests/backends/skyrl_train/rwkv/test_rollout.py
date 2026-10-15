@@ -1,6 +1,7 @@
 import asyncio
 import json
 import signal
+import subprocess
 import sys
 from collections import Counter, defaultdict
 from itertools import cycle
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[4]))
-from examples.train.rwkv import rollout
+from examples.train.rwkv import build_value_data, rollout
 
 
 class Tokenizer:
@@ -213,6 +214,7 @@ def test_math_rollout_matches_strict_gsm8k_reward(tmp_path, tokenizer):
                         f"http://{host}:{port}",
                         "--limit",
                         "4",
+                        "--save-rollouts",
                         "--concurrency",
                         "8",
                         "--score-workers",
@@ -233,6 +235,17 @@ def test_math_rollout_matches_strict_gsm8k_reward(tmp_path, tokenizer):
     assert summary["Knowledge"]["correct_rollouts"] == 64
     assert len(requests) == 128
     assert all(payload["return_token_ids"] for payload in requests)
+    records = [
+        json.loads(line)
+        for path in (tmp_path / "output/rollouts").glob("*/*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+    assert len(records) == 128
+    math_records = [record for record in records if record["domain"] == "Math"]
+    assert sum(record["reward"] for record in math_records) == 16
+    assert sum(record["truncated"] for record in math_records) == 8
+    assert any(len(record["response_ids"]) > 1 for record in math_records)
+    assert all(record["prompt_ids"] == list(record["domain"].encode()) for record in records)
     assert {(query, kwargs["rwkv_generation_prompt"]) for query, kwargs in tokenizer.prompts} == {
         ("Math", "open_think"),
         ("Knowledge", "fake_think"),
@@ -273,6 +286,7 @@ def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(
         def complete(engine):
             async def handle(request):
                 payload = await request.json()
+                assert all(payload[key] == value for key, value in rollout.ROLLOUT_SAMPLING_PARAMS.items())
                 requests[engine] += 1
                 if payload["prompt"] == list(b"q3"):
                     await asyncio.wait_for(persisted.wait(), timeout=10)
@@ -307,6 +321,9 @@ def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(
                     ",".join(urls),
                     "--max-num-seqs",
                     "1",
+                    "--save-rollouts",
+                    "--sampling",
+                    "rollout",
                     "--score-workers",
                     "1",
                     "--timeout",
@@ -322,6 +339,10 @@ def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(
             with pytest.raises(ValueError, match="changed max_tokens"):
                 await rollout.run(args)
             args.max_tokens = 8192
+            args.save_rollouts = False
+            with pytest.raises(ValueError, match="changed save_rollouts"):
+                await rollout.run(args)
+            args.save_rollouts = True
             saved = json.loads((output / "summary.json").read_text())
             before = (output / "correct_counts_by_question.jsonl").read_bytes()
             for version in (None, 1):
@@ -357,6 +378,153 @@ def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(
     assert len(records) == 5
     assert {record["uuid"] for record in records} == {f"Knowledge_{index}" for index in range(5)}
     assert all(record["counts"] == {"correct": 64} for record in records)
+    trajectories = [
+        json.loads(line) for path in (output / "rollouts").glob("*/*.jsonl") for line in path.read_text().splitlines()
+    ]
+    assert len(trajectories) == 320
+    assert len({(record["uuid"], record["sample_index"]) for record in trajectories}) == 320
+    assert all(record["response_ids"] == list(b"Final answer: 42") + [0] for record in trajectories)
+    assert all(record["reward"] == 1.0 and not record["truncated"] for record in trajectories)
+    assert not list((output / "rollouts").glob("*/*.pending"))
+    manifest = build_value_data.build_data(output, tmp_path / "value", validation_fraction=0.5, seed=0, max_length=64)
+    assert sum(manifest["counts"][f"{split}_rollouts"] for split in ("train", "validation")) == 320
+
+
+@pytest.fixture
+def token_rollout_run(tmp_path):
+    output = tmp_path / "token-run"
+    shards = output / "rollouts/Knowledge"
+    shards.mkdir(parents=True)
+    (output / "summary.json").write_text(json.dumps({"config": {"save_rollouts": True, "model": "test-rwkv"}}))
+    for index in range(20):
+        rows = [
+            {"response_ids": [13, 0], "reward": 1.0, "truncated": False},
+            {"response_ids": [14, 0], "response_mask": [1, 0], "reward": 0.0, "truncated": False},
+            {"response_ids": [15, 16], "reward": 0.0, "truncated": True},
+            {"response_ids": [], "reward": 0.0, "truncated": False},
+            {"response_ids": [17] * 20, "reward": 0.0, "truncated": False},
+            {"response_ids": [18, 0], "reward": 0.0, "truncated": True, "returns": [0, 0, 0.7, 0.8]},
+        ]
+        with (shards / f"question_{index}.jsonl").open("w") as handle:
+            for sample_index, row in enumerate(rows):
+                handle.write(
+                    json.dumps(
+                        {
+                            "uuid": f"Knowledge_{index}",
+                            "domain": "Knowledge",
+                            "sample_index": sample_index,
+                            "prompt_ids": [11, 12],
+                            **row,
+                        }
+                    )
+                    + "\n"
+                )
+    (shards / "unfinished.pending").write_text("not a completed trajectory")
+    return output
+
+
+def test_build_value_data_preserves_tokens_masks_outcomes_and_uuid_split(tmp_path, token_rollout_run):
+    import torch
+
+    from skyrl.train.dataset.value_dataset import (
+        RewardDataCollator,
+        ValueDataset,
+        value_loss,
+    )
+
+    output = tmp_path / "value-data"
+    manifest = build_value_data.build_data(token_rollout_run, output, validation_fraction=0.5, max_length=8)
+    assert manifest["counts"]["read_rollouts"] == 120
+    for reason in ("truncated", "empty", "overlength"):
+        assert manifest["counts"][f"skipped_{reason}"] == 20
+    splits = {
+        split: [json.loads(line) for line in (output / f"{split}.jsonl").read_text().splitlines()]
+        for split in ("train", "validation")
+    }
+    assert sum(len(rows) for rows in splits.values()) == 60
+    assert {row["uuid"] for row in splits["train"]}.isdisjoint(row["uuid"] for row in splits["validation"])
+    for split, rows in splits.items():
+        assert manifest["counts"][f"{split}_questions"] == len({row["uuid"] for row in rows})
+        for row in rows:
+            assert row["input_ids"][:2] == [11, 12]
+            assert row["loss_mask"][:2] == [0, 0]
+            if row["sample_index"] == 0:
+                assert row["input_ids"] == [11, 12, 13, 0] and row["reward"] == 1.0
+            elif row["sample_index"] == 1:
+                assert row["input_ids"] == [11, 12, 14, 0] and row["reward"] == 0.0
+                assert row["loss_mask"] == [0, 0, 1, 0]
+            else:
+                assert row["returns"] == [0, 0, 0.7, 0.8]
+        dataset = ValueDataset(str(output / f"{split}.jsonl"), max_length=8)
+        batch = RewardDataCollator(0)([dataset[index] for index in range(len(dataset))])
+        predictions = torch.zeros_like(batch["labels"], requires_grad=True)
+        error, count = value_loss(predictions, batch["labels"], batch["response_mask"])
+        (error / count).backward()
+        assert torch.isfinite(predictions.grad).all()
+    other = tmp_path / "value-data-repeat"
+    build_value_data.build_data(token_rollout_run, other, validation_fraction=0.5, max_length=8)
+    for name in ("train.jsonl", "validation.jsonl"):
+        assert (output / name).read_bytes() == (other / name).read_bytes()
+    cli_output = tmp_path / "value-data-cli"
+    root = Path(__file__).parents[4]
+    with (tmp_path / "build_cli.log").open("wb") as log:
+        subprocess.run(
+            [
+                "uv",
+                "run",
+                "--isolated",
+                "--no-project",
+                sys.executable,
+                str(root / "examples/train/rwkv/build_value_data.py"),
+                "--input",
+                str(token_rollout_run),
+                "--output",
+                str(cli_output),
+                "--validation-fraction",
+                "0.5",
+                "--max-length",
+                "8",
+            ],
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            check=True,
+            timeout=45,
+        )
+    for name in ("train.jsonl", "validation.jsonl"):
+        assert (output / name).read_bytes() == (cli_output / name).read_bytes()
+    with pytest.raises(FileExistsError):
+        build_value_data.build_data(token_rollout_run, output, validation_fraction=0.5)
+
+
+def test_build_value_data_rejects_empty_split_without_publishing(tmp_path, token_rollout_run):
+    output = tmp_path / "empty-split"
+    with pytest.raises(ValueError, match="empty train/validation"):
+        build_value_data.build_data(token_rollout_run, output, validation_fraction=1e-20)
+    assert not output.exists()
+    assert not list(tmp_path.glob(".value-data-*"))
+
+
+def test_trajectory_publication_is_atomic_and_can_replace_unmarked_question(tmp_path):
+    row = {"uuid": "Knowledge_1", "domain": "Knowledge"}
+    pending = rollout.start_trajectory(tmp_path, row, [11, 12])
+    rollout.append_trajectory(pending, 1, [14, 0], "length")
+    rollout.append_trajectory(pending, 0, [13, 0], "stop")
+    path = rollout.trajectory_path(tmp_path, row)
+    assert not path.exists()
+    rollout.publish_trajectories(
+        tmp_path, row, [{"status": "correct", "reason": "ok"}, {"status": "unanswered", "reason": "length"}]
+    )
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [record["reward"] for record in records] == [0.0, 1.0]
+    assert [record["truncated"] for record in records] == [True, False]
+    assert [record["sample_index"] for record in records] == [1, 0]
+    pending = rollout.start_trajectory(tmp_path, row, [11, 12])
+    rollout.append_trajectory(pending, 0, [15, 0], "stop")
+    rollout.publish_trajectories(tmp_path, row, [{"status": "wrong", "reason": "answer_match"}])
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert len(records) == 1 and records[0]["response_ids"] == [15, 0]
+    assert not list(path.parent.glob("*.pending"))
+    assert not list(path.parent.glob("*.tmp"))
 
 
 def test_http_failure_stops_pipeline_and_keeps_external_server(tmp_path, tokenizer):

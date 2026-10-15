@@ -98,6 +98,13 @@ disagree.
 
 ### Weight sources
 
+RWKV NoRA policies (`trainer.policy.model.lora.use_nora=true`) use
+`FsdpLoraWeightSource` instead of adapter hot-loading. It shares the complete-weight
+transport and metadata contract with `FsdpWeightSource`, streams one projection at a
+time, and uses `iter_merged_lora_weights` in `distributed/fsdp_utils.py` for AntiDoom's
+FP32 NoRA normalization/merge. HF exports use the same merge helper. The live adapter
+and frozen base are not modified; the existing RWKV cache reset runs after transfer.
+
 `sources.py` implements exactly vLLM's two-channel contract, and the two channels must
 agree element for element — `metadata()` declares what iteration will yield, and the
 engine sizes the worker's receive buffers and cuts its packed chunk boundaries from it.

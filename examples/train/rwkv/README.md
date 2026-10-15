@@ -750,13 +750,15 @@ containing EOS or RWKV protocol tokens.
 NoRA uses `use_nora=True`, rank 8, alpha equal to rank, zero dropout, and the
 RWKV attention projections `r_proj`, `k_proj`, `v_proj`, `o_proj`, and the
 `lm_head` output projection. `--target-modules` can select the adaptation scope.
-The attention training path calls these projection modules, so PEFT computes
-NoRA's normalized low-rank update outside the FlashRWKV2 recurrent operators;
-the WKV kernels do not need adapter-specific changes. ChannelMix `key` and
-`value` use fused weight-based training operators and are not adaptation targets
-in this example. Native fused inference requires absorbing the adapter first;
-the export below normalizes attention factors and absorbs the output head before
-checking the fused inference path. Each FTPO
+BF16 training passes the original PEFT A/B parameters and scaling to fused
+FlashRWKV2 projection operators, including NoRA column normalization and its
+backward. WKV recurrence retains its existing implementation. ChannelMix
+`key` and `value` can also be selected with `--target-modules`; the default
+five targets above preserve this example's training recipe. Each sample's
+hidden state is selected before the output-head projection, so a batch of B
+samples produces B vocabulary rows. PEFT continues to manage disabling,
+saving, loading, and merging adapters. Native FP16 inference absorbs Head
+and any ChannelMix adapters before the full-model merge probe. Each FTPO
 sample scores a single next-token position. The loss keeps the notebook's
 margin 2, non-target logit MSE coefficient 0.4, target coefficient 0.05 and
 target tolerance 0.5. Reference logits come from the frozen base with the

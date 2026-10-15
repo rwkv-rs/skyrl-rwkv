@@ -23,6 +23,7 @@ def main():
     parser.add_argument("--steps", type=int, default=2)
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group("nccl")
     training = args.role == "policy"
     strategy = FSDPStrategy(
         FSDPConfig(fsdp_size=1, reshard_after_forward=False, sync_gradients_each_microbatch=False),

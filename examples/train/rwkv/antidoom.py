@@ -557,6 +557,9 @@ def batch_logits(model, rows, device):
     for index, row in enumerate(rows):
         ids[index, : lengths[index]] = torch.tensor(row["prompt_ids"], device=device)
     positions = torch.tensor(lengths, device=device) - 1
+    if model.config.model_type == "rwkv":
+        logits = model(ids, use_cache=False, logits_to_keep=positions[:, None]).logits
+        return logits[:, 0].float()
     logits = model(ids, use_cache=False, logits_to_keep=positions).logits
     indices = torch.arange(len(rows), device=device)
     # Each row's loss is causal: trailing pads are outside its selected prefix.
@@ -1186,25 +1189,32 @@ def merge_and_save(model, tokenizer, model_path, output, probe_ids, device):
                 factors[layer] = (weight_a, weight_b)
                 layer.lora_A["default"].weight.data = weight_a
         model.half().eval()
-        # RWKV's inference head reads lm_head.weight directly. Absorb its
-        # adapter before probing the native FP16 inference path.
+        # FP16 inference reads dense Head and ChannelMix weights.
         head = model.get_output_embeddings()
+        dense_layers = [head]
+        if model.config.model_type == "rwkv":
+            for block in model.get_base_model().model.layers:
+                dense_layers.extend((block.mlp.key, block.mlp.value))
         head_error = None
-        if head in factors:
-            weight_a, weight_b = factors[head]
-            head.get_base_layer().weight.data = head.get_base_layer().weight.data.float()
-            head.lora_A["default"].weight.data = weight_a
-            head.lora_B["default"].weight.data = weight_b
-            hidden = torch.randn(1, head.in_features, device=device, dtype=torch.float32)
-            expected = (
-                F.linear(hidden, head.get_base_layer().weight)
-                + F.linear(F.linear(hidden, weight_a), weight_b) * head.scaling["default"]
-            )
-            head.merge(safe_merge=True)
-            actual = F.linear(hidden, head.get_base_layer().weight)
-            torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
-            head_error = (actual - expected).abs().max().item()
-            head.get_base_layer().weight.data = head.get_base_layer().weight.data.half()
+        for layer in dense_layers:
+            if layer not in factors:
+                continue
+            weight_a, weight_b = factors[layer]
+            layer.get_base_layer().weight.data = layer.get_base_layer().weight.data.float()
+            layer.lora_A["default"].weight.data = weight_a
+            layer.lora_B["default"].weight.data = weight_b
+            if layer is head:
+                hidden = torch.randn(1, head.in_features, device=device, dtype=torch.float32)
+                expected = (
+                    F.linear(hidden, head.get_base_layer().weight)
+                    + F.linear(F.linear(hidden, weight_a), weight_b) * head.scaling["default"]
+                )
+            layer.merge(safe_merge=True)
+            if layer is head:
+                actual = F.linear(hidden, head.get_base_layer().weight)
+                torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
+                head_error = (actual - expected).abs().max().item()
+            layer.get_base_layer().weight.data = layer.get_base_layer().weight.data.half()
         before = last_logits(model, probe_ids, device)
         for layer, (weight_a, weight_b) in factors.items():
             layer.get_base_layer().weight.data = layer.get_base_layer().weight.data.float()

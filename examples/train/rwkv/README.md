@@ -84,6 +84,11 @@ Each run gets a timestamped model-specific output directory containing:
 - `pass_rate_histogram.svg` and up to 20 UUID-disjoint examples in each of
   `correct_samples.jsonl`, `wrong_samples.jsonl`, and `unanswered_samples.jsonl`, written on exit.
 - `vllm_gpu_*.log` and `vllm.pids`: logs and identities of engines owned by this run.
+- With `--save-rollouts`, `rollouts/<domain>/<UUID-SHA256>.jsonl`: all scored samples,
+  with exact prompt/response token IDs, sample indices, rewards, and termination reasons.
+  Full response IDs are staged on disk as they arrive, not accumulated in RAM. Each
+  question shard is atomically published before its completed-count record; resume
+  replaces any unmarked shard instead of appending duplicate samples.
 
 Existing result files are not overwritten. To resume an interrupted run:
 
@@ -103,6 +108,104 @@ prompts, golden cases, or a per-question score map.
 
 Completion, failure, and SIGTERM shut down only engines started by this invocation;
 externally supplied engines remain running.
+
+## Offline value pretraining
+
+`skyrl.train.main_value` trains an independent token-level scalar critic from offline
+rollouts, using the native critic loader and `FSDPStrategy` (no inference engines or
+Ray cluster). The data/alignment implementation is adapted from
+[ReDiPPO standard critic pretraining](https://github.com/cii030/ReDiPPO/tree/ecb67b2119b966616a6b8ffbad3db830c4c423fd/critic_pretraining),
+under Apache-2.0 (see the repository `LICENSE`). It does not include ReDiPPO's dual
+critics. This is critic initialization, not the full online SAO algorithm.
+
+### Collect rollouts and build data
+
+Use `--sampling rollout` to match the training policy (temperature 1, top-p 1,
+top-k -1, no penalties). The existing evaluation sampling remains the default.
+This explicit 128-question run is a small data-collection example; omit `--limit`
+to collect the full UltraData corpus. Each question still has 64 scored samples.
+
+```bash
+MODEL_DIR="$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600"
+ROLLOUT_DIR=outputs/rwkv7-g1k-1.5b-20260930-ctx25600-value-rollouts
+DATA_DIR="$HOME/data/rwkv-value"
+
+uv run --isolated --no-project .venv/bin/python examples/train/rwkv/rollout.py \
+  --model "$MODEL_DIR" --output "$ROLLOUT_DIR" \
+  --sampling rollout --save-rollouts --limit 128 \
+  > /tmp/results_rwkv_value_rollouts.log 2>&1
+
+uv run --isolated --no-project .venv/bin/python examples/train/rwkv/build_value_data.py \
+  --input "$ROLLOUT_DIR" --output "$DATA_DIR" \
+  --validation-fraction 0.05 --seed 42 --max-length 8192 \
+  > /tmp/results_rwkv_build_value_data.log 2>&1
+```
+
+The builder streams complete question shards into `train.jsonl`, `validation.jsonl`,
+and `manifest.json`, published together in a new output directory. UUID-hash splitting
+keeps all samples of each question in one split and is stable on repeated builds.
+It retains positive and zero rewards without balancing. Empty, over-length, and
+truncated samples without explicit bootstrap returns are excluded and counted in the
+manifest. Thus the default MC dataset is conditioned on completion within the length
+budget; it does not claim to estimate values for excluded truncated trajectories.
+The manifest records the source model, sampling configuration, split seed, and counts.
+
+### Dataset contract and pretraining
+
+Store exact rollout token IDs, not re-tokenized decoded text, as unpadded JSONL,
+Parquet, Arrow, or a HuggingFace `Dataset.save_to_disk` directory:
+
+```json
+{"input_ids": [11, 12, 13, 14, 15, 16], "loss_mask": [0, 0, 1, 0, 0, 1], "reward": 1.0, "truncated": false}
+```
+
+- `input_ids` includes the prompt and all assistant/tool turns.
+- `loss_mask` covers the entire sequence: 1 for generated action tokens, 0 for prompt
+  and tool-observation tokens. The first token must be context (mask 0).
+- For completed trajectories with an undiscounted terminal reward, every action gets
+  the same `reward` target. For discounted or intermediate rewards, supply explicit
+  full-sequence `returns` instead. Truncated trajectories require `returns`, including
+  the chosen bootstrap; the trainer does not invent a terminal target.
+- Values are aligned before the target action: the first response token uses the
+  final prompt state. Tool observations remain in recurrent context but not the loss.
+- Over-length rows are dropped rather than cutting completed trajectories. Split
+  training/validation by question UUID so repeated rollouts do not leak across splits.
+
+`build_value_data.py` concatenates stored prompt/response IDs without re-tokenization.
+For this single-turn collector it masks the prompt to 0 and generated actions to 1;
+explicit `response_mask` fields in source rows preserve tool-observation exclusions.
+The trainer consumes these exact tokens and full-sequence masks.
+
+After preparing the project-local RWKV environment and FlashRWKV2 cache:
+
+```bash
+MODEL_DIR="$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600"
+TORCH_EXTENSIONS_DIR="$HOME/.cache/skyrl-rwkv/torch_extensions" \
+uv run --isolated --no-project .venv/bin/torchrun --standalone --nproc-per-node=8 \
+  -m skyrl.train.main_value \
+  --model "$MODEL_DIR" \
+  --train-data "$HOME/data/rwkv-value/train.jsonl" \
+  --val-data "$HOME/data/rwkv-value/validation.jsonl" \
+  --output-dir outputs/rwkv7-g1k-1.5b-20260930-ctx25600-value \
+  --epochs 2 --lr 5e-6 --batch-size 1 --gradient-accumulation-steps 4 \
+  --max-length 8192 --gradient-checkpointing \
+  > /tmp/results_rwkv_value_pretraining.log 2>&1
+```
+
+Default: native BF16 RWKV, `wkv_mode=fp32io16`, raw scalar predictions and FP32 masked
+MSE, globally normalized over action tokens across ranks and accumulation windows.
+Unlike ReDiPPO's binary-outcome sigmoid, raw values match SkyRL's online critic and
+arbitrary reward scales. Parameters, optimizer, and HF weights are saved and held-out
+evaluation runs every 50 optimizer steps and at the final step. W&B records training
+MSE, token/sequence validation MSE, value/target means, and mask-aware explained
+variance (`--report-to none` disables it).
+
+`step_N/` holds native FSDP checkpoints and `step_N/huggingface/` holds HF exports;
+`best/` holds the critic with the lowest held-out sequence MSE. Load `best/` through
+`get_llm_for_sequence_regression(path, "critic")`, or set
+`trainer.critic.model.path=<output-dir>/best` for an online critic. Keep the actor's
+model path separate so online initialization does not reset the pretrained value head.
+The offline entry point starts a fresh optimizer; it does not resume interrupted runs.
 
 ## Download and verify the model
 
@@ -194,6 +297,88 @@ MODEL_DIR="$MODEL_DIR" bash examples/train/rwkv/run_rwkv_grpo.sh
 
 Choose `MICRO_BATCH_SIZE` for the available GPU memory while keeping global train and policy mini-batch sizes fixed. Successful acceptance requires all 50 optimizer steps, every trainer-to-inference weight update, aligned rollout token/logprob/loss-mask lengths, finite logprob-difference metrics without abnormal jumps, step-50 checkpoint/export/eval artifacts, and an online W&B run containing training, reward, evaluation, system-resource, and logprob-alignment curves.
 
+## On-policy distillation
+
+`run_rwkv_on_policy_distill.sh` uses the native
+`examples.train.on_policy_distillation.main_on_policy_distill` entry point to distill
+`rwkv7-g1k-13.3b-20260930-ctx25600` into `rwkv7-g1k-1.5b-20260930-ctx25600`.
+The student generates completions; the frozen teacher occupies the reference-model role
+and scores the same token IDs. The native trainer replaces task rewards with masked
+`teacher_logprob - student_logprob`, passes them through the `no_op` advantage estimator,
+and updates the student with `importance_sampling` loss. Task answer scores remain
+available for evaluation. No critic is used.
+
+Prepare the project-local RWKV environment and FlashRWKV2 cache as described above.
+Download both model subfolders from the same release revision:
+
+```bash
+MODEL_ROOT="$HOME/Weights/RWKV/hf"
+hf download rwkv-rs/rwkv7-g1-st \
+  --revision b672701cccf4bddcc66f65c8c9a468b776c9836a \
+  --include 'rwkv7-g1k-1.5b-20260930-ctx25600/*' \
+            'rwkv7-g1k-13.3b-20260930-ctx25600/*' \
+  --local-dir "$MODEL_ROOT" \
+  > /tmp/results_rwkv_opd_download.log 2>&1
+```
+
+The recipe uses the native OPD example's DAPO-Math training set and AIME 2024 evaluation
+set. Reuse its download sources and preprocessing module in this project's RWKV environment:
+
+```bash
+DATA_DIR="$HOME/data/dapo"
+mkdir -p "$DATA_DIR"
+wget -O "$DATA_DIR/dapo-math-17k.parquet" \
+  'https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k/resolve/main/data/dapo-math-17k.parquet?download=true' \
+  > /tmp/results_rwkv_opd_download_dapo.log 2>&1
+wget -O "$DATA_DIR/aime-2024.parquet" \
+  'https://huggingface.co/datasets/BytedTsinghua-SIA/AIME-2024/resolve/main/data/aime-2024.parquet?download=true' \
+  > /tmp/results_rwkv_opd_download_aime.log 2>&1
+uv run --isolated --no-project .venv/bin/python \
+  -m examples.train.algorithms.dapo.data_preprocess_dapo_aime --data-dir "$DATA_DIR" \
+  > /tmp/results_rwkv_opd_prepare_data.log 2>&1
+```
+
+Run from the project root after configuring W&B in `.env`:
+
+```bash
+STUDENT_MODEL="$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600" \
+TEACHER_MODEL="$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600" \
+  bash examples/train/rwkv/run_rwkv_on_policy_distill.sh \
+  > /tmp/results_rwkv_opd.log 2>&1
+```
+
+Defaults: 8 colocated GPUs, eight TP1 student inference engines, BF16 training and
+teacher scoring with `wkv_mode=fp32io16`, FP16 inference, gradient checkpointing,
+64 prompts per batch, one completion per prompt, policy mini-batch 64, per-GPU
+micro-batch 1, and AdamW LR `1e-5`. Each fresh rollout batch produces one optimizer
+step followed by native student-to-inference weight sync; the teacher stays frozen.
+Prompts use `bot + open_think`, with a 2048-token prompt budget and an 8192-token
+generation budget. Training sampling uses temperature `1`, top-p `1`, top-k `-1`,
+and disabled penalties. Evaluation uses temperature `0.96`, top-p `0.76`, top-k `32`,
+presence penalty `1.0`, frequency penalty `0.1`, penalty decay `0.988`, and 32 samples
+per prompt.
+
+The default run stops after 50 training steps. Evaluation runs before training and
+every 50 steps; resumable checkpoints and HF exports are saved every 50 steps.
+Training metrics, evaluation scores, and sampled trajectories are uploaded to W&B;
+detailed training rollout dumps are written under `$OUTPUT_ROOT/exports/dumped_rollouts`.
+`OUTPUT_ROOT` defaults to `$HOME/skyrl-rwkv-runs/$RUN_NAME`.
+
+`STUDENT_MODEL`, `TEACHER_MODEL`, `DATA_DIR`, `TRAIN_FILE`, `TEST_FILE`, `NUM_GPUS`,
+`MICRO_BATCH_SIZE`, `LOGGER`, `RUN_NAME`, and `OUTPUT_ROOT` accept environment overrides.
+Additional native config overrides are forwarded at the end of the command, for example:
+
+```bash
+RUN_NAME=rwkv7-g1k-1.5b-20260930-ctx25600-dapo-opd-long \
+  bash examples/train/rwkv/run_rwkv_on_policy_distill.sh \
+  trainer.max_training_steps=500 \
+  > /tmp/results_rwkv_opd_long.log 2>&1
+```
+
+This recipe keeps full-sequence recurrent forwards for both models
+(`trainer.rwkv_chunk_size=0` by default). Runtime correctness, memory use, throughput,
+and convergence have not yet been validated for this teacher/student pair.
+
 ## FlashREINFORCE and algorithm ablations
 
 FlashREINFORCE is available through the native policy-loss registry. It uses one rollout per
@@ -230,9 +415,20 @@ GSM8K rewards remain unchanged when strict mode is disabled. The shared parquet 
 need to be rewritten. Historical answer-match scores are not directly comparable to strict rewards.
 For the asynchronous pipeline, use the existing
 `examples.train.fully_async.main_fully_async` entrypoint, set `trainer.fully_async.enabled=true` and
-`generator.batched=false`; also pass `environment.skyrl_gym.gsm8k.strict_reward=true`. The default gate is `3e-3`; monitor
+`generator.batched=false`; also pass `environment.skyrl_gym.gsm8k.strict_reward=true`.
+The launcher sets `trainer.fully_async.clear_kv_cache_on_weight_sync=true`: each weight update
+resets cached prefixes and running recurrent states before generation resumes. RWKV fully-async
+training requires this setting so cached states are recomputed with the updated weights.
+The default gate is `3e-3`; monitor
 `policy/loss_metrics/flashreinforce/acceptance_rate` and the rollout/trainer logprob-difference
 metrics before tuning it.
+
+Before a fresh training run, verify the model's `bot + open_think` template and score a fresh
+rollout batch with the native strict GSM8K environment. Check `environment/structural_format_valid`,
+`environment/ended_eod`, `environment/truncated`, and `environment/strict_reward` alongside
+the positive-reward count; an all-zero batch provides no centered reward signal for FlashREINFORCE.
+Keep the training and evaluation sampling recipes above, batch size, optimizer, Score-Centering,
+and admission gate fixed when comparing the corrected reward/cache baseline.
 
 BPO is implemented as a separate `policy_loss_type=bpo` / `advantage_estimator=bpo` ablation. For
 example, on the synchronous RWKV script use `trainer.algorithm.use_kl_loss=false`,

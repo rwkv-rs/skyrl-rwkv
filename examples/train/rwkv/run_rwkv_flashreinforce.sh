@@ -61,6 +61,7 @@ uv run --isolated --no-project .venv/bin/python -m "$TRAINING_ENTRYPOINT" \
   trainer.policy.sequence_parallel_size=1 \
   trainer.policy.use_torch_compile=false \
   trainer.gradient_checkpointing=true \
+  trainer.fully_async.clear_kv_cache_on_weight_sync=true \
   trainer.placement.colocate_all=true \
   trainer.placement.policy_num_gpus_per_node="$NUM_POLICY_GPUS" \
   trainer.placement.critic_num_gpus_per_node="$NUM_POLICY_GPUS" \

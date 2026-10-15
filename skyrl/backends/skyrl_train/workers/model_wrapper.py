@@ -841,6 +841,12 @@ def _get_critic_model(
 
             self.sequence_parallel_size = sequence_parallel_size
             self.remove_microbatch_padding = remove_microbatch_padding
+            self.is_rwkv = config.model_type == "rwkv"
+            if self.is_rwkv:
+                if remove_microbatch_padding:
+                    raise ValueError("RWKV does not support remove_microbatch_padding=true")
+                if sequence_parallel_size > 1:
+                    raise ValueError("RWKV does not support sequence parallelism")
             if remove_microbatch_padding:
                 assert (
                     config._attn_implementation == "flash_attention_2"
@@ -851,6 +857,30 @@ def _get_critic_model(
 
             self.post_init()
 
+        def _forward_rwkv(self, input_ids, attention_mask, return_output):
+            """Run one right-padded recurrent batch, then restore original positions.
+
+            One forward per microbatch keeps FSDP collectives aligned across ranks.
+            Tail padding cannot affect earlier states in a causal recurrent model.
+            """
+            lengths = attention_mask.sum(-1)
+            recurrent_ids = input_ids.new_zeros((input_ids.shape[0], int(lengths.max().item())))
+            for index, length in enumerate(lengths.tolist()):
+                recurrent_ids[index, :length] = input_ids[index, attention_mask[index].bool()]
+            with torch.autocast(device_type=input_ids.device.type, enabled=False):
+                outputs = getattr(self, self.base_model_prefix)(recurrent_ids, use_cache=False)
+                hidden_states = outputs["last_hidden_state"]
+                recurrent_values = getattr(self, self.value_head_prefix)(hidden_states).squeeze(-1)
+            values = recurrent_values.new_zeros(input_ids.shape)
+            for index, length in enumerate(lengths.tolist()):
+                values[index, attention_mask[index].bool()] = recurrent_values[index, :length]
+            if return_output:
+                restored_hidden_states = hidden_states.new_zeros((*input_ids.shape, hidden_states.shape[-1]))
+                for index, length in enumerate(lengths.tolist()):
+                    restored_hidden_states[index, attention_mask[index].bool()] = hidden_states[index, :length]
+                outputs["last_hidden_state"] = restored_hidden_states
+            return values[:, :-1], outputs
+
         def forward(
             self,
             input_ids: torch.LongTensor = None,
@@ -858,6 +888,14 @@ def _get_critic_model(
             attention_mask: Optional[torch.Tensor] = None,
             return_output=False,
         ) -> torch.Tensor:
+            if self.is_rwkv:
+                values, outputs = self._forward_rwkv(input_ids, attention_mask, return_output)
+                if num_actions is None:
+                    assert return_output
+                    return outputs
+                action_values = values[:, -num_actions:]
+                return (action_values, outputs) if return_output else action_values
+
             position_ids = attention_mask.long().cumsum(-1) - 1
             position_ids.masked_fill_(attention_mask == 0, 1)
             input_ids_fwd = input_ids
@@ -971,7 +1009,12 @@ def get_llm_for_sequence_regression(
     assert model_type == "critic", f"Only model_type critic is supported, got: {model_type}."
 
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True, **model_config_kwargs)
-    config._attn_implementation = "flash_attention_2" if use_flash_attention_2 else "sdpa"
+    if config.model_type == "rwkv":
+        # FlashRWKV2 requires native BF16, including evaluation and FSDP master weights.
+        bf16 = True
+        config._attn_implementation = "eager"
+    else:
+        config._attn_implementation = "flash_attention_2" if use_flash_attention_2 else "sdpa"
 
     base_class = AutoModel._model_mapping[type(config)]
     base_pretrained_class = base_class.__base__

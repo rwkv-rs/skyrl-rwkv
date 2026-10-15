@@ -44,6 +44,7 @@ def main():
     if training:
         wrapper.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         wrapper, optimizer, _ = strategy.prepare((wrapper, None, None))
+        wrapper.train()
     else:
         wrapper = strategy.prepare(wrapper)
         wrapper.eval()

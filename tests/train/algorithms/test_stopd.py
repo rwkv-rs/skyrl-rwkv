@@ -136,9 +136,15 @@ def test_native_opd_gradient_is_invariant_to_dp_microbatches_and_padding(monkeyp
     mask = torch.tensor([[1, 1, 1, 0], [0, 1, 1, 1], [1, 1, 0, 0], [0, 0, 1, 1]])
     rewards = torch.arange(1, 17, dtype=torch.float32).reshape(4, 4) / 10
     data = TrainingInputBatch({"loss_mask": mask.float(), "response_mask": mask, "rewards": rewards, "values": None})
-    data.metadata = {"uids": [str(i) for i in range(4)], "avg_response_length": 2.5, "pad_size": pad_size}
+    boundaries = [(0, 4 - pad_size)]
+    data.metadata = {
+        "uids": [str(i) for i in range(4)],
+        "avg_response_length": 2.5,
+        "pad_size": pad_size,
+        "policy_mini_batch_boundaries": boundaries,
+    }
     data = trainer.compute_advantages_and_returns(data)
-    data = trainer._normalize_advantages(data, [(0, 4)])
+    data = trainer._normalize_advantages(data, boundaries)
     parameter = torch.tensor(0.1, requires_grad=True)
     features = torch.arange(1, 17, dtype=torch.float32).reshape(4, 4) / 20
     losses = []
@@ -413,7 +419,7 @@ def test_actual_training_input_preserves_generated_prefix_and_ipw(tmp_path, corr
             )
         )
     )
-    data.metadata = {"pad_size": 0}
+    data.metadata = {"pad_size": 0, "policy_mini_batch_boundaries": [(0, 2)]}
     data["action_log_probs"] = data["rollout_logprobs"].clone()
     data["base_action_log_probs"] = data["action_log_probs"] + 0.1 * data["loss_mask"]
     data["rewards"] = -(data["action_log_probs"] - data["base_action_log_probs"]) * data["loss_mask"]

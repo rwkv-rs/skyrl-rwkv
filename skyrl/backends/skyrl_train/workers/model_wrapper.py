@@ -313,6 +313,11 @@ class HFModelWrapper(nn.Module):
                     **({"use_nora": True} if use_nora else {}),
                 )
                 self.model = get_peft_model(self.model, lora_config)
+                if use_nora:
+                    # PEFT's new root starts in train mode, while from_pretrained
+                    # leaves rank 0's inner model in eval mode. Align all layers
+                    # so their gradient checkpointing is active on every rank.
+                    self.model.train()
 
                 if load_in_4bit:
                     for name, module in self.model.named_modules():
@@ -521,7 +526,9 @@ class HFModelWrapper(nn.Module):
             finally:
                 self.model.train(was_training)
             bucket_logits = bucket_output["logits"]
-            bucket_logits.div_(temperature)
+            # FlashRWKV2's fused head returns a custom-autograd view.
+            if temperature != 1.0:
+                bucket_logits = bucket_logits / temperature
             if enable_score_centering:
                 bucket_head_logprobs, bucket_sampler_logprobs = _score_centering_support_head_logprobs(
                     bucket_logits,

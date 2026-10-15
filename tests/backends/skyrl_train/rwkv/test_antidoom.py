@@ -367,9 +367,9 @@ def test_reference_candidates_exclude_eos_protocol_and_low_probability_tokens():
             return "✿" if ids == [7] else super().decode(ids, skip_special_tokens)
 
     logits = torch.full((256,), -30.0)
-    logits[[69, 0, 32, 7, 65, 66, 67, 68]] = torch.tensor([22.0, 21.0, 20.0, 19.0, 10.0, 9.0, 4.0, -20.0])
-    assert antidoom.select_chosen_tokens(logits, 69, ControlTokenizer(), top_k=8) == [66, 65]
-    assert antidoom.select_chosen_tokens(logits, 69, ControlTokenizer(), top_k=8, max_tokens=1) == [66]
+    logits[[69, 101, 0, 32, 7, 65, 66, 67, 68]] = torch.tensor([22.0, 21.5, 21.0, 20.0, 19.0, 10.0, 9.0, 4.0, -20.0])
+    assert antidoom.select_chosen_tokens(logits, 69, ControlTokenizer(), top_k=9) == [66, 65]
+    assert antidoom.select_chosen_tokens(logits, 69, ControlTokenizer(), top_k=9, max_tokens=1) == [66]
 
 
 def test_reference_frequency_regularisation_preserves_metadata_and_deduplicates_surfaces():

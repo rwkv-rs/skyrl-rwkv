@@ -363,6 +363,11 @@ and disabled penalties. Evaluation uses temperature `0.96`, top-p `0.76`, top-k 
 presence penalty `1.0`, frequency penalty `0.1`, penalty decay `0.988`, and 32 samples
 per prompt.
 
+RWKV Rapid-Sampling uses `raw_logprobs`. The launcher selects it explicitly;
+the inference setup requires an unmodified training distribution so these equal
+the sampling logprobs used by OPD. Evaluation logprobs do not enter the loss.
+Each engine has a 2-GiB recurrent-state cache budget and up to 128 active requests.
+
 The default run covers one complete epoch. Evaluation runs before training and
 every 50 steps; resumable checkpoints and HF exports are saved every 50 steps.
 Training metrics, evaluation scores, and sampled trajectories are uploaded to W&B;
@@ -405,8 +410,9 @@ The pinned Transformers-RWKV passes the raw A/B parameters and `use_nora` into
 FlashRWKV2's fused BF16 projection forward/backward operators. No Python adapter
 forward is inserted around those fused projections.
 
-With `fsdp_size=1`, every GPU keeps a complete frozen base and synchronizes adapter
-gradients once per optimizer step. The teacher also uses replicated parameters.
+With policy `fsdp_size=1`, every GPU keeps a complete frozen base and synchronizes
+adapter gradients once per optimizer step. The teacher shards its parameters across
+all eight GPUs to reduce host storage during colocation offload.
 Weight sync computes the normalized update and adds it to each base projection in
 FP32, then streams complete FP16 weights through the native transfer engine.
 It leaves the live training parameters untouched and resets recurrent inference
@@ -448,8 +454,11 @@ memory is the maximum PyTorch allocation across ranks.
 | Frozen teacher | 1 | 53,585 | 55.8 |
 | Frozen teacher | 2 | 57,956 | 62.0 |
 | Frozen teacher | 4 | 60,304 | 71.4 |
+| Frozen teacher, FSDP 8 | 4 | 60,950 | 50.1 |
+| Frozen teacher, FSDP 8 | 8 | 60,455 | 71.6 |
 
-These measurements select training micro-batch 8 and forward micro-batch 4. Policy
+These measurements select training micro-batch 8, forward micro-batch 4, and teacher
+FSDP size 8. Policy
 profiling enables expandable activation segments after model initialization, matching
 the production worker. The complete local corpus contains 85994 questions; the native
 17408-token prompt filter retains 72321 (Math 32412, Code 23665, Long_Context 4372,

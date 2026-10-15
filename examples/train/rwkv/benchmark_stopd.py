@@ -116,7 +116,14 @@ def summarize(output, steps):
     # Native backend workers write to infrastructure logs; the trainer logs to
     # the console. Verbose infrastructure mode puts both on the console.
     restored = text + "\n".join(path.read_text() for path in (output / "logs").glob("infra-*.log"))
-    if "Successfully loaded optimizer state" not in restored or "Successfully loaded dataloader state" not in text:
+    optimizer_restored = any(
+        message in restored
+        for message in (
+            "Successfully loaded optimizer state",
+            "Checkpoint weights, optimizer and scheduler restored on ",
+        )
+    )
+    if not optimizer_restored or "Successfully loaded dataloader state" not in text:
         raise ValueError(f"The benchmark did not restore complete training state in {output}")
     return {"timings": timings, "updates": statuses}
 

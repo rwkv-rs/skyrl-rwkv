@@ -386,6 +386,21 @@ RUN_NAME=rwkv7-g1k-1.5b-20260930-ctx25600-ultradata-opd-long \
   > /tmp/results_rwkv_opd_long.log 2>&1
 ```
 
+### Optional STOPD
+
+Set `USE_STOPD=true` to enable independent stochastic rollout truncation in the
+native OPD example. The defaults are 128-token blocks and 25 complete warmup
+updates, counted from global step zero. Training retains actual generated token
+prefixes, applies inverse-probability token weights, and normalizes by the
+preceding update's estimated full response-token count. Evaluation keeps its
+normal full-response budget and decoding settings.
+
+STOPD checkpoints include `stopd_state.pt` alongside the native model, optimizer,
+scheduler, RNG, and dataloader state. Importing a Vanilla checkpoint after warmup
+requires the previous update's full token count; it does not require a new
+warmup. See [Optional STOPD](../on_policy_distillation/README.md#optional-stopd)
+for explicit checkpoint resumption and the paired eight-GPU benchmark.
+
 ### Optional NoRA policy
 
 The launcher enables NoRA by default, using the same PEFT fork and FP32 normalization

@@ -710,8 +710,8 @@ def load_model(model_path, adapter_path=None):
         with torch.no_grad():
             for name, param in parameters.items():
                 param.copy_(weights[name])
-    # RWKV's ordinary BF16 head is selected by training mode. Read-only
-    # scoring uses no_grad; FP16 free generation is handled by vLLM.
+    # BF16 scoring uses the differentiable fused operators under no_grad;
+    # FP16 free generation is handled by vLLM.
     return model.train()
 
 

@@ -760,6 +760,7 @@ def test_adapter_reference_reload_and_merged_logits_after_optimizer_step(tmp_pat
 
     monkeypatch.setattr(AutoModelForCausalLM, "from_pretrained", load_base)
     model = antidoom.load_model(base_path, adapter_path).eval()
+    model.config.model_type = type(model.config).model_type
     torch.testing.assert_close(antidoom.last_logits(model, prompt_ids, "cpu"), adapted)
     if not use_nora:
         return

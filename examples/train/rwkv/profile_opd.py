@@ -21,12 +21,13 @@ def main():
     parser.add_argument("--sequence-length", type=int, default=25600)
     parser.add_argument("--rank", type=int, default=256)
     parser.add_argument("--steps", type=int, default=2)
+    parser.add_argument("--fsdp-size", type=int, default=1)
     args = parser.parse_args()
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl")
     training = args.role == "policy"
     strategy = FSDPStrategy(
-        FSDPConfig(fsdp_size=1, reshard_after_forward=False, sync_gradients_each_microbatch=False),
+        FSDPConfig(fsdp_size=args.fsdp_size, reshard_after_forward=False, sync_gradients_each_microbatch=False),
         optimizer_config=OptimizerConfig(lr=2e-6, offload_after_step=False) if training else None,
         num_training_steps=10,
     )

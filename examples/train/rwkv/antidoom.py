@@ -1519,7 +1519,7 @@ def main():
     train_parser = commands.choices["train"]
     train_parser.add_argument("--data", type=Path, required=True)
     train_parser.add_argument("--rank", type=int, default=8)
-    train_parser.add_argument("--target-modules", nargs="+", default=TARGET_MODULES)
+    train_parser.add_argument("--target-modules", nargs="+", choices=TARGET_MODULES, default=TARGET_MODULES)
     train_parser.add_argument("--lora-alpha", type=int, help="Defaults to rank, the NoRA reference scaling")
     train_parser.add_argument("--learning-rate", type=float, default=5e-7)
     train_parser.add_argument("--warmup-ratio", type=float, default=0.0)

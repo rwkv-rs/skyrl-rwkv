@@ -63,7 +63,8 @@ When importing a Vanilla OPD checkpoint after warmup, set
 `trainer.algorithm.stopd.initial_denominator` to the preceding update's full
 response-token count (the sum of its dumped rollout `loss_mask` values).
 
-To compare both modes from the same complete checkpoint and data position:
+To compare both modes from the same complete Vanilla OPD checkpoint and data
+position after warmup:
 
 ```bash
 uv run --isolated --no-project .venv/bin/python3 \
@@ -73,8 +74,9 @@ uv run --isolated --no-project .venv/bin/python3 \
 
 This runs three updates per arm with the checkpoint's original training
 configuration and independent, reproducible sampling seeds. It checks restored
-optimizer/data state, retained rollout prefixes, finite updates, and the saved
-STOPD denominator, and reports end-to-end and per-stage timings. The optional
+optimizer/data state, actual generator-to-trainer tokens/logprobs/masks, IPW
+advantages, finite updates, and the saved STOPD denominator, and reports
+end-to-end and per-stage timings. The optional
 `--continue-training` resumes the resulting STOPD checkpoint after these checks
 and at least 5% measured end-to-end acceleration. Periodic evaluation and
 checkpoint intervals then follow the original experiment configuration.

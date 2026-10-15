@@ -22,12 +22,17 @@ from examples.train.on_policy_distillation.stopd import (
     request_seed,
     token_weights,
 )
-from examples.train.rwkv.benchmark_stopd import run_config, summarize
+from examples.train.rwkv.benchmark_stopd import (
+    run_config,
+    summarize,
+    validate_training_input,
+)
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
     AdvantageEstimatorRegistry,
     importance_sampling_loss,
 )
+from skyrl.train.dataset.preprocess import convert_prompts_responses_to_batch_tensors
 from skyrl.train.generators.skyrl_gym_generator import SkyRLGymGenerator
 from skyrl.train.generators.utils import prepare_generator_input
 from skyrl.train.trainer import RayPPOTrainer
@@ -384,3 +389,44 @@ def test_benchmark_requires_complete_finite_updates_and_native_state_restore(tmp
     infra.write_text("")
     with pytest.raises(ValueError, match="restore complete training state"):
         summarize(tmp_path, 3)
+
+
+@pytest.mark.parametrize("corrupt", [None, "sequences", "rollout_logprobs", "loss_mask", "advantages"])
+def test_actual_training_input_preserves_generated_prefix_and_ipw(tmp_path, corrupt):
+    prompts, responses = [[10, 20], [11]], [[7, 8, 9], [5, 6, 7, 8]]
+    logprobs = [[-0.1] * len(tokens) for tokens in responses]
+    masks = [[1] * len(tokens) for tokens in responses]
+    tensors = convert_prompts_responses_to_batch_tensors(0, prompts, responses, masks, masks, logprobs)
+    data = TrainingInputBatch(
+        dict(
+            zip(
+                ["sequences", "attention_mask", "response_mask", "rewards", "loss_mask", "rollout_logprobs"],
+                tensors[:6],
+                strict=True,
+            )
+        )
+    )
+    data.metadata = {"pad_size": 0}
+    data["action_log_probs"] = data["rollout_logprobs"].clone()
+    data["base_action_log_probs"] = data["action_log_probs"] + 0.1 * data["loss_mask"]
+    data["rewards"] = -(data["action_log_probs"] - data["base_action_log_probs"]) * data["loss_mask"]
+    stopd = STOPD(8, 2, 0, 11)
+    data["advantages"] = data["rewards"] * stopd.multiplier(data["loss_mask"], data["loss_mask"].sum())
+    rows = [
+        dict(prompt_token_ids=p, response_token_ids=r, rollout_logprobs=lp, loss_mask=m)
+        for p, r, lp, m in zip(prompts, responses, logprobs, masks, strict=True)
+    ]
+    if corrupt:
+        data[corrupt][0, -1] += 1
+    directory = tmp_path / "exports/dumped_data"
+    directory.mkdir(parents=True)
+    data.save(directory / "global_step_51_training_input.pkl")
+    if corrupt:
+        with pytest.raises((AssertionError, ValueError)):
+            validate_training_input(tmp_path, rows, stopd, 51)
+    else:
+        assert validate_training_input(tmp_path, rows, stopd, 51) == {
+            "rows": 2,
+            "response_tokens": 7,
+            "ipw_advantages_exact": True,
+        }

@@ -354,7 +354,7 @@ TEACHER_MODEL="$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-
 Defaults: 8 colocated GPUs, eight TP1 student inference engines, BF16 training and
 teacher scoring with `wkv_mode=fp32io16`, FP16 inference, gradient checkpointing,
 512 prompts per batch, one completion per prompt, policy mini-batch 512, per-GPU
-micro-batch 8 for training and 4 for forward passes, and AdamW LR `2e-6`.
+micro-batch 4 for training and forward passes, and AdamW LR `2e-6`.
 Each fresh rollout batch produces one optimizer
 step followed by native student-to-inference weight sync; the teacher stays frozen.
 Prompts use `bot + open_think`, with a 17408-token prompt budget and an 8192-token
@@ -441,23 +441,19 @@ weight-transfer time.
 
 Full-context component measurements on eight 96-GB RTX PRO 6000 GPUs use 25600-token
 sequences, rank-256 NoRA with the attention/output-head targets above, and the pinned
-FlashRWKV2 fused operators. Policy measurements include backward and AdamW; teacher
+FlashRWKV2 fused operators. Policy measurements include the native worker's BF16
+autocast region, log-softmax, entropy statistics, backward, and AdamW; teacher
 measurements run without gradients. Throughput is aggregated over all eight ranks;
 memory is the maximum PyTorch allocation across ranks.
 
 | Component | Per-GPU micro-batch | Tokens/s | Peak GiB |
 | --- | ---: | ---: | ---: |
-| NoRA student | 1 | 73,321 | 19.4 |
-| NoRA student | 2 | 103,666 | 25.7 |
-| NoRA student | 4 | 120,995 | 44.1 |
-| NoRA student | 8 | 128,794 | 80.8 |
-| Frozen teacher | 1 | 53,585 | 55.8 |
-| Frozen teacher | 2 | 57,956 | 62.0 |
-| Frozen teacher | 4 | 60,304 | 71.4 |
+| NoRA student | 2 | 97,835 | 38.2 |
+| NoRA student | 4 | 112,290 | 62.8 |
 | Frozen teacher, FSDP 8 | 4 | 60,950 | 50.1 |
 | Frozen teacher, FSDP 8 | 8 | 60,455 | 71.6 |
 
-These measurements select training micro-batch 8, forward micro-batch 4, and teacher
+These measurements select training micro-batch 4, forward micro-batch 4, and teacher
 FSDP size 8. Policy
 profiling enables expandable activation segments after model initialization, matching
 the production worker. The complete local corpus contains 85994 questions; the native

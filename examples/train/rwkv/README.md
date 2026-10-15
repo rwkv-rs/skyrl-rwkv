@@ -776,6 +776,15 @@ GPU retains the frozen model and only adapter gradients are synchronized. Use
 throughput, and the maximum allocation across all ranks before a production
 run. Profiling visits the longest context groups first.
 
+For `rwkv7-g1k-13.3b-20260930-ctx25600` on eight 96-GB RTX PRO 6000 GPUs,
+the validated production configuration uses `--rank 256 --lora-alpha 256`,
+`--learning-rate 2e-6 --warmup-ratio 0.05 --epochs 3 --max-steps 0`,
+`--micro-batch-size 16 --max-batch-tokens 32768`, and
+`--gradient-accumulation-steps 1 --fsdp-size 1`. Keep the output head and
+all four attention projections enabled. On the prepared 748-example FTPO
+training split this completes 93 optimizer steps, with peak allocation about
+85 GiB per GPU and approximately 7.1k useful context tokens/s across eight GPUs.
+
 Every 50 optimizer steps and at each epoch boundary, including the final step, training writes adapter weights,
 per-rank optimizer/scheduler/RNG states, and held-out FTPO loss on a fixed
 `--eval-max-samples` subset. The frozen base is identified by the exact model

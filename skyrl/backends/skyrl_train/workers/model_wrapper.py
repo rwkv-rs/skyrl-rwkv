@@ -155,6 +155,7 @@ class HFModelWrapper(nn.Module):
         lora_alpha (int, optional): Alpha parameter for LoRA. Defaults to 16.
         lora_dropout (float, optional): Dropout rate for LoRA layers. Defaults to 0.
         lora_init_method (str, optional): Initialization method for LoRA layers. Defaults to "kaiming".
+        use_nora (bool, optional): Use AntiDoom's normalized LoRA for RWKV. Defaults to False.
         target_modules (list, optional): List of target modules for applying LoRA. Defaults to None.
         exclude_modules (list, optional): List of modules to exclude from applying LoRA. Defaults to None.
         device_map (dict, optional): Device mapping for loading the model onto specific devices. Defaults to None.

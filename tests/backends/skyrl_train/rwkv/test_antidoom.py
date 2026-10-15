@@ -17,6 +17,7 @@ from examples.train.rwkv import antidoom
 
 class Tokenizer:
     eos_token_id = 0
+    all_special_ids = [0]
 
     def encode(self, text, add_special_tokens=False):
         return list(text.encode())
@@ -326,7 +327,7 @@ def test_repetition_and_original_token_boundary():
     assert found
     assert hit.repeats >= 4
     index = antidoom.find_rejected_token_index(Tokenizer(), ids, hit)
-    assert len(bytes(ids[:index]).decode()) <= hit.repeat_start
+    assert index == text.index("Let", text.index("Let") + 1)
     assert not antidoom.find_inner_repetition("First 2+2=4. Then 4*3=12. Answer: 12.")[0]
 
 
@@ -348,7 +349,52 @@ def test_long_context_boundary_avoids_decoding_every_prefix():
     hit = antidoom.RepeatHit(24002, 24006, 1, 4, "界")
     tokenizer = CountingTokenizer()
     assert antidoom.find_rejected_token_index(tokenizer, ids, hit) == 24005
-    assert tokenizer.calls <= math.ceil(math.log2(len(ids))) + 1
+    assert tokenizer.calls <= 2 * math.ceil(math.log2(len(ids))) + 12
+
+
+def test_token_aware_boundary_skips_loop_leading_punctuation():
+    prefix, pattern = "Intro", ". Wait, consider again "
+    text = prefix + pattern * 5
+    hit = antidoom.RepeatHit(len(prefix), len(text), len(pattern), 5, pattern)
+    index = antidoom.find_rejected_token_index(Tokenizer(), list(text.encode()), hit)
+    assert index == len(prefix + pattern) + 2
+    assert text[index] == "W"
+
+
+def test_reference_candidates_exclude_eos_protocol_and_low_probability_tokens():
+    class ControlTokenizer(Tokenizer):
+        def decode(self, ids, skip_special_tokens=True):
+            return "✿" if ids == [7] else super().decode(ids, skip_special_tokens)
+
+    logits = torch.full((256,), -30.0)
+    logits[[69, 0, 32, 7, 65, 66, 67, 68]] = torch.tensor([22.0, 21.0, 20.0, 19.0, 10.0, 9.0, 4.0, -20.0])
+    assert antidoom.select_chosen_tokens(logits, 69, ControlTokenizer(), top_k=8) == [66, 65]
+    assert antidoom.select_chosen_tokens(logits, 69, ControlTokenizer(), top_k=8, max_tokens=1) == [66]
+
+
+def test_reference_frequency_regularisation_preserves_metadata_and_deduplicates_surfaces():
+    rows = [
+        {
+            "prompt_ids": [i + 1],
+            "chosen_ids": [65, 97, 67 if i < 40 else 68],
+            "rejected_token_id": 70 if i < 64 else 71,
+            "source": {"task": str(i % 2)},
+            "prompt_key": str(i),
+        }
+        for i in range(80)
+    ]
+    chosen = antidoom.regularise_ftpo_rows(
+        rows, Tokenizer(), max_train_examples=80, rejected_strength=0, chosen_strength=0.5
+    )
+    assert len(chosen) == 80
+    assert sum(65 in row["chosen_ids"] for row in chosen) == round(math.sqrt(80 * 50))
+    assert not any(97 in row["chosen_ids"] for row in chosen)
+    assert all(row["prompt_ids"] == [int(row["prompt_key"]) + 1] for row in chosen)
+    assert all(len(row["chosen_ids"]) == 3 for row in rows)
+    rejected = antidoom.regularise_ftpo_rows(rows, Tokenizer(), max_train_examples=40, chosen_strength=0)
+    assert len(rejected) == 40
+    assert sum(row["rejected_token_id"] == 70 for row in rejected) / len(rejected) < 0.8
+    assert rejected == antidoom.regularise_ftpo_rows(rows, Tokenizer(), max_train_examples=40, chosen_strength=0)
 
 
 def test_pair_uses_exact_rollout_context_and_model_candidates():
@@ -367,7 +413,7 @@ def test_pair_uses_exact_rollout_context_and_model_candidates():
     assert calls == [row["prompt_ids"] + row["response_ids"][:index]]
     assert pair["prompt_ids"] == calls[0]
     assert pair["rejected_token_id"] == row["response_ids"][index]
-    assert pair["chosen_ids"] == [65, 66]
+    assert pair["chosen_ids"] == [66, 65]
     assert antidoom.extract_ftpo_pair(row, Tokenizer(), forward, "cpu", 1) is None
     assert len(calls) == 1
 
@@ -404,7 +450,7 @@ def test_cached_long_loop_keeps_supplied_boundary_and_utf8_context():
     assert pair["rejected_token_index"] == boundary
     assert contexts == [list(row["prompt_text"].encode()) + list(text.encode())[:boundary]]
     assert pair["cached_text_provenance"] == row["cached_text_provenance"]
-    assert pair["chosen_ids"] == [65, 66]
+    assert pair["chosen_ids"] == [66, 65]
     bad = {**row, "cached_text_provenance": {"response_sha256": "wrong"}}
     with pytest.raises(ValueError, match="SHA256"):
         antidoom.encode_cached_response(bad, Tokenizer())
@@ -548,17 +594,35 @@ def test_ftpo_target_tether_and_satisfied_margin():
     assert metrics["margin_win"].item() == 1
 
 
+def test_ftpo_variable_chosen_counts_match_reference_token_weighted_tethers():
+    logits = torch.tensor(
+        [[0.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0], [0.0, 3.0, 3.0, 3.0, 2.0, 0.0, 0.0, 0.0]], requires_grad=True
+    )
+    loss, metrics = antidoom.ftpo_loss(logits, torch.zeros_like(logits), [[1], [1, 2, 3]], [0, 0])
+    assert metrics["pref_loss"].item() == 0
+    torch.testing.assert_close(metrics["mse_elem"], torch.tensor(5 / 10))
+    torch.testing.assert_close(metrics["mse_target"], torch.tensor(25 / 6))
+    torch.testing.assert_close(loss, torch.tensor(0.4 * 5 / 10 + 0.05 * 25 / 6))
+    loss.backward()
+    torch.testing.assert_close(logits.grad[0, 1], torch.tensor(0.05 * 5 / 6))
+    torch.testing.assert_close(logits.grad[0, 2], torch.tensor(0.08))
+    torch.testing.assert_close(logits.grad[1, 4], torch.tensor(0.16))
+
+
 def test_ftpo_data_rejects_bad_ids_and_discards_overlength(tmp_path):
     path = tmp_path / "data.jsonl"
     row = {"prompt_ids": [1, 2], "chosen_ids": [3], "rejected_token_id": 4}
     path.write_text(json.dumps(row) + "\n" + json.dumps({**row, "prompt_ids": [1] * 10}) + "\n")
-    assert antidoom.load_ftpo_data(path, 8, 4) == [row]
+    assert antidoom.load_ftpo_data(path, 8, 4, Tokenizer()) == [row]
     path.write_text(json.dumps({**row, "chosen_ids": [4]}) + "\n")
     with pytest.raises(ValueError, match="distinct"):
-        antidoom.load_ftpo_data(path, 8, 4)
+        antidoom.load_ftpo_data(path, 8, 4, Tokenizer())
     path.write_text(json.dumps({**row, "rejected_token_id": 8}) + "\n")
     with pytest.raises(ValueError, match="vocabulary"):
-        antidoom.load_ftpo_data(path, 8, 4)
+        antidoom.load_ftpo_data(path, 8, 4, Tokenizer())
+    path.write_text(json.dumps({**row, "chosen_ids": [0, 3]}) + "\n")
+    with pytest.raises(ValueError, match="EOS or RWKV protocol"):
+        antidoom.load_ftpo_data(path, 8, 4, Tokenizer())
 
 
 def test_prepare_groups_siblings_and_keeps_original_validation_prompts(tmp_path, monkeypatch):
@@ -598,6 +662,10 @@ def test_prepare_groups_siblings_and_keeps_original_validation_prompts(tmp_path,
             seed=42,
             validation_fraction=0.25,
             cached_text=False,
+            chosen_min_p=0.01,
+            max_train_examples=len(rows),
+            rejected_regularisation_strength=0.3,
+            chosen_regularisation_strength=0,
         )
     )
     train = list(antidoom.read_jsonl(output / "train.jsonl"))

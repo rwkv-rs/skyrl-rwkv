@@ -206,6 +206,7 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--wait", action="store_true")
     parser.add_argument("--baseline-pid", type=int)
+    parser.add_argument("--baseline-log", type=Path, help="Wait for checkpoint-step evaluation and logging to finish")
     parser.add_argument("--continue-training", action="store_true")
     args = parser.parse_args()
     if args.steps < 1 or args.block < 1:
@@ -235,6 +236,12 @@ def main():
         time.sleep(5)
     rows = read_rollouts(Path(original["trainer"]["export_path"]) / "dumped_rollouts" / f"global_step_{step}.jsonl")
     denominator = denominator_from_rollouts(rows)
+    if args.baseline_log:
+        progress = re.compile(r"Training Batches Processed:[^\r\n]*\b" + str(step) + r"/\d+")
+        while not progress.search(args.baseline_log.read_text()):
+            if args.baseline_pid and not psutil.pid_exists(args.baseline_pid):
+                raise RuntimeError("Baseline exited before completing checkpoint-step evaluation and logging")
+            time.sleep(5)
     if args.baseline_pid:
         stop_baseline(args.baseline_pid)
     args.output.mkdir(parents=True, exist_ok=False)

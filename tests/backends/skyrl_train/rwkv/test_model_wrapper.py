@@ -64,6 +64,28 @@ class ToyRecurrentCache:
         return ToyRecurrentCache(self.state.clone())
 
 
+@pytest.mark.parametrize("temperature", [1.0, 0.8])
+def test_rwkv_fused_head_view_preserves_autograd(temperature):
+    class HeadView(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, logits):
+            return logits.view_as(logits)
+
+        @staticmethod
+        def backward(ctx, gradient):
+            return gradient
+
+    model = ToyCausalLM()
+    model.forward = lambda ids: {"logits": HeadView.apply(model.lm_head(model.embed_tokens(ids)))}
+    ids = torch.tensor([[1, 2, 3, 4]])
+    expected = torch.log_softmax(model.lm_head(model.embed_tokens(ids)) / temperature, dim=-1)
+    expected = expected[:, :-1].gather(-1, ids[:, 1:].unsqueeze(-1)).squeeze(-1)[:, -2:]
+    actual = HFModelWrapper(model)(ids, num_actions=2, attention_mask=torch.ones_like(ids), temperature=temperature)
+    torch.testing.assert_close(actual, expected)
+    (-actual.mean()).backward()
+    assert torch.isfinite(model.lm_head.weight.grad).all()
+
+
 class ToyRecurrentCausalLM(ToyCausalLM):
     def forward(self, input_ids, past_key_values=None, use_cache=False):
         self.calls.append((input_ids.detach().clone(), {}))

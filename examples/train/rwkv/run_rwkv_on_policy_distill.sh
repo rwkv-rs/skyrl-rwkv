@@ -81,7 +81,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   trainer.policy.fsdp_config.fsdp_size=1 \
   trainer.policy.fsdp_config.reshard_after_forward=false \
   trainer.policy.fsdp_config.sync_gradients_each_microbatch=false \
-  trainer.ref.fsdp_config.fsdp_size=1 \
+  trainer.ref.fsdp_config.fsdp_size="$NUM_GPUS" \
   trainer.ref.fsdp_config.reshard_after_forward=false \
   trainer.update_ref_every_epoch=false \
   trainer.placement.colocate_all=true \
@@ -112,6 +112,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   generator.inference_engine.backend=vllm \
   generator.inference_engine.model_dtype=float16 \
   generator.inference_engine.engine_init_kwargs.logprobs_mode=raw_logprobs \
+  generator.inference_engine.engine_init_kwargs.kv_cache_memory_bytes=2147483648 \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.num_engines="$NUM_GPUS" \
   generator.inference_engine.tensor_parallel_size=1 \

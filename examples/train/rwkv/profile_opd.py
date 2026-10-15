@@ -48,6 +48,9 @@ def main():
     else:
         wrapper = strategy.prepare(wrapper)
         wrapper.eval()
+    # Match FSDPPolicyWorkerBase: keep model storage IPC-compatible and enable
+    # expandable activation allocations only after model initialization.
+    torch.cuda.memory._set_allocator_settings("expandable_segments:True")
     for batch_size in args.micro_batch_sizes:
         ids = torch.randint(1, 60000, (batch_size, args.sequence_length), device="cuda")
         mask = torch.ones_like(ids)

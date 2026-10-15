@@ -301,7 +301,8 @@ Choose `MICRO_BATCH_SIZE` for the available GPU memory while keeping global trai
 
 `run_rwkv_on_policy_distill.sh` uses the native
 `examples.train.on_policy_distillation.main_on_policy_distill` entry point to distill
-`rwkv7-g1k-13.3b-20260930-ctx25600` into `rwkv7-g1k-1.5b-20260930-ctx25600`.
+`rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora` into
+`rwkv7-g1k-1.5b-20260930-ctx25600`.
 The student generates completions; the frozen teacher occupies the reference-model role
 and scores the same token IDs. The native trainer replaces task rewards with masked
 `teacher_logprob - student_logprob`, passes them through the `no_op` advantage estimator,
@@ -309,14 +310,14 @@ and updates the student with `importance_sampling` loss. Task answer scores rema
 available for evaluation. No critic is used.
 
 Prepare the project-local RWKV environment and FlashRWKV2 cache as described above.
-Download both model subfolders from the same release revision:
+The teacher path must contain the complete merged AntiDoom HF checkpoint. Download the
+student from the original release revision:
 
 ```bash
 MODEL_ROOT="$HOME/Weights/RWKV/hf"
 hf download rwkv-rs/rwkv7-g1-st \
   --revision b672701cccf4bddcc66f65c8c9a468b776c9836a \
   --include 'rwkv7-g1k-1.5b-20260930-ctx25600/*' \
-            'rwkv7-g1k-13.3b-20260930-ctx25600/*' \
   --local-dir "$MODEL_ROOT" \
   > /tmp/results_rwkv_opd_download.log 2>&1
 ```
@@ -342,15 +343,15 @@ Run from the project root after configuring W&B in `.env`:
 
 ```bash
 STUDENT_MODEL="$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600" \
-TEACHER_MODEL="$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600" \
+TEACHER_MODEL="$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora" \
   bash examples/train/rwkv/run_rwkv_on_policy_distill.sh \
   > /tmp/results_rwkv_opd.log 2>&1
 ```
 
 Defaults: 8 colocated GPUs, eight TP1 student inference engines, BF16 training and
 teacher scoring with `wkv_mode=fp32io16`, FP16 inference, gradient checkpointing,
-64 prompts per batch, one completion per prompt, policy mini-batch 64, per-GPU
-micro-batch 1, and AdamW LR `1e-5`. Each fresh rollout batch produces one optimizer
+512 prompts per batch, one completion per prompt, policy mini-batch 512, per-GPU
+micro-batch 8, and AdamW LR `2e-6`. Each fresh rollout batch produces one optimizer
 step followed by native student-to-inference weight sync; the teacher stays frozen.
 Prompts use `bot + open_think`, with a 2048-token prompt budget and an 8192-token
 generation budget. Training sampling uses temperature `1`, top-p `1`, top-k `-1`,
@@ -358,14 +359,15 @@ and disabled penalties. Evaluation uses temperature `0.96`, top-p `0.76`, top-k 
 presence penalty `1.0`, frequency penalty `0.1`, penalty decay `0.988`, and 32 samples
 per prompt.
 
-The default run stops after 50 training steps. Evaluation runs before training and
+The default run covers 20 epochs. Evaluation runs before training and
 every 50 steps; resumable checkpoints and HF exports are saved every 50 steps.
 Training metrics, evaluation scores, and sampled trajectories are uploaded to W&B;
 detailed training rollout dumps are written under `$OUTPUT_ROOT/exports/dumped_rollouts`.
 `OUTPUT_ROOT` defaults to `$HOME/skyrl-rwkv-runs/$RUN_NAME`.
 
 `STUDENT_MODEL`, `TEACHER_MODEL`, `DATA_DIR`, `TRAIN_FILE`, `TEST_FILE`, `NUM_GPUS`,
-`MICRO_BATCH_SIZE`, `LOGGER`, `RUN_NAME`, and `OUTPUT_ROOT` accept environment overrides.
+`MICRO_BATCH_SIZE`, `MICRO_FORWARD_BATCH_SIZE`, `MINI_BATCH_SIZE`, `LR`, `USE_NORA`,
+`LORA_RANK`, `LORA_ALPHA`, `LOGGER`, `RUN_NAME`, and `OUTPUT_ROOT` accept environment overrides.
 Additional native config overrides are forwarded at the end of the command, for example:
 
 ```bash
@@ -375,9 +377,30 @@ RUN_NAME=rwkv7-g1k-1.5b-20260930-ctx25600-dapo-opd-long \
   > /tmp/results_rwkv_opd_long.log 2>&1
 ```
 
-This recipe keeps full-sequence recurrent forwards for both models
-(`trainer.rwkv_chunk_size=0` by default). Runtime correctness, memory use, throughput,
-and convergence have not yet been validated for this teacher/student pair.
+### Optional NoRA policy
+
+The launcher enables NoRA by default, using the same PEFT fork and FP32 normalization
+as AntiDoom. Install the pinned fork with the command in "Antidoom FTPO with NoRA"
+after preparing the RWKV environment. NoRA is selected through
+`trainer.policy.model.lora.use_nora=true`; ordinary training defaults elsewhere remain
+unchanged. To run full-parameter OPD, set `USE_NORA=false LORA_RANK=0` and choose its
+learning rate explicitly with `LR`.
+
+NoRA uses rank 256, alpha 256, zero dropout, and the same attention and output-head
+targets as AntiDoom: `r_proj`, `k_proj`, `v_proj`, `o_proj`, and `lm_head`.
+The pinned Transformers-RWKV passes the raw A/B parameters and `use_nora` into
+FlashRWKV2's fused BF16 projection forward/backward operators. No Python adapter
+forward is inserted around those fused projections.
+
+With `fsdp_size=1`, every GPU keeps a complete frozen base and synchronizes adapter
+gradients once per optimizer step. The teacher also uses replicated parameters.
+Weight sync computes the normalized update and adds it to each base projection in
+FP32, then streams complete FP16 weights through the native transfer engine.
+It leaves the live training parameters untouched and resets recurrent inference
+caches through the existing weight-sync lifecycle. Resumable checkpoints retain
+the adapter and optimizer; periodic HF exports contain complete merged weights.
+
+Both models keep full-sequence recurrent forwards (`trainer.rwkv_chunk_size=0`).
 
 ## FlashREINFORCE and algorithm ablations
 

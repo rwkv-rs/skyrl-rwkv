@@ -133,7 +133,7 @@ def _validate_logprobs_mode(engine_kwargs: Dict[str, Any], *, context: str) -> N
 def _uses_lora_weight_sync(cfg: SkyRLTrainConfig) -> bool:
     """Return True when the trainer syncs LoRA adapters (not merged weights).
 
-    FSDP always syncs LoRA adapters when ``lora.rank > 0``.
+    FSDP syncs adapters for ordinary LoRA, and complete merged weights for NoRA.
     Megatron merges LoRA into the base weights by default
     (``merge_lora=True``), so the inference engine should not enable LoRA.
     """
@@ -141,7 +141,7 @@ def _uses_lora_weight_sync(cfg: SkyRLTrainConfig) -> bool:
         return False
     if cfg.trainer.strategy == "megatron":
         return not cfg.trainer.policy.megatron_config.lora_config.merge_lora
-    return True
+    return not cfg.trainer.policy.model.lora.use_nora
 
 
 def resolve_policy_model_name(cfg: SkyRLTrainConfig) -> str:

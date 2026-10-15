@@ -17,7 +17,6 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Type, TypeVar,
 
 import yaml
 from omegaconf import DictConfig, OmegaConf
-
 from skyrl_gym.envs.search.env import SearchEnvConfig
 from skyrl_gym.envs.sql.env import Text2SQLEnvConfig
 
@@ -104,6 +103,12 @@ class SkyRLLoraConfig(BaseConfig):
     """Scaling factor for LoRA updates."""
     dropout: float = 0.0
     """Dropout probability applied to LoRA layers, to help prevent overfitting."""
+    use_nora: bool = False
+    """Use AntiDoom's normalized LoRA implementation with the NoRA PEFT fork.
+
+    RWKV FSDP only. Requires positive ``rank``. Weight sync and HF exports merge the
+    normalized adapter into complete weights; inference does not load an adapter.
+    """
     lora_sync_path: str = "/tmp/skyrl_lora_sync"
     """Directory where LoRA adapter weights are saved and synchronized between the training and inference processes.
     Must be accessible to all workers in distributed setups. Unused when ``sync_mode="memory"``."""
@@ -1751,6 +1756,10 @@ class TrainerConfig(BaseConfig):
         # ref model defaults to the policy model
         if self.ref.model.path is None:
             self.ref.model.path = self.policy.model.path
+
+        if self.policy.model.lora.use_nora:
+            if self.strategy != "fsdp" or self.policy.model.lora.rank <= 0:
+                raise ValueError("use_nora=True requires trainer.strategy=fsdp and a positive policy LoRA rank.")
 
         if self.log_example_interval > 0:
             print(

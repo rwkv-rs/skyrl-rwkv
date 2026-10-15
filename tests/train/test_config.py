@@ -1451,6 +1451,14 @@ def test_lora_disk_sync_mode_is_default_and_unconstrained():
     validate_inference_engine_cfg(cfg)
 
 
+@pytest.mark.parametrize("overrides", [["trainer.policy.model.lora.rank=0"], ["trainer.strategy=megatron"]])
+def test_nora_requires_fsdp_and_positive_rank(overrides):
+    with pytest.raises(ValueError, match="use_nora=True requires"):
+        SkyRLTrainConfig.from_cli_overrides(
+            ["trainer.policy.model.lora.rank=8", "trainer.policy.model.lora.use_nora=true", *overrides]
+        )
+
+
 class TestMegatronRouterReplayValidation:
     @staticmethod
     def _cfg():

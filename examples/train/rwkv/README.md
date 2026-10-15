@@ -322,22 +322,25 @@ hf download rwkv-rs/rwkv7-g1-st \
   > /tmp/results_rwkv_opd_download.log 2>&1
 ```
 
-The recipe uses the native OPD example's DAPO-Math training set and AIME 2024 evaluation
-set. Reuse its download sources and preprocessing module in this project's RWKV environment:
+The recipe uses the existing local UltraData-RL-2609 corpus for training and a prepared
+AIME 2024 Parquet for evaluation. Convert all Math, Code, Long_Context, and Knowledge
+shards without collecting new rollouts:
 
 ```bash
-DATA_DIR="$HOME/data/dapo"
-mkdir -p "$DATA_DIR"
-wget -O "$DATA_DIR/dapo-math-17k.parquet" \
-  'https://huggingface.co/datasets/BytedTsinghua-SIA/DAPO-Math-17k/resolve/main/data/dapo-math-17k.parquet?download=true' \
-  > /tmp/results_rwkv_opd_download_dapo.log 2>&1
-wget -O "$DATA_DIR/aime-2024.parquet" \
-  'https://huggingface.co/datasets/BytedTsinghua-SIA/AIME-2024/resolve/main/data/aime-2024.parquet?download=true' \
-  > /tmp/results_rwkv_opd_download_aime.log 2>&1
-uv run --isolated --no-project .venv/bin/python \
-  -m examples.train.algorithms.dapo.data_preprocess_dapo_aime --data-dir "$DATA_DIR" \
+uv run --isolated --no-config --no-project .venv/bin/python \
+  -m examples.train.rwkv.prepare_opd \
+  --input "$HOME/data/UltraData-RL-2609/files" \
+  --output "$HOME/data/ultradata-opd/train.parquet" \
   > /tmp/results_rwkv_opd_prepare_data.log 2>&1
 ```
+
+The converter preserves each question's UUID and domain and writes domain counts to
+`train.manifest.json`. It reuses the native AIME single-turn environment; training
+rewards are replaced by the OPD teacher signal. Only Math rows carry a mathematical
+answer; the other domains have an empty answer and their task scores are not accuracy
+metrics. Code questions are distilled without executing test cases. The native prompt
+length filter applies after conversion. `TEST_FILE` defaults to
+`$HOME/data/dapo/aime-2024-cleaned.parquet`; it can point to another native AIME Parquet.
 
 Run from the project root after configuring W&B in `.env`:
 
@@ -353,13 +356,13 @@ teacher scoring with `wkv_mode=fp32io16`, FP16 inference, gradient checkpointing
 512 prompts per batch, one completion per prompt, policy mini-batch 512, per-GPU
 micro-batch 8, and AdamW LR `2e-6`. Each fresh rollout batch produces one optimizer
 step followed by native student-to-inference weight sync; the teacher stays frozen.
-Prompts use `bot + open_think`, with a 2048-token prompt budget and an 8192-token
+Prompts use `bot + open_think`, with a 17408-token prompt budget and an 8192-token
 generation budget. Training sampling uses temperature `1`, top-p `1`, top-k `-1`,
 and disabled penalties. Evaluation uses temperature `0.96`, top-p `0.76`, top-k `32`,
 presence penalty `1.0`, frequency penalty `0.1`, penalty decay `0.988`, and 32 samples
 per prompt.
 
-The default run covers 20 epochs. Evaluation runs before training and
+The default run covers one complete epoch. Evaluation runs before training and
 every 50 steps; resumable checkpoints and HF exports are saved every 50 steps.
 Training metrics, evaluation scores, and sampled trajectories are uploaded to W&B;
 detailed training rollout dumps are written under `$OUTPUT_ROOT/exports/dumped_rollouts`.
@@ -371,7 +374,7 @@ detailed training rollout dumps are written under `$OUTPUT_ROOT/exports/dumped_r
 Additional native config overrides are forwarded at the end of the command, for example:
 
 ```bash
-RUN_NAME=rwkv7-g1k-1.5b-20260930-ctx25600-dapo-opd-long \
+RUN_NAME=rwkv7-g1k-1.5b-20260930-ctx25600-ultradata-opd-long \
   bash examples/train/rwkv/run_rwkv_on_policy_distill.sh \
   trainer.max_training_steps=500 \
   > /tmp/results_rwkv_opd_long.log 2>&1
@@ -401,6 +404,22 @@ caches through the existing weight-sync lifecycle. Resumable checkpoints retain
 the adapter and optimizer; periodic HF exports contain complete merged weights.
 
 Both models keep full-sequence recurrent forwards (`trainer.rwkv_chunk_size=0`).
+
+`examples.train.rwkv.profile_opd` measures the maximum rank time and peak allocation
+with full-length synthetic sequences, the native FSDP strategy, and the fused RWKV
+operators. Run policy and teacher separately so their working memory does not overlap:
+
+```bash
+XDG_CACHE_HOME="$HOME/.cache/skyrl-rwkv" \
+uv run --isolated --no-config --no-project .venv/bin/torchrun \
+  --standalone --nproc-per-node=8 -m examples.train.rwkv.profile_opd \
+  --role policy --model "$STUDENT_MODEL" --micro-batch-sizes 1 2 4 \
+  > /tmp/results_rwkv_opd_profile_policy.log 2>&1
+```
+
+Use `--role ref --model "$TEACHER_MODEL"` for teacher scoring. These measurements
+report component throughput; they do not include rollout, colocation offload, or
+weight-transfer time.
 
 ## FlashREINFORCE and algorithm ablations
 

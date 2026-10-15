@@ -14,24 +14,27 @@ import json
 import math
 import os
 import random
+import re
 import resource
 import signal
 import shutil
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Mapping
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
 from skyrl.utils.tok import get_tokenizer
 
 NORA_REVISION = "4669c35ce0ffd027456272ee5050c0f58ac8d22a"
+ANTIDOOM_REFERENCE_REVISION = "bd6a126476e18554b0cacaea3fd9f258fdde1f97"
 TARGET_MODULES = ["r_proj", "k_proj", "v_proj", "o_proj"]
 ANTIDOOM_DATASET = "LiquidAI/antidoom-mix-v1.0"
 ANTIDOOM_REVISION = "79ff2d479c5e59ea9973a66a7ca9ce8b703f9c7b"
@@ -322,23 +325,219 @@ def export_mix(args):
 
 
 def find_rejected_token_index(tokenizer, generated_ids, hit):
-    """Map the repetition boundary onto original IDs, including split UTF-8 tokens."""
+    """Reference token-aware loop boundary, retaining exact RWKV byte-token IDs."""
     text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-    char_pos = hit.repeat_start
-    while char_pos < len(text) and text[char_pos].isspace():
-        char_pos += 1
-    before = text[:char_pos]
-    low, high = 0, len(generated_ids)
-    while low < high:
-        index = (low + high) // 2
-        prefix = tokenizer.decode(generated_ids[: index + 1], skip_special_tokens=True)
-        # Prefixes grow monotonically. A partial UTF-8 character at this
-        # boundary belongs to its first byte token, even before completion.
-        if len(prefix) > char_pos and prefix.startswith(before):
-            high = index
-        else:
-            low = index + 1
-    return low if low < len(generated_ids) else None
+
+    def char_to_token_index(char_pos):
+        before = text[:char_pos]
+        low, high = 0, len(generated_ids)
+        while low < high:
+            index = (low + high) // 2
+            prefix = tokenizer.decode(generated_ids[: index + 1], skip_special_tokens=True)
+            if len(prefix) > char_pos and prefix.startswith(before):
+                high = index
+            else:
+                low = index + 1
+        return low
+
+    def surface(index):
+        return tokenizer.decode([generated_ids[index]], skip_special_tokens=True)
+
+    def key(index):
+        value = surface(index)
+        # Distinct incomplete UTF-8 bytes must not collapse to the same U+FFFD.
+        return generated_ids[index] if "\ufffd" in value else value.lstrip()
+
+    def skip_boundary_only(index, max_tokens=4, max_chars=12):
+        start, chars = index, 0
+        while index < len(generated_ids) and index - start < max_tokens:
+            value = surface(index)
+            chars += len(value)
+            if chars > max_chars or not value or "\ufffd" in value or any(c.isalnum() or c == "_" for c in value):
+                break
+            index += 1
+        return index
+
+    def word(index):
+        return re.sub(r"^[^\w_]+|[^\w_]+$", "", surface(index).strip().lower())
+
+    seed = char_to_token_index(hit.start)
+    repeat = char_to_token_index(hit.repeat_start)
+    period = repeat - seed
+    if period > 0:
+        while seed > 0 and seed - 1 + period < len(generated_ids) and key(seed - 1) == key(seed - 1 + period):
+            seed -= 1
+    index = skip_boundary_only(seed + period)
+    if index >= len(generated_ids):
+        return None
+    punct_end = skip_boundary_only(index + 1, max_tokens=3, max_chars=8)
+    restart_words = {
+        "actually",
+        "after",
+        "also",
+        "alternatively",
+        "because",
+        "but",
+        "finally",
+        "first",
+        "given",
+        "hmm",
+        "however",
+        "in",
+        "let",
+        "looking",
+        "maybe",
+        "now",
+        "okay",
+        "perhaps",
+        "second",
+        "since",
+        "so",
+        "the",
+        "then",
+        "therefore",
+        "this",
+        "thus",
+        "wait",
+    }
+    if (
+        word(index)
+        and punct_end > index + 1
+        and punct_end < len(generated_ids)
+        and any(c in "".join(surface(i) for i in range(index + 1, punct_end)) for c in ".!?")
+        and seed > 0
+        and generated_ids[seed - 1] != generated_ids[seed + period - 1]
+        and word(punct_end) in restart_words
+    ):
+        index = punct_end
+    while index < len(generated_ids) and not surface(index).strip():
+        index += 1
+    return index if index < len(generated_ids) else None
+
+
+def is_control_token(tokenizer, token_id):
+    """RWKV's protocol delimiter is not registered in all_special_ids."""
+    return token_id in tokenizer.all_special_ids or "✿" in tokenizer.decode([token_id], skip_special_tokens=False)
+
+
+def select_chosen_tokens(logits, rejected_id, tokenizer, top_k=50, max_tokens=20, min_p=0.01):
+    """Reference sampling order/min-p, conditioned on readable non-control tokens."""
+    values, indices = logits.topk(min(top_k, logits.numel()))
+    candidates = [
+        (token, value)
+        for token, value in zip(indices.tolist(), values.tolist(), strict=True)
+        if token != rejected_id
+        and not is_control_token(tokenizer, token)
+        and tokenizer.decode([token], skip_special_tokens=True).strip()
+    ]
+    if min_p and candidates:
+        floor = max(value for _, value in candidates) + math.log(min_p)
+        candidates = [(token, value) for token, value in candidates if value >= floor]
+    return [token for token, _ in sorted(candidates, key=lambda item: item[1])[:max_tokens]]
+
+
+def _rejected_normalisation(rows, target_n, strength, seed):
+    """Reference greedy token-frequency sampling, with source-share tiebreaks."""
+    counts = Counter(row["rejected_token_id"] for row in rows)
+    median = float(np.median(list(counts.values())))
+    weights = {
+        token: 1.0 if count <= median or strength <= 0 else (median / count) ** strength
+        for token, count in counts.items()
+    }
+    total = sum(weights[token] * count for token, count in counts.items())
+    ratios = {token: weights[token] * count / total for token, count in counts.items()}
+    targets = {token: round(ratio * target_n) for token, ratio in ratios.items()}
+
+    def source(row):
+        metadata = row.get("source") or {}
+        return metadata.get("task") or metadata.get("benchmark", "__unknown__")
+
+    pool = Counter(source(row) for row in rows)
+    share = {name: count / len(rows) for name, count in pool.items()}
+    buckets = defaultdict(lambda: defaultdict(list))
+    for row in rows:
+        buckets[row["rejected_token_id"]][source(row)].append(row)
+    rng = np.random.default_rng(seed)
+    for sources in buckets.values():
+        for available in sources.values():
+            rng.shuffle(available)
+    selected, seen, selected_sources = [], Counter(), Counter()
+    for respect_cap in (True, False):
+        while len(selected) < target_n:
+            best, best_key = None, None
+            for token, sources in buckets.items():
+                if respect_cap and seen[token] >= targets[token]:
+                    continue
+                gap = ratios[token] - seen[token] / max(len(selected), 1)
+                for name, available in sources.items():
+                    key = (gap, share[name] - selected_sources[name] / max(len(selected), 1))
+                    if available and (best_key is None or key > best_key):
+                        best, best_key = (token, name), key
+            if best is None:
+                break
+            token, name = best
+            selected.append(buckets[token][name].pop())
+            seen[token] += 1
+            selected_sources[name] += 1
+    rng.shuffle(selected)
+    return selected
+
+
+def normalise_chosen_key(text):
+    stripped = text.strip().lower()
+    word = re.sub(r"^[^\w]+|[^\w]+$", "", stripped, flags=re.UNICODE)
+    return word or stripped or text
+
+
+def _regularise_chosen_examples(rows, tokenizer, strength):
+    """Reference p95/min-50 caps; prune alternatives before dropping a row."""
+    examples, keys, counts = [], [], Counter()
+    for row in rows:
+        chosen, row_keys = [], []
+        for token in row["chosen_ids"]:
+            surface = tokenizer.decode([token], skip_special_tokens=False)
+            key = f"byte:{token}" if "\ufffd" in surface else normalise_chosen_key(surface)
+            if key not in row_keys:
+                chosen.append(token)
+                row_keys.append(key)
+        examples.append({**row, "chosen_ids": chosen})
+        keys.append(row_keys)
+        counts.update(row_keys)
+    values = sorted(counts.values())
+    reference = max(50, values[int((len(values) - 1) * 0.95)])
+    targets = {
+        key: max(1, round(count * (reference / count) ** strength)) if count > reference else count
+        for key, count in counts.items()
+    }
+    indices = defaultdict(set)
+    for index, row_keys in enumerate(keys):
+        for key in row_keys:
+            indices[key].add(index)
+    for single in (False, True):
+        for key in sorted(targets, key=lambda item: counts[item] - targets[item], reverse=True):
+            while counts[key] > targets[key]:
+                candidates = [
+                    index
+                    for index in indices[key]
+                    if key in keys[index] and (len(keys[index]) == 1 if single else len(keys[index]) > 1)
+                ]
+                if not candidates:
+                    break
+                index = min(candidates) if single else max(candidates, key=lambda item: (len(keys[item]), -item))
+                position = keys[index].index(key)
+                del keys[index][position]
+                del examples[index]["chosen_ids"][position]
+                counts[key] -= 1
+    return [row for row in examples if row["chosen_ids"]]
+
+
+def regularise_ftpo_rows(rows, tokenizer, max_train_examples=0, rejected_strength=0.3, chosen_strength=0.5, seed=42):
+    """Reserve pool headroom for the reference rejected/chosen frequency passes."""
+    if not rows:
+        return rows
+    target = min(max_train_examples or max(1, int(0.7 * len(rows))), len(rows))
+    rows = _rejected_normalisation(rows, target, rejected_strength, seed)
+    return _regularise_chosen_examples(rows, tokenizer, chosen_strength) if chosen_strength > 0 else rows
 
 
 def last_logits(model, prompt_ids, device):
@@ -372,7 +571,7 @@ def microbatches(rows, batch_size, max_batch_tokens):
         yield batch
 
 
-def extract_ftpo_pair(row, tokenizer, model, device, max_length, top_k=50, num_chosen=20):
+def extract_ftpo_pair(row, tokenizer, model, device, max_length, top_k=50, num_chosen=20, chosen_min_p=0.01):
     generated_ids = row["response_ids"]
     text = tokenizer.decode(generated_ids, skip_special_tokens=True)
     if row.get("cached_text_provenance"):
@@ -388,13 +587,11 @@ def extract_ftpo_pair(row, tokenizer, model, device, max_length, top_k=50, num_c
     if not context_ids or len(context_ids) > max_length:
         return None
     rejected_id = generated_ids[index]
+    if is_control_token(tokenizer, rejected_id):
+        return None
     with torch.no_grad():
         logits = last_logits(model, context_ids, device)[0]
-    chosen_ids = [
-        token
-        for token in logits.topk(min(top_k, logits.numel())).indices.tolist()
-        if token != rejected_id and tokenizer.decode([token], skip_special_tokens=True).strip()
-    ][:num_chosen]
+    chosen_ids = select_chosen_tokens(logits, rejected_id, tokenizer, top_k, num_chosen, chosen_min_p)
     if not chosen_ids:
         return None
     return {
@@ -447,15 +644,24 @@ def ftpo_loss(
     tau_mse_target=0.5,
     clip_epsilon_logits=2.0,
 ):
-    """Notebook FTPO at one next-token position; preserve weight gradients."""
+    """Reference FTPO: per-example preference, vocabulary/target-token mean MSE."""
     logits, ref_logits = logits.float(), ref_logits.float()
-    chosen = torch.tensor(chosen_ids, device=logits.device)
-    delta_tok = logits[0, chosen] - logits[0, rejected_id]
-    weights = ((clip_epsilon_logits - delta_tok) / clip_epsilon_logits).clamp(0, 1)
-    pref_loss = (F.softplus(clip_epsilon_logits - delta_tok) * weights).mean()
+    if isinstance(rejected_id, int):
+        chosen_ids, rejected_id = [chosen_ids], [rejected_id]
+    chosen = torch.zeros(len(chosen_ids), max(map(len, chosen_ids)), dtype=torch.long, device=logits.device)
+    chosen_mask = torch.zeros_like(chosen, dtype=torch.bool)
+    for index, ids in enumerate(chosen_ids):
+        chosen[index, : len(ids)] = torch.tensor(ids, device=logits.device)
+        chosen_mask[index, : len(ids)] = True
+    rejected = torch.tensor(rejected_id, device=logits.device).unsqueeze(1)
+    delta_tok = logits.gather(1, chosen) - logits.gather(1, rejected)
+    weights = ((clip_epsilon_logits - delta_tok) / clip_epsilon_logits).clamp(0, 1) * chosen_mask
+    counts = chosen_mask.sum(-1)
+    pref_loss = ((F.softplus(clip_epsilon_logits - delta_tok) * weights).sum(-1) / counts).mean()
     target_mask = torch.zeros_like(logits, dtype=torch.bool)
-    target_mask[0, chosen] = True
-    target_mask[0, rejected_id] = True
+    rows = torch.arange(logits.shape[0], device=logits.device).unsqueeze(1).expand_as(chosen)
+    target_mask[rows[chosen_mask], chosen[chosen_mask]] = True
+    target_mask.scatter_(1, rejected, True)
     diff = logits - ref_logits
     mse_elem = diff.square()[~target_mask].mean()
     mse_target = (diff.abs()[target_mask] - tau_mse_target).clamp(min=0).square().mean()
@@ -465,8 +671,8 @@ def ftpo_loss(
         "pref_loss": pref_loss.detach(),
         "mse_elem": mse_elem.detach(),
         "mse_target": mse_target.detach(),
-        "chosen_win": (delta_tok > 0).float().mean().detach(),
-        "margin_win": (delta_tok >= clip_epsilon_logits).float().mean().detach(),
+        "chosen_win": (((delta_tok > 0) & chosen_mask).sum(-1) / counts).mean().detach(),
+        "margin_win": (((delta_tok >= clip_epsilon_logits) & chosen_mask).sum() / chosen_mask.sum()).detach(),
     }
 
 
@@ -721,7 +927,9 @@ def prepare(args):
                     row = encode_cached_response(row, tokenizer)
                 if "model" in row and Path(row["model"]).resolve() != Path(args.model).resolve():
                     raise ValueError("FTPO extraction must use the checkpoint that generated the rollout.")
-                pair = extract_ftpo_pair(row, tokenizer, model, "cuda", args.max_length, args.top_k, args.num_chosen)
+                pair = extract_ftpo_pair(
+                    row, tokenizer, model, "cuda", args.max_length, args.top_k, args.num_chosen, args.chosen_min_p
+                )
                 counts["rollouts"] += 1
                 if pair is None:
                     continue
@@ -748,11 +956,32 @@ def prepare(args):
         dist.barrier()
         dist.destroy_process_group()
     if rank == 0:
+        train_rows = list(read_jsonl(args.output / "train.jsonl"))
+        raw_train = len(train_rows)
+        train_rows = regularise_ftpo_rows(
+            train_rows,
+            tokenizer,
+            args.max_train_examples,
+            args.rejected_regularisation_strength,
+            args.chosen_regularisation_strength,
+            args.seed,
+        )
+        with (args.output / "train.jsonl").open("w") as handle:
+            for row in train_rows:
+                write_json(handle, row)
+        counts["train"] = len(train_rows)
         manifest = {
             "model": args.model,
             "max_length": args.max_length,
             "seed": args.seed,
             "trajectory_format": "retokenized_evaluation_cache" if args.cached_text else "original_rollout_ids",
+            "reference_revision": ANTIDOOM_REFERENCE_REVISION,
+            "chosen_selection": "ascending probability within top-k/min-p; EOS and RWKV protocol tokens excluded",
+            "chosen_min_p": args.chosen_min_p,
+            "raw_train": raw_train,
+            "max_train_examples": args.max_train_examples,
+            "rejected_regularisation_strength": args.rejected_regularisation_strength,
+            "chosen_regularisation_strength": args.chosen_regularisation_strength,
             **counts,
         }
         (args.output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -860,7 +1089,7 @@ def score(args):
     print(json.dumps(result), flush=True)
 
 
-def load_ftpo_data(path, vocab_size, max_length):
+def load_ftpo_data(path, vocab_size, max_length, tokenizer):
     rows = []
     for row in read_jsonl(path):
         prompt, chosen, rejected = row["prompt_ids"], row["chosen_ids"], row["rejected_token_id"]
@@ -868,6 +1097,8 @@ def load_ftpo_data(path, vocab_size, max_length):
             raise ValueError("FTPO rows need a non-empty context and distinct chosen/rejected IDs.")
         if any(not isinstance(token, int) or not 0 <= token < vocab_size for token in prompt + chosen + [rejected]):
             raise ValueError("FTPO IDs must be integer tokens in the model vocabulary.")
+        if any(is_control_token(tokenizer, token) for token in chosen + [rejected]):
+            raise ValueError("FTPO targets contain EOS or RWKV protocol tokens; rebuild preferences with prepare.")
         if len(prompt) <= max_length:
             rows.append(row)
     if not rows:
@@ -880,13 +1111,9 @@ def batch_loss(model, rows, device):
     # The frozen base is the reference; no second model or reference adapter.
     with torch.no_grad(), model.disable_adapter():
         ref_logits = batch_logits(model, rows, device)
-    results = [
-        ftpo_loss(logits[index : index + 1], ref_logits[index : index + 1], row["chosen_ids"], row["rejected_token_id"])
-        for index, row in enumerate(rows)
-    ]
-    return torch.stack([loss for loss, _ in results]).mean(), {
-        key: torch.stack([metrics[key] for _, metrics in results]).mean() for key in results[0][1]
-    }
+    return ftpo_loss(
+        logits, ref_logits, [row["chosen_ids"] for row in rows], [row["rejected_token_id"] for row in rows]
+    )
 
 
 def row_loss(model, row, device):
@@ -985,8 +1212,8 @@ def train(args):
             if Path(manifest["model"]).resolve() != Path(args.model).resolve():
                 raise ValueError("FTPO training must use the checkpoint that generated the preferences.")
         model = load_model(args.model)
-        train_rows = load_ftpo_data(args.data / "train.jsonl", model.config.vocab_size, args.max_length)
-        val_rows = load_ftpo_data(args.data / "validation.jsonl", model.config.vocab_size, args.max_length)
+        train_rows = load_ftpo_data(args.data / "train.jsonl", model.config.vocab_size, args.max_length, tokenizer)
+        val_rows = load_ftpo_data(args.data / "validation.jsonl", model.config.vocab_size, args.max_length, tokenizer)
         if {row["prompt_key"] for row in train_rows} & {row["prompt_key"] for row in val_rows}:
             raise ValueError("FTPO train/validation partitions contain the same source prompts.")
         model = get_peft_model(
@@ -994,7 +1221,7 @@ def train(args):
             LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
                 r=args.rank,
-                lora_alpha=args.rank,
+                lora_alpha=args.lora_alpha if args.lora_alpha is not None else args.rank,
                 lora_dropout=0.0,
                 target_modules=TARGET_MODULES,
                 bias="none",
@@ -1225,6 +1452,10 @@ def main():
     prepare_parser.add_argument("--rollouts", type=Path, required=True)
     prepare_parser.add_argument("--top-k", type=int, default=50)
     prepare_parser.add_argument("--num-chosen", type=int, default=20)
+    prepare_parser.add_argument("--chosen-min-p", type=float, default=0.01)
+    prepare_parser.add_argument("--max-train-examples", type=int, default=0, help="0 keeps 70% of the training pool")
+    prepare_parser.add_argument("--rejected-regularisation-strength", type=float, default=0.3)
+    prepare_parser.add_argument("--chosen-regularisation-strength", type=float, default=0.5)
     prepare_parser.add_argument("--validation-fraction", type=float, default=0.1)
     prepare_parser.add_argument(
         "--cached-text",
@@ -1234,7 +1465,8 @@ def main():
     train_parser = commands.choices["train"]
     train_parser.add_argument("--data", type=Path, required=True)
     train_parser.add_argument("--rank", type=int, default=8)
-    train_parser.add_argument("--learning-rate", type=float, default=1.5e-5)
+    train_parser.add_argument("--lora-alpha", type=int, help="Defaults to rank, the NoRA reference scaling")
+    train_parser.add_argument("--learning-rate", type=float, default=5e-7)
     train_parser.add_argument("--warmup-ratio", type=float, default=0.0)
     train_parser.add_argument("--epochs", type=int, default=1)
     train_parser.add_argument("--gradient-accumulation-steps", type=int, default=16)
@@ -1268,6 +1500,12 @@ def main():
             parser.error("--validation-fraction must be between 0 and 1")
         if min(args.max_length, args.top_k, args.num_chosen) <= 0:
             parser.error("FTPO context and candidate sizes must be positive")
+        if (
+            not 0 <= args.chosen_min_p <= 1
+            or min(args.max_train_examples, args.rejected_regularisation_strength, args.chosen_regularisation_strength)
+            < 0
+        ):
+            parser.error("Candidate min-p must be in [0, 1]; sample limits and regularisation must be non-negative")
         prepare(args)
     elif args.command == "score":
         if min(args.max_period, args.sample_interval) <= 0:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import json
 import multiprocessing
 import os
@@ -207,12 +208,64 @@ def rows(
                 break
 
 
-def score_question(row, choices, eos_token_id, collect_samples=True):
+def trajectory_path(output: Path, row) -> Path:
+    name = hashlib.sha256(row["uuid"].encode()).hexdigest()
+    return output / "rollouts" / row["domain"] / f"{name}.jsonl"
+
+
+def start_trajectory(output: Path, row, prompt_ids) -> Path:
+    """Stage one question on disk so full response IDs do not accumulate in RAM."""
+    path = trajectory_path(output, row).with_suffix(".pending")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(orjson.dumps({"prompt_ids": prompt_ids}, option=orjson.OPT_APPEND_NEWLINE))
+    return path
+
+
+def append_trajectory(path: Path, sample_index, response_ids, finish_reason):
+    with path.open("ab") as handle:
+        handle.write(
+            orjson.dumps(
+                {"sample_index": sample_index, "response_ids": response_ids, "finish_reason": finish_reason},
+                option=orjson.OPT_APPEND_NEWLINE,
+            )
+        )
+
+
+def publish_trajectories(output: Path, row, verdicts):
+    """Publish a scored question atomically before marking it completed."""
+    path = trajectory_path(output, row)
+    pending = path.with_suffix(".pending")
+    temporary = path.with_suffix(".tmp")
+    with pending.open("rb") as source, temporary.open("wb") as target:
+        prompt_ids = orjson.loads(source.readline())["prompt_ids"]
+        for line in source:
+            record = orjson.loads(line)
+            verdict = verdicts[record["sample_index"]]
+            target.write(
+                orjson.dumps(
+                    {
+                        **record,
+                        "uuid": row["uuid"],
+                        "domain": row["domain"],
+                        "prompt_ids": prompt_ids,
+                        "reward": float(verdict["status"] == "correct"),
+                        "truncated": record["finish_reason"] in {"length", "max_tokens"},
+                        **verdict,
+                    },
+                    option=orjson.OPT_APPEND_NEWLINE,
+                )
+            )
+    temporary.replace(path)
+    pending.unlink()
+
+
+def score_question(row, choices, eos_token_id, collect_samples=True, collect_verdicts=False):
     path, offset = row["_source"]
     with open(path, "rb") as handle:
         handle.seek(offset)
         original = orjson.loads(handle.readline())
     counts, reasons, samples, code_cache = Counter(), Counter(), {}, {}
+    verdicts = []
     for index, choice in enumerate(choices):
         response = choice["text"]
         finish, response_ids = choice.get("finish_reason"), choice.get("token_ids") or []
@@ -255,6 +308,8 @@ def score_question(row, choices, eos_token_id, collect_samples=True):
             ), "answer_match"
         counts[status] += 1
         reasons[reason] += 1
+        if collect_verdicts:
+            verdicts.append({"status": status, "reason": reason})
         if collect_samples:
             samples.setdefault(
                 status,
@@ -269,6 +324,8 @@ def score_question(row, choices, eos_token_id, collect_samples=True):
                     "reason": reason,
                 },
             )
+    if collect_verdicts:
+        return counts, reasons, samples, verdicts
     return counts, reasons, samples
 
 
@@ -451,14 +508,16 @@ async def run(args):
     completed = set()
     elapsed_before_resume = 0.0
     processes, pool = [], None
+    sampling_params = ROLLOUT_SAMPLING_PARAMS if args.sampling == "rollout" else SAMPLING_PARAMS
     config = {
         "model": args.model,
+        "save_rollouts": args.save_rollouts,
         "limit": args.limit,
         "rollouts_per_question": ROLLOUTS_PER_QUESTION,
         "scoring_version": SCORING_VERSION,
         "max_tokens": args.max_tokens,
         "max_model_len": args.max_model_len,
-        **SAMPLING_PARAMS,
+        **sampling_params,
         "status": "starting",
         "progress": progress,
     }
@@ -475,6 +534,8 @@ async def run(args):
         ):
             if saved.get(key) != config[key]:
                 raise ValueError(f"Cannot resume with changed {key}: {saved.get(key)!r} -> {config[key]!r}")
+        if saved.get("save_rollouts", False) != args.save_rollouts:
+            raise ValueError("Cannot resume with changed save_rollouts")
         with (args.output / "correct_counts_by_question.jsonl").open("rb") as handle:
             for line in handle:
                 record = orjson.loads(line)
@@ -580,7 +641,7 @@ async def run(args):
                         "model": args.model,
                         "prompt": prompt_ids,
                         "max_tokens": args.max_tokens,
-                        **SAMPLING_PARAMS,
+                        **sampling_params,
                         "stream": False,
                         "return_token_ids": True,
                     }
@@ -591,6 +652,11 @@ async def run(args):
                     "remaining": ROLLOUTS_PER_QUESTION,
                     "body": body,
                 }
+                if args.save_rollouts:
+                    question["trajectory_path"] = await asyncio.to_thread(
+                        start_trajectory, args.output, row, prompt_ids
+                    )
+                    question["trajectory_lock"] = asyncio.Lock()
                 # Keep the 64 copies together for prefix reuse; choose the least loaded engine.
                 index = min(range(len(urls)), key=lambda i: (queues[i].qsize() + active[i], (i - position) % len(urls)))
                 position = (index + 1) % len(urls)
@@ -624,7 +690,16 @@ async def run(args):
                     progress["generated_rollouts"] += 1
                     progress["generated_tokens"] += len(response_ids)
                     choice["text"] = await asyncio.to_thread(tokenizer.decode, response_ids, skip_special_tokens=True)
-                    # Only the terminal token is needed for strict EOS validation.
+                    if args.save_rollouts:
+                        async with question["trajectory_lock"]:
+                            await asyncio.to_thread(
+                                append_trajectory,
+                                question["trajectory_path"],
+                                sample_index,
+                                response_ids,
+                                choice.get("finish_reason"),
+                            )
+                    # Only the terminal token is needed in RAM for strict EOS validation.
                     choice["token_ids"] = response_ids[-1:]
                     del response_ids
                     question["choices"][sample_index] = choice
@@ -640,9 +715,18 @@ async def run(args):
                         collect_samples = row["uuid"] not in sample_ids and any(
                             len(candidates[status][row["domain"]]) < 20 for status in STATUSES
                         )
-                        counts, reasons, samples = await loop.run_in_executor(
-                            pool, score_question, row, choices, tokenizer.eos_token_id, collect_samples
+                        result = await loop.run_in_executor(
+                            pool,
+                            score_question,
+                            row,
+                            choices,
+                            tokenizer.eos_token_id,
+                            collect_samples,
+                            args.save_rollouts,
                         )
+                        counts, reasons, samples = result[:3]
+                        if args.save_rollouts and not row["_prompt_too_long"]:
+                            await asyncio.to_thread(publish_trajectories, args.output, row, result[3])
                         question = groups[row["domain"]]
                         question["num_questions"] += 1
                         question["counts"].update(counts)
@@ -745,6 +829,10 @@ parser = argparse.ArgumentParser(description="Full UltraData evaluation on every
 parser.add_argument("--data-root", type=Path, default=Path.home() / "data/UltraData-RL-2609/files")
 parser.add_argument("--output", type=Path, help="Output directory (default: timestamped model-specific directory)")
 parser.add_argument("--resume", action="store_true", help="Resume completed question counts from --output")
+parser.add_argument(
+    "--save-rollouts", action="store_true", help="Persist all scored token trajectories for value pretraining"
+)
+parser.add_argument("--sampling", choices=("eval", "rollout"), default="eval", help="Sampling recipe (default: eval)")
 parser.add_argument(
     "--base-url", help="Comma-separated external engines; otherwise launch one TP1 engine per visible GPU"
 )

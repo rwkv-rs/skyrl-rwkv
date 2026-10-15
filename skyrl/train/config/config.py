@@ -1998,25 +1998,6 @@ class SkyRLTrainConfig(BaseConfig):
             self.trainer.algorithm.temperature = self.generator.sampling_params.temperature
 
         flashreinforce = self.trainer.algorithm.flashreinforce
-        rollout_is = self.trainer.algorithm.rollout_is
-        if rollout_is.score_centering:
-            if self.trainer.algorithm.policy_loss_type != "rollout_is":
-                raise ValueError("rollout_is.score_centering requires policy_loss_type=rollout_is")
-            if self.trainer.strategy != "fsdp":
-                raise ValueError("rollout_is.score_centering currently requires trainer.strategy=fsdp")
-            if not self.generator.use_conversation_multi_turn:
-                raise ValueError("rollout_is.score_centering requires generator.use_conversation_multi_turn=True")
-            if self.generator.sampling_params.logprobs is None:
-                raise ValueError("rollout_is.score_centering requires generator.sampling_params.logprobs")
-            if (
-                self.generator.sampling_params.temperature != 1.0
-                or self.generator.sampling_params.top_p != 1.0
-                or self.generator.sampling_params.top_k != -1
-            ):
-                raise ValueError("rollout_is.score_centering requires temperature=1, top_p=1, top_k=-1")
-            self.generator.inference_engine.enable_return_sample_support_set = True
-            self.generator.inference_engine.sample_support_top_k = rollout_is.score_centering_top_k
-            self.generator.inference_engine.sample_support_logprobs_mode = "raw_logprobs"
         if flashreinforce.score_centering:
             if self.trainer.algorithm.policy_loss_type not in ("flashreinforce", "flash_reinforce"):
                 raise ValueError("flashreinforce.score_centering requires policy_loss_type=flashreinforce")

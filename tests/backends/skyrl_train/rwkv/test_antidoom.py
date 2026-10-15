@@ -692,9 +692,12 @@ def test_prepare_groups_siblings_and_keeps_original_validation_prompts(tmp_path,
 )
 @pytest.mark.parametrize("adapt_head", [False, True])
 def test_adapter_reference_reload_and_merged_logits_after_optimizer_step(tmp_path, monkeypatch, use_nora, adapt_head):
+    from safetensors.torch import save_file
     from tokenizers import Tokenizer as RustTokenizer
     from tokenizers.models import WordLevel
     from transformers import AutoModelForCausalLM, PreTrainedTokenizerFast
+
+    from skyrl.backends.skyrl_train.distributed.fsdp_utils import layered_summon_lora_params
 
     torch.manual_seed(7)
     base = LlamaForCausalLM(
@@ -739,7 +742,13 @@ def test_adapter_reference_reload_and_merged_logits_after_optimizer_step(tmp_pat
     adapted = antidoom.last_logits(model, prompt_ids, "cpu").detach()
     assert not torch.allclose(adapted, reference)
     adapter_path = tmp_path / "adapter"
-    model.save_pretrained(adapter_path, save_embedding_layers=False)
+    adapter_path.mkdir()
+    state = layered_summon_lora_params(model)
+    assert state.keys() == {
+        name.replace(".default.", ".") for name, param in model.named_parameters() if param.requires_grad
+    }
+    save_file(state, str(adapter_path / "adapter_model.safetensors"))
+    model.peft_config["default"].save_pretrained(adapter_path)
     original_load = AutoModelForCausalLM.from_pretrained
 
     def load_base(path, **kwargs):

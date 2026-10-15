@@ -1,4 +1,5 @@
 import copy
+import math
 import os
 import sys
 from dataclasses import dataclass, field
@@ -23,8 +24,14 @@ from skyrl.train.utils import initialize_ray
 
 @dataclass
 class OnPolicyDistillationAlgorithmConfig(AlgorithmConfig):
+    proximal_teacher_alpha: float = 1.0
+    """TOP-D probability mixture weight for the teacher; 1.0 preserves native OPD."""
     stopd: STOPDConfig = field(default_factory=STOPDConfig)
     """Optional stochastic truncation, inverse-probability weights, and lagged normalization."""
+
+    def __post_init__(self):
+        if not isinstance(self.proximal_teacher_alpha, (int, float)) or not 0 < self.proximal_teacher_alpha <= 1:
+            raise ValueError("proximal_teacher_alpha must be in (0, 1]")
 
 
 OnPolicyDistillationConfig = make_config(algorithm_cls=OnPolicyDistillationAlgorithmConfig)
@@ -200,7 +207,15 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
 
         # set rewards to the KL penalty
         # note: tinker seems to use k1 or k2: https://github.com/thinking-machines-lab/tinker-cookbook/blob/3dd0463472dda5847efee80010b50514fa3068ef/tinker_cookbook/rl/metrics.py#L40
-        rewards = -(action_log_probs - teacher_action_log_probs) * loss_masks_all
+        rewards = -(action_log_probs - teacher_action_log_probs)
+        alpha = self.cfg.trainer.algorithm.proximal_teacher_alpha
+        if alpha < 1:
+            # TOP-D Eq. (5): log(alpha * p_teacher / p_old + 1 - alpha).
+            # The cached trainer logprobs are from the rollout policy before
+            # this batch's update. Work in log space to avoid ratio overflow.
+            # https://arxiv.org/abs/2607.04751
+            rewards = torch.logaddexp(rewards + math.log(alpha), torch.full_like(rewards, math.log1p(-alpha)))
+        rewards = rewards * loss_masks_all
         data["rewards"] = rewards
         return data
 

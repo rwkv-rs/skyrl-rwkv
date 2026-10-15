@@ -20,6 +20,7 @@ fi
 : "${NUM_GPUS:=8}"
 : "${USE_NORA:=true}"
 : "${USE_STOPD:=false}"
+: "${PROXIMAL_TEACHER_ALPHA:=1.0}"
 : "${LORA_RANK:=256}"
 : "${LORA_ALPHA:=$LORA_RANK}"
 : "${MINI_BATCH_SIZE:=512}"
@@ -59,6 +60,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   trainer.algorithm.use_kl_in_reward=true \
   trainer.algorithm.use_kl_loss=false \
   trainer.algorithm.stopd.enabled="$USE_STOPD" \
+  trainer.algorithm.proximal_teacher_alpha="$PROXIMAL_TEACHER_ALPHA" \
   trainer.policy.model.path="$STUDENT_MODEL" \
   trainer.ref.model.path="$TEACHER_MODEL" \
   trainer.policy.model_config_kwargs.wkv_mode=fp32io16 \

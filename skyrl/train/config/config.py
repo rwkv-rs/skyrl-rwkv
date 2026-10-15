@@ -1436,7 +1436,8 @@ class InferenceEngineConfig(BaseConfig):
     """Pass-through kwargs for the vLLM engine.
     Names must match the engine's args. Applied last, so they silently override config-derived
     engine args (e.g. ``tensor_parallel_size``). The exception is ``logprobs_mode``, which is
-    always ``"processed_logprobs"``; any other value is rejected.
+    ``"processed_logprobs"`` by default. RWKV Rapid-Sampling accepts an explicit
+    ``"raw_logprobs"`` override only with an unmodified rollout distribution.
 
     For HuggingFace config overrides such as RoPE scaling, use
     ``engine_init_kwargs.hf_overrides.rope_parameters`` and set the matching trainer-side override
@@ -1463,8 +1464,8 @@ class InferenceEngineConfig(BaseConfig):
     """Pass-through kwargs for the vLLM engine, applied only to prefill engines when
     ``enable_pd=True``. Mutually exclusive with ``engine_init_kwargs``: provide role-specific
     kwargs (including shared ones like ``kv_transfer_config``) via ``prefill_init_kwargs`` /
-    ``decode_init_kwargs`` instead. As with ``engine_init_kwargs``, ``logprobs_mode`` must be
-    ``"processed_logprobs"``."""
+    ``decode_init_kwargs`` instead. As with ``engine_init_kwargs``, ``logprobs_mode`` must
+    match the mode selected by ``engine_init_kwargs`` (``"processed_logprobs"`` by default)."""
     decode_init_kwargs: Dict[str, Any] = field(default_factory=dict)
     """Pass-through kwargs for the vLLM engine, applied only to decode engines when
     ``enable_pd=True``. Mutually exclusive with ``engine_init_kwargs`` (see ``prefill_init_kwargs``)."""
@@ -2065,6 +2066,25 @@ class SkyRLTrainConfig(BaseConfig):
             self.trainer.algorithm.temperature = self.generator.sampling_params.temperature
 
         flashreinforce = self.trainer.algorithm.flashreinforce
+        rollout_is = self.trainer.algorithm.rollout_is
+        if rollout_is.score_centering:
+            if self.trainer.algorithm.policy_loss_type != "rollout_is":
+                raise ValueError("rollout_is.score_centering requires policy_loss_type=rollout_is")
+            if self.trainer.strategy != "fsdp":
+                raise ValueError("rollout_is.score_centering currently requires trainer.strategy=fsdp")
+            if not self.generator.use_conversation_multi_turn:
+                raise ValueError("rollout_is.score_centering requires generator.use_conversation_multi_turn=True")
+            if self.generator.sampling_params.logprobs is None:
+                raise ValueError("rollout_is.score_centering requires generator.sampling_params.logprobs")
+            if (
+                self.generator.sampling_params.temperature != 1.0
+                or self.generator.sampling_params.top_p != 1.0
+                or self.generator.sampling_params.top_k != -1
+            ):
+                raise ValueError("rollout_is.score_centering requires temperature=1, top_p=1, top_k=-1")
+            self.generator.inference_engine.enable_return_sample_support_set = True
+            self.generator.inference_engine.sample_support_top_k = rollout_is.score_centering_top_k
+            self.generator.inference_engine.sample_support_logprobs_mode = "raw_logprobs"
         if flashreinforce.score_centering:
             if self.trainer.algorithm.policy_loss_type not in ("flashreinforce", "flash_reinforce"):
                 raise ValueError("flashreinforce.score_centering requires policy_loss_type=flashreinforce")

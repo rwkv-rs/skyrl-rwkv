@@ -370,7 +370,10 @@ def test_benchmark_replays_complete_configuration_and_checkpoint(tmp_path, monke
 
 
 def test_benchmark_requires_complete_finite_updates_and_native_state_restore(tmp_path):
-    lines = ["Successfully loaded optimizer state", "Successfully loaded dataloader state"]
+    lines = ["Successfully loaded dataloader state"]
+    (tmp_path / "logs").mkdir()
+    infra = tmp_path / "logs/infra-test.log"
+    infra.write_text("Successfully loaded optimizer state")
     for _ in range(3):
         for stage in ("step", "generate", "fwd_logprobs_values_reward", "policy_train", "sync_weights"):
             lines.append(f"Finished: '{stage}', time cost: 3.00s")
@@ -378,6 +381,6 @@ def test_benchmark_requires_complete_finite_updates_and_native_state_restore(tmp
     log = tmp_path / "console.log"
     log.write_text("\n".join(lines))
     assert summarize(tmp_path, 3)["timings"]["step"]["mean"] == 3
-    log.write_text("\n".join(lines[1:]))
+    infra.write_text("")
     with pytest.raises(ValueError, match="restore complete training state"):
         summarize(tmp_path, 3)

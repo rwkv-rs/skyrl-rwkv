@@ -26,6 +26,7 @@ from packaging import version
 from peft.utils.save_and_load import get_peft_model_state_dict
 from torch.distributed import DeviceMesh
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor
 
 from skyrl.train.config import FSDPConfig
 
@@ -61,6 +62,43 @@ def should_use_meta_init(use_meta_tensor=True, mesh: DeviceMesh = None) -> bool:
     if mesh is None:
         return torch.distributed.get_rank() != 0
     return mesh.get_coordinate()[-1] != 0
+
+
+def iter_merged_lora_weights(model, state_dict=None):
+    """Yield complete weights without changing the live adapter or frozen base.
+
+    Use AntiDoom's FP32 column normalization and merge precision. Materialize one
+    projection at a time so FSDP weight transfer can stream from sharded models.
+    ``state_dict`` may supply already gathered PEFT weights for an HF export.
+    """
+    from peft.tuners.lora import LoraLayer
+
+    base_model = model.get_base_model()
+    if state_dict is None:
+        state_dict = base_model.state_dict()
+    else:
+        state_dict = {name.removeprefix("base_model.model."): tensor for name, tensor in state_dict.items()}
+    modules = dict(base_model.named_modules())
+
+    def materialize(tensor):
+        return tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
+
+    for name, tensor in state_dict.items():
+        if ".lora_A." in name or ".lora_B." in name:
+            continue
+        weight = materialize(tensor)
+        if name.endswith(".base_layer.weight"):
+            module_name = name.removesuffix(".base_layer.weight")
+            layer = modules[module_name]
+            assert isinstance(layer, LoraLayer)
+            weight = weight.float()
+            for adapter in layer.active_adapters:
+                weight_a = materialize(state_dict[f"{module_name}.lora_A.{adapter}.weight"]).float()
+                weight_b = materialize(state_dict[f"{module_name}.lora_B.{adapter}.weight"]).float()
+                if layer.use_nora.get(adapter) is True:
+                    weight_a = weight_a / (weight_a.norm(dim=0, keepdim=True) + 1e-6)
+                weight = weight + (weight_b @ weight_a) * layer.scaling[adapter]
+        yield name.replace(".base_layer.", "."), weight
 
 
 @torch.no_grad()

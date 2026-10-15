@@ -181,6 +181,7 @@ class HFModelWrapper(nn.Module):
         lora_alpha=16,
         lora_dropout=0,
         lora_init_method="kaiming",
+        use_nora=False,
         target_modules=None,
         exclude_modules=None,
         train_attn=True,
@@ -226,6 +227,8 @@ class HFModelWrapper(nn.Module):
 
             model_config = AutoConfig.from_pretrained(pretrain_or_model, trust_remote_code=True, **model_config_kwargs)
             is_rwkv_config = model_config.model_type == "rwkv"
+            if use_nora and not is_rwkv_config:
+                raise ValueError("use_nora=True is supported by the RWKV FSDP policy.")
 
             if language_model_only:
                 logger.info("[VLM] language_model_only=True, skipping vision encoder initialization")
@@ -303,6 +306,10 @@ class HFModelWrapper(nn.Module):
                 # https://github.com/huggingface/peft/issues/137
                 self.model.enable_input_require_grads()
                 resolved_target_modules = resolve_lora_target_modules(self.model, target_modules, train_attn, train_mlp)
+                if use_nora and "use_nora" not in LoraConfig.__dataclass_fields__:
+                    raise RuntimeError(
+                        "Install the NoRA PEFT fork used by AntiDoom; see examples/train/rwkv/README.md."
+                    )
                 lora_config = LoraConfig(
                     task_type=TaskType.CAUSAL_LM,
                     r=lora_rank,
@@ -312,6 +319,7 @@ class HFModelWrapper(nn.Module):
                     lora_dropout=lora_dropout,
                     bias="none",
                     init_lora_weights=True if lora_init_method == "kaiming" else lora_init_method,
+                    **({"use_nora": True} if use_nora else {}),
                 )
                 self.model = get_peft_model(self.model, lora_config)
 

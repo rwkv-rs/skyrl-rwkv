@@ -3,7 +3,7 @@
 set -euo pipefail
 
 # Native OPD on DAPO-Math, with AIME 2024 evaluation.
-# Teacher: rwkv7-g1k-13.3b-20260930-ctx25600.
+# Teacher: rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora.
 # Student: rwkv7-g1k-1.5b-20260930-ctx25600.
 
 if [[ -f .env ]]; then
@@ -13,14 +13,20 @@ if [[ -f .env ]]; then
 fi
 
 : "${STUDENT_MODEL:=$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600}"
-: "${TEACHER_MODEL:=$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600}"
+: "${TEACHER_MODEL:=$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora}"
 : "${DATA_DIR:=$HOME/data/dapo}"
 : "${TRAIN_FILE:=$DATA_DIR/dapo-math-17k-cleaned.parquet}"
 : "${TEST_FILE:=$DATA_DIR/aime-2024-cleaned.parquet}"
 : "${NUM_GPUS:=8}"
-: "${MICRO_BATCH_SIZE:=1}"
+: "${USE_NORA:=true}"
+: "${LORA_RANK:=256}"
+: "${LORA_ALPHA:=$LORA_RANK}"
+: "${MINI_BATCH_SIZE:=512}"
+: "${MICRO_BATCH_SIZE:=8}"
+: "${MICRO_FORWARD_BATCH_SIZE:=$MICRO_BATCH_SIZE}"
+: "${LR:=2e-6}"
 : "${LOGGER:=wandb}"
-: "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-dapo-opd-from-rwkv7-g1k-13.3b-20260930-ctx25600}"
+: "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-dapo-opd-nora-from-rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
 export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
 # FlashRWKV2 uses get_default_build_root() (XDG_CACHE_HOME), not TORCH_EXTENSIONS_DIR.
@@ -41,9 +47,15 @@ uv run --isolated --no-project .venv/bin/python -m examples.train.on_policy_dist
   trainer.ref.model.path="$TEACHER_MODEL" \
   trainer.policy.model_config_kwargs.wkv_mode=fp32io16 \
   trainer.ref.model_config_kwargs.wkv_mode=fp32io16 \
-  trainer.policy.optimizer_config.lr=1e-5 \
+  trainer.policy.model.lora.use_nora="$USE_NORA" \
+  trainer.policy.model.lora.rank="$LORA_RANK" \
+  trainer.policy.model.lora.alpha="$LORA_ALPHA" \
+  trainer.policy.model.lora.dropout=0.0 \
+  trainer.policy.model.lora.target_modules="[r_proj,k_proj,v_proj,o_proj,lm_head]" \
+  trainer.policy.optimizer_config.lr="$LR" \
   trainer.policy.optimizer_config.num_warmup_steps=0 \
-  trainer.policy.optimizer_config.weight_decay=0.1 \
+  trainer.policy.optimizer_config.weight_decay=0.01 \
+  trainer.policy.optimizer_config.max_grad_norm=1.0 \
   trainer.strategy=fsdp \
   trainer.bf16=true \
   trainer.flash_attn=false \
@@ -52,17 +64,22 @@ uv run --isolated --no-project .venv/bin/python -m examples.train.on_policy_dist
   trainer.ref.sequence_parallel_size=1 \
   trainer.policy.use_torch_compile=false \
   trainer.gradient_checkpointing=true \
+  trainer.policy.fsdp_config.fsdp_size=1 \
+  trainer.policy.fsdp_config.reshard_after_forward=false \
+  trainer.policy.fsdp_config.sync_gradients_each_microbatch=false \
+  trainer.ref.fsdp_config.fsdp_size=1 \
+  trainer.ref.fsdp_config.reshard_after_forward=false \
   trainer.update_ref_every_epoch=false \
   trainer.placement.colocate_all=true \
   trainer.placement.policy_num_gpus_per_node="$NUM_GPUS" \
   trainer.placement.ref_num_gpus_per_node="$NUM_GPUS" \
   trainer.epochs=20 \
-  trainer.max_training_steps=50 \
+  trainer.max_training_steps=null \
   trainer.update_epochs_per_batch=1 \
-  trainer.train_batch_size=64 \
-  trainer.policy_mini_batch_size=64 \
+  trainer.train_batch_size="$MINI_BATCH_SIZE" \
+  trainer.policy_mini_batch_size="$MINI_BATCH_SIZE" \
   trainer.micro_train_batch_size_per_gpu="$MICRO_BATCH_SIZE" \
-  trainer.micro_forward_batch_size_per_gpu="$MICRO_BATCH_SIZE" \
+  trainer.micro_forward_batch_size_per_gpu="$MICRO_FORWARD_BATCH_SIZE" \
   trainer.eval_batch_size=64 \
   trainer.eval_before_train=true \
   trainer.dump_train_results=true \
@@ -86,6 +103,7 @@ uv run --isolated --no-project .venv/bin/python -m examples.train.on_policy_dist
   generator.inference_engine.weight_sync_backend=nccl \
   generator.inference_engine.enforce_eager=true \
   generator.inference_engine.gpu_memory_utilization=0.8 \
+  generator.inference_engine.max_num_seqs=128 \
   generator.batched=false \
   generator.n_samples_per_prompt=1 \
   generator.eval_n_samples_per_prompt=32 \

@@ -718,12 +718,25 @@ class FSDPStrategy(DistributedStrategy):
 
         # Step 4: Save on rank 0 only
         if self.is_rank_0():
+            if self.model_config is not None and self.model_config.lora.use_nora:
+                from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
+                    iter_merged_lora_weights,
+                )
+
+                output_state_dict = {
+                    name: weight.to(torch.float16).contiguous()
+                    for name, weight in iter_merged_lora_weights(model_to_save, output_state_dict)
+                }
+                model_to_save = model_to_save.get_base_model()
             with self._atomic_local_export_dir(output_dir) as work_dir:
                 # Save the model in HuggingFace format using safetensors
                 model_to_save.save_pretrained(work_dir, state_dict=output_state_dict, safe_serialization=True, **kwargs)
 
                 # Fix and save the config
                 config_to_save = self._fix_fsdp_config(model_to_save.config)
+                if self.model_config is not None and self.model_config.lora.use_nora:
+                    config_to_save = copy.deepcopy(config_to_save)
+                    config_to_save.dtype = torch.float16
                 config_to_save.save_pretrained(work_dir)
 
                 # Save tokenizer if provided

@@ -152,7 +152,8 @@ def validate_training_input(output, rows, stopd, step):
     torch.testing.assert_close(data["returns"], expected_rewards, rtol=0, atol=0)
     expected_advantages = expected_rewards
     if stopd.truncating:
-        expected_advantages = expected_rewards * stopd.multiplier(mask, data["loss_mask"].sum().item())
+        start, end = data.metadata["policy_mini_batch_boundaries"][0]
+        expected_advantages = expected_rewards * stopd.multiplier(mask, data["loss_mask"][start:end].sum().item())
     torch.testing.assert_close(data["advantages"], expected_advantages, rtol=0, atol=0)
     if not torch.isfinite(data["advantages"]).all():
         raise ValueError("Native OPD advantages must be finite")

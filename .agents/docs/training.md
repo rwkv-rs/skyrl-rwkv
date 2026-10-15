@@ -44,6 +44,6 @@ uv run --isolated --extra megatron --env-file .env.test -m skyrl.train.entrypoin
 Located in `examples/train/<task>/`:
 - `examples/train/gsm8k/` — GSM8K math training
 - `examples/train/text_to_sql/` — SQL training
-- `examples/train/rwkv/run_rwkv_on_policy_distill.sh` — RWKV7 G1k-13.3B to G1k-1.5B on-policy distillation on DAPO-Math with AIME 2024 evaluation, using the native OPD entrypoint and the project-local RWKV environment. Setup and overrides: `examples/train/rwkv/README.md` (On-policy distillation).
+- `examples/train/rwkv/run_rwkv_on_policy_distill.sh` — RWKV7 G1k-13.3B to G1k-1.5B on-policy distillation on local UltraData with AIME 2024 evaluation, using the native OPD entrypoint and the project-local RWKV environment. `prepare_opd.py` streams all four UltraData domains to Parquet; `profile_opd.py` measures full-context FSDP/FlashRWKV2 component throughput on torchrun ranks. Setup and overrides: `examples/train/rwkv/README.md` (On-policy distillation).
 - RWKV OPD defaults to the merged AntiDoom teacher and optional NoRA student training (`trainer.policy.model.lora.use_nora`). It reuses AntiDoom's pinned PEFT fork and FlashRWKV2 fused projections; FSDP weight sync and HF exports merge complete weights in FP32 before FP16 conversion. Ordinary LoRA keeps its adapter sync path.
 - Each has a `run_*.sh` script with preconfigured overrides.

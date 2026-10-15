@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-# Native OPD on DAPO-Math, with AIME 2024 evaluation.
+# Native OPD on local UltraData, with AIME 2024 evaluation.
 # Teacher: rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora.
 # Student: rwkv7-g1k-1.5b-20260930-ctx25600.
 
@@ -14,9 +14,9 @@ fi
 
 : "${STUDENT_MODEL:=$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600}"
 : "${TEACHER_MODEL:=$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora}"
-: "${DATA_DIR:=$HOME/data/dapo}"
-: "${TRAIN_FILE:=$DATA_DIR/dapo-math-17k-cleaned.parquet}"
-: "${TEST_FILE:=$DATA_DIR/aime-2024-cleaned.parquet}"
+: "${DATA_DIR:=$HOME/data/ultradata-opd}"
+: "${TRAIN_FILE:=$DATA_DIR/train.parquet}"
+: "${TEST_FILE:=$HOME/data/dapo/aime-2024-cleaned.parquet}"
 : "${NUM_GPUS:=8}"
 : "${USE_NORA:=true}"
 : "${LORA_RANK:=256}"
@@ -26,7 +26,7 @@ fi
 : "${MICRO_FORWARD_BATCH_SIZE:=$MICRO_BATCH_SIZE}"
 : "${LR:=2e-6}"
 : "${LOGGER:=wandb}"
-: "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-dapo-opd-nora-from-rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora}"
+: "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-ultradata-opd-nora-from-rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
 export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
 # FlashRWKV2 uses get_default_build_root() (XDG_CACHE_HOME), not TORCH_EXTENSIONS_DIR.
@@ -34,9 +34,9 @@ export XDG_CACHE_HOME="$HOME/.cache/skyrl-rwkv"
 export TORCH_EXTENSIONS_DIR="$XDG_CACHE_HOME/torch_extensions"
 
 # Check the exact native cache key before loading.
-uv run --isolated --no-project .venv/bin/python examples/train/rwkv/prepare_flashrwkv2.py --check
+uv run --isolated --no-config --no-project .venv/bin/python examples/train/rwkv/prepare_flashrwkv2.py --check
 
-uv run --isolated --no-project .venv/bin/python -m examples.train.on_policy_distillation.main_on_policy_distill \
+uv run --isolated --no-config --no-project .venv/bin/python -m examples.train.on_policy_distillation.main_on_policy_distill \
   data.train_data="['$TRAIN_FILE']" \
   data.val_data="['$TEST_FILE']" \
   trainer.algorithm.advantage_estimator=no_op \
@@ -73,7 +73,7 @@ uv run --isolated --no-project .venv/bin/python -m examples.train.on_policy_dist
   trainer.placement.colocate_all=true \
   trainer.placement.policy_num_gpus_per_node="$NUM_GPUS" \
   trainer.placement.ref_num_gpus_per_node="$NUM_GPUS" \
-  trainer.epochs=20 \
+  trainer.epochs=1 \
   trainer.max_training_steps=null \
   trainer.update_epochs_per_batch=1 \
   trainer.train_batch_size="$MINI_BATCH_SIZE" \
@@ -87,7 +87,7 @@ uv run --isolated --no-project .venv/bin/python -m examples.train.on_policy_dist
   trainer.eval_interval=50 \
   trainer.ckpt_interval=50 \
   trainer.hf_save_interval=50 \
-  trainer.max_prompt_length=2048 \
+  trainer.max_prompt_length=17408 \
   trainer.resume_mode=null \
   trainer.logger="$LOGGER" \
   trainer.project_name=skyrl-rwkv \

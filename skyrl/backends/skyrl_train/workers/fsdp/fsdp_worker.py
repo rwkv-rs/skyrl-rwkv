@@ -149,6 +149,8 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         """
         weight_prefix = get_inference_weight_prefix(self._is_multimodal_lm_only)
         if backend == "sharded_rdt":
+            if self.model.is_rwkv:
+                raise ValueError("RWKV does not support sharded_rdt weight sync.")
             # RDT pulls, so it needs the ownership + group channels its own
             # source subclass adds (see sharded_rdt/sharded_rdt_base.py).
             from skyrl.backends.skyrl_train.weight_sync.sharded_rdt.rdt_send import (

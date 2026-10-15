@@ -86,7 +86,7 @@ uv run --isolated --no-sync --extra rwkv -m skyrl.train.entrypoints.main_base \
   generator.chat_template_kwargs="{rwkv_prompt_template: bot, rwkv_generation_prompt: open_think}" \
   generator.sampling_params.max_generate_length=1024 \
   generator.sampling_params.temperature=1.0 \
-  generator.sampling_params.top_p=0.95 \
+  generator.sampling_params.top_p=1.0 \
   generator.sampling_params.top_k=-1 \
   generator.sampling_params.additional_kwargs="{presence_penalty: 0.0, frequency_penalty: 0.0, penalty_decay: 1.0}" \
   generator.eval_sampling_params.max_generate_length=1024 \

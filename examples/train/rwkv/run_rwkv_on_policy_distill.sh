@@ -22,7 +22,7 @@ fi
 : "${LORA_RANK:=256}"
 : "${LORA_ALPHA:=$LORA_RANK}"
 : "${MINI_BATCH_SIZE:=512}"
-: "${MICRO_BATCH_SIZE:=8}"
+: "${MICRO_BATCH_SIZE:=4}"
 : "${MICRO_FORWARD_BATCH_SIZE:=4}"
 : "${LR:=2e-6}"
 : "${LOGGER:=wandb}"

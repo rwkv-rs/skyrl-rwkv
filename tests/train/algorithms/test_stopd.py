@@ -59,6 +59,60 @@ def config(**overrides):
     return cfg
 
 
+@pytest.mark.parametrize("alpha", [0.1, 0.2, 1.0])
+def test_proximal_teacher_rewards_match_probability_mixture(alpha):
+    trainer = object.__new__(OnPolicyDistillationTrainer)
+    trainer.cfg = config(**{"trainer.algorithm.proximal_teacher_alpha": alpha})
+    student = torch.tensor([[0.2, 0.3, 0.5]], dtype=torch.float64)
+    teacher = torch.tensor([[0.05, 0.15, 0.8]], dtype=torch.float64)
+    mask = torch.tensor([[1, 1, 0]])
+    data = TrainingInputBatch(
+        {"loss_mask": mask, "action_log_probs": student.log(), "base_action_log_probs": teacher.log()}
+    )
+    actual = trainer.apply_reward_kl_penalty(data)["rewards"]
+    expected = ((alpha * teacher + (1 - alpha) * student) / student).log() * mask
+    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
+    if alpha == 1:
+        torch.testing.assert_close(actual, -(student.log() - teacher.log()) * mask, rtol=0, atol=0)
+
+
+def test_proximal_teacher_extreme_ratios_are_finite_and_negative_reward_is_bounded():
+    trainer = object.__new__(OnPolicyDistillationTrainer)
+    trainer.cfg = config(**{"trainer.algorithm.proximal_teacher_alpha": 0.2})
+    data = TrainingInputBatch(
+        {
+            "loss_mask": torch.tensor([[1, 1, 0]]),
+            "action_log_probs": torch.tensor([[0.0, -1000.0, -4.0]]),
+            "base_action_log_probs": torch.tensor([[-1000.0, 0.0, -8.0]]),
+        }
+    )
+    actual = trainer.apply_reward_kl_penalty(data)["rewards"]
+    assert torch.isfinite(actual).all()
+    assert actual[0, 0] == pytest.approx(torch.tensor(0.8).log().item())
+    assert actual[0, 1] == pytest.approx(1000 + torch.tensor(0.2).log().item())
+    assert actual[0, 2] == 0
+
+
+@pytest.mark.parametrize("alpha", [0, -0.1, 1.1, float("nan"), float("inf")])
+def test_invalid_proximal_teacher_alpha_is_rejected(alpha):
+    with pytest.raises(ValueError, match="proximal_teacher_alpha"):
+        config(**{"trainer.algorithm.proximal_teacher_alpha": alpha})
+
+
+def test_stopd_ipw_remains_unbiased_with_proximal_teacher_rewards():
+    student = torch.linspace(0.1, 0.8, 8, dtype=torch.float64)
+    teacher = student.flip(0)
+    rewards = ((0.2 * teacher + 0.8 * student) / student).log()
+    gradients = []
+    for cutoff in [2, 4, 6, 8]:
+        mask = torch.arange(8)[None, :] < cutoff
+        stopd = STOPD(8, 2, 0, 8)
+        parameter = torch.tensor(0.0, dtype=torch.float64, requires_grad=True)
+        loss = -(parameter.exp() * rewards * stopd.weights(mask)).sum() / 8
+        gradients.append(torch.autograd.grad(loss, parameter)[0])
+    torch.testing.assert_close(torch.stack(gradients).mean(), -rewards.mean())
+
+
 def test_expected_gradient_and_token_count_match_complete_rollouts():
     lengths = torch.tensor([3, 8])
     features = torch.arange(1, 17, dtype=torch.float64).reshape(2, 8) / 16
@@ -404,8 +458,9 @@ def test_benchmark_requires_complete_finite_updates_and_native_state_restore(tmp
         summarize(tmp_path, 3)
 
 
+@pytest.mark.parametrize("alpha", [1.0, 0.2])
 @pytest.mark.parametrize("corrupt", [None, "sequences", "rollout_logprobs", "loss_mask", "advantages"])
-def test_actual_training_input_preserves_generated_prefix_and_ipw(tmp_path, corrupt):
+def test_actual_training_input_preserves_generated_prefix_and_ipw(tmp_path, corrupt, alpha):
     prompts, responses = [[10, 20], [11]], [[7, 8, 9], [5, 6, 7, 8]]
     logprobs = [[-0.1] * len(tokens) for tokens in responses]
     masks = [[1] * len(tokens) for tokens in responses]
@@ -422,7 +477,9 @@ def test_actual_training_input_preserves_generated_prefix_and_ipw(tmp_path, corr
     data.metadata = {"pad_size": 0, "policy_mini_batch_boundaries": [(0, 2)]}
     data["action_log_probs"] = data["rollout_logprobs"].clone()
     data["base_action_log_probs"] = data["action_log_probs"] + 0.1 * data["loss_mask"]
-    data["rewards"] = -(data["action_log_probs"] - data["base_action_log_probs"]) * data["loss_mask"]
+    trainer = object.__new__(OnPolicyDistillationTrainer)
+    trainer.cfg = config(**{"trainer.algorithm.proximal_teacher_alpha": alpha})
+    trainer.apply_reward_kl_penalty(data)
     data["returns"] = data["rewards"].clone()
     stopd = STOPD(8, 2, 0, 11)
     data["advantages"] = data["rewards"] * stopd.multiplier(data["loss_mask"], data["loss_mask"].sum())
@@ -438,9 +495,9 @@ def test_actual_training_input_preserves_generated_prefix_and_ipw(tmp_path, corr
     data.save(directory / "global_step_51_training_input.pkl")
     if corrupt:
         with pytest.raises((AssertionError, ValueError)):
-            validate_training_input(tmp_path, rows, stopd, 51)
+            validate_training_input(tmp_path, rows, stopd, 51, alpha)
     else:
-        assert validate_training_input(tmp_path, rows, stopd, 51) == {
+        assert validate_training_input(tmp_path, rows, stopd, 51, alpha) == {
             "rows": 2,
             "response_tokens": 7,
             "ipw_advantages_exact": True,

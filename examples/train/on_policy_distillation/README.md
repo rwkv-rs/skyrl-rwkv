@@ -80,3 +80,26 @@ end-to-end and per-stage timings. The optional
 `--continue-training` resumes the resulting STOPD checkpoint after these checks
 and at least 5% measured end-to-end acceleration. Periodic evaluation and
 checkpoint intervals then follow the original experiment configuration.
+
+## Optional proximal teacher reward
+
+[Trust Region Policy Distillation (TOP-D)](https://arxiv.org/abs/2607.04751),
+Eq. (5), replaces the immediate log-ratio reward with
+`log(alpha * p_teacher / p_old + 1 - alpha)`. Set
+`trainer.algorithm.proximal_teacher_alpha=0.2` (or the RWKV launcher's
+`PROXIMAL_TEACHER_ALPHA=0.2`) to enable this probability mixture. The default
+`1.0` preserves the original OPD computation. The implementation uses
+`logaddexp` for numerical stability and reuses the cached teacher and student
+token logprobs, requiring no additional model forward pass or checkpoint state.
+
+This option implements TOP-D's immediate reward smoothing. It composes with
+STOPD's token IPW correction. The paper's full algorithm also uses future
+returns, group normalization, and clipped updates over multiple mini-batches;
+those require separate treatment of unobserved suffixes under truncation.
+The paper's reported full-algorithm accuracy gains therefore do not describe
+this combination. Measure its quality through the experiment's evaluations.
+
+Use `--proximal-teacher-alpha 0.2` with `benchmark_stopd.py` to apply the same
+reward transformation to both full and truncated rollout arms and the resumed
+production run. The benchmark records the coefficient and verifies actual
+transformed rewards and IPW advantages before continuing training.

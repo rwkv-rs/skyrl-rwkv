@@ -56,7 +56,10 @@ def stop_baseline(pid):
     process.terminate()
     _, alive = psutil.wait_procs([process, *children], timeout=30)
     for child in alive:
-        child.kill()
+        try:
+            child.kill()
+        except psutil.NoSuchProcess:
+            pass
     psutil.wait_procs(alive, timeout=10)
 
 

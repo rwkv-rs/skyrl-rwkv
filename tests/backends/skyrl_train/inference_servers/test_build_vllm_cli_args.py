@@ -259,6 +259,26 @@ def test_resolve_policy_model_name_uses_served_model_name():
     assert resolve_policy_model_name(cfg) == "served-alias"
 
 
+@pytest.mark.parametrize("use_nora", [False, True])
+def test_fsdp_nora_serves_complete_weights_instead_of_adapter(use_nora):
+    from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+        SKYRL_LORA_ADAPTER_NAME,
+    )
+    from skyrl.backends.skyrl_train.inference_servers.utils import (
+        _uses_lora_weight_sync,
+    )
+
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "trainer.policy.model.path=rwkv-student",
+            "trainer.policy.model.lora.rank=8",
+            f"trainer.policy.model.lora.use_nora={str(use_nora).lower()}",
+        ]
+    )
+    assert _uses_lora_weight_sync(cfg) is not use_nora
+    assert resolve_policy_model_name(cfg) == ("rwkv-student" if use_nora else SKYRL_LORA_ADAPTER_NAME)
+
+
 def test_serialized_fp8_threads_the_wire_format_into_the_ignore_list(monkeypatch):
     """The engine ignore list is wire-specific, so the resolved wire must reach the spec.
 

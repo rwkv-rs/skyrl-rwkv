@@ -32,6 +32,7 @@ from vllm.distributed.weight_transfer.base import (
 
 __all__ = [
     "FsdpWeightSource",
+    "FsdpLoraWeightSource",
     "LoraAdapterWeightSource",
     "MegatronLoraAdapterSource",
     "MegatronWeightSource",
@@ -114,6 +115,25 @@ class FsdpWeightSource(WeightSource):
                 full = full.to(torch.bfloat16)
             full = full.to(self._dtype).detach().contiguous()
             yield f"{self._prefix}{key}", full
+
+
+class FsdpLoraWeightSource(FsdpWeightSource):
+    """Stream FP32-merged NoRA projections through the complete-weight transport."""
+
+    def metadata(self) -> List[ParamMeta]:
+        return [
+            ParamMeta(f"{self._prefix}{name.replace('.base_layer.', '.')}", self._dtype, tuple(param.shape))
+            for name, param in self._model.get_base_model().state_dict().items()
+            if ".lora_A." not in name and ".lora_B." not in name
+        ]
+
+    def __iter__(self) -> Iterator[Tuple[str, torch.Tensor]]:
+        from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
+            iter_merged_lora_weights,
+        )
+
+        for name, weight in iter_merged_lora_weights(self._model):
+            yield f"{self._prefix}{name}", weight.to(self._dtype).detach().contiguous()
 
 
 class MegatronWeightSource(WeightSource):

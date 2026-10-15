@@ -79,6 +79,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             lora_alpha=self.cfg.policy.model.lora.alpha,
             lora_dropout=self.cfg.policy.model.lora.dropout,
             lora_init_method=self.cfg.policy.model.lora.init_method,
+            use_nora=self.cfg.policy.model.lora.use_nora,
             target_modules=self.cfg.policy.model.lora.target_modules,
             exclude_modules=self.cfg.policy.model.lora.exclude_modules,
             sequence_parallel_size=self.cfg.policy.sequence_parallel_size,
@@ -159,7 +160,13 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
             return make_fsdp_weight_source(self.model.model, dtype, weight_prefix)
 
-        from skyrl.backends.skyrl_train.weight_sync.sources import FsdpWeightSource
+        from skyrl.backends.skyrl_train.weight_sync.sources import (
+            FsdpLoraWeightSource,
+            FsdpWeightSource,
+        )
+
+        if self.cfg.policy.model.lora.use_nora:
+            return FsdpLoraWeightSource(self.model.model, dtype, weight_prefix)
 
         return FsdpWeightSource(self.model.model, dtype, weight_prefix, rwkv_effective_bf16=self.model.is_rwkv)
 
@@ -236,7 +243,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         # Check if this is a LoRA model
         peft_model = getattr(self.model.model, "_fsdp_wrapped_module", self.model.model)
 
-        if self._is_lora:
+        if self._is_lora and not self.cfg.policy.model.lora.use_nora:
             assert hasattr(peft_model, "peft_config"), "LoRA model should have peft_config"
 
             # Multi-tenant: per-adapter subdir + per-adapter vLLM name.

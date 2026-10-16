@@ -382,6 +382,10 @@ def compare_teacher_precision(args, cfg, rank, world, emit):
         measurements = []
         wrapper_errors = []
         for row_index, row in enumerate(local_rows):
+            if worker is not None and row_index:
+                # Production unloads the frozen teacher between rollout batches.
+                worker.strategy.offload_to_cpu(worker.model, None)
+                worker.strategy.backload_to_gpu(worker.model, None)
             prompt, response = row["prompt_token_ids"], row["response_token_ids"]
             offsets = torch.linspace(0, len(response) - 1, min(64, len(response))).long()
             positions = (offsets + len(prompt) - 1).unsqueeze(0).cuda()
@@ -439,6 +443,7 @@ def compare_teacher_precision(args, cfg, rank, world, emit):
                 "top1_change_fraction": sum(sum(item["top1_changed"]) for item in flat) / delta.numel(),
                 "mean_absolute_reward_delta": reward_delta.abs().mean().item(),
                 "wrapper_max_action_logprob_error": max(wrapper_errors, default=0.0),
+                "offload_reload_cycles_per_rank": len(local_rows) - 1 if worker is not None else 0,
                 "per_sample": flat,
             },
         )

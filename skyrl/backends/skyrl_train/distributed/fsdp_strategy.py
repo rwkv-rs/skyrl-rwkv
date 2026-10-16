@@ -209,6 +209,16 @@ class FSDPStrategy(DistributedStrategy):
             param_dtype = torch.bfloat16
             reduce_dtype = torch.float32
 
+        if is_wrapped and model.is_rwkv and model.rwkv_inference_mode:
+            # Native FP16 RWKV inference uses BF16 input embeddings and their
+            # norm. Establish these dtypes before FSDP caches parameter metadata;
+            # changing .data dtype during forward breaks the next all-gather
+            # after an offload/reload cycle. Frozen groups support mixed dtypes.
+            model.model.requires_grad_(False)
+            model.model.get_input_embeddings().to(dtype=torch.bfloat16)
+            model.model.model.embedding_norm.to(dtype=torch.bfloat16)
+            param_dtype = None
+
         assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
         # RWKV inference and recurrent chunks carry FP32 WKV states between
         # decoder layers. Hidden states already follow the compute dtype.

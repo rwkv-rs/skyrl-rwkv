@@ -21,6 +21,7 @@ def reload_inference_weights(model, path):
 
     from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
         finalize_rwkv_runtime_weights,
+        load_rwkv_checkpoint_weights,
     )
 
     def weights():
@@ -30,7 +31,7 @@ def reload_inference_weights(model, path):
                 for name in names:
                     yield name, handle.get_tensor(name)
 
-    loaded = model.load_weights(weights())
+    loaded = load_rwkv_checkpoint_weights(model, weights())
     finalize_rwkv_runtime_weights(model)
     return len(loaded)
 

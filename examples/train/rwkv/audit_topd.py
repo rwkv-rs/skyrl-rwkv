@@ -217,7 +217,9 @@ def compare_conditional_kl(args, cfg, rank, world, emit):
         offsets = torch.linspace(0, len(response) - 1, min(16, len(response))).long()
         positions = (offsets + len(prompt) - 1).unsqueeze(0).to("cuda")
         ids = torch.tensor([prompt + response], device="cuda")
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        # Match HFModelWrapper: CUDA autocast would promote RWKV LayerNorm
+        # outputs to FP32 instead of retaining the FSDP compute dtype.
+        with torch.no_grad(), torch.autocast("cuda", enabled=False):
             output = model.model(
                 input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=False, logits_to_keep=positions
             )

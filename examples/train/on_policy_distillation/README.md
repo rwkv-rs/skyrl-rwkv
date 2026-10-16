@@ -49,7 +49,7 @@ bash examples/train/rwkv/run_rwkv_on_policy_distill.sh \
 ```
 
 Warmup counts completed global updates, including updates restored from a
-checkpoint. The supported configuration is synchronous, single-turn OPD with
+checkpoint. Without TOP-D, the supported configuration is synchronous, single-turn OPD with
 one response per prompt and one optimizer update per rollout batch. Sampled
 prefixes keep their actual tokens, logprobs, and action masks; no terminal token
 is appended at a sampled cutoff. Additional advantage normalization, entropy
@@ -138,16 +138,17 @@ batch size unchanged when restoring an existing dataloader checkpoint.
 group moments. Therefore, when both options are enabled, generation and the
 teacher/behavior-policy scoring pass cover complete responses up to the
 unchanged training length limit. After calculating the complete TOP-D targets,
-independent STOPD budgets select response prefixes for training. The native
-collator repacks these shorter sequences; all response tensors keep the same
-token alignment and no terminal token is inserted at a cut. Retained advantages
+independent STOPD budgets select response prefixes for the loss. Full sequence
+tensors, attention masks, and response tensors retain their original layout
+through every inner update. Retained advantages
 receive STOPD's inverse inclusion probabilities. Loss denominators remain the
 **complete** prompt-group token counts, rather than random prefix counts or
 the legacy OPD lagged token count. For a fixed policy and rollout batch, the
 expected clipped loss and gradient over budgets equal complete TOP-D.
 
-This preserves full TOP-D's target computation while reducing backward-pass
-work. It does not provide STOPD's rollout or teacher-forward speedup. Reusing
+This preserves full TOP-D's target computation and the training kernel's
+forward layout. The combined mode does not provide STOPD's compute savings;
+TOP-D still reuses the collected data across inner optimizer updates. Reusing
 the same sampled prefixes in later PPO updates follows ordinary sample reuse;
 the fixed-policy expectation identity is not an unbiasedness guarantee for an
 adaptive sequence of optimizer updates. With TOP-D disabled, existing STOPD

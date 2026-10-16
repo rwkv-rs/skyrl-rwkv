@@ -11,7 +11,7 @@ import ray
 import torch
 
 from examples.train.on_policy_distillation.stopd import STOPD, STOPDConfig, request_seed
-from examples.train.on_policy_distillation.topd import TOPDConfig, compute_topd_advantage, truncate_training_input
+from examples.train.on_policy_distillation.topd import TOPDConfig, compute_topd_advantage, mask_training_input
 from skyrl.backends.skyrl_train.inference_servers.utils import resolve_policy_model_name
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.backends.skyrl_train.utils.io import io
@@ -323,7 +323,7 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
                 # Complete-group moments stay fixed before drawing loss prefixes.
                 # Conditional on this rollout, E[I(t <= B) / P(B >= t)] = 1.
                 data["advantages"] *= self.stopd.weights(mask)
-                data = truncate_training_input(data, self.stopd.budgets(len(mask)), self.tokenizer.pad_token_id)
+                data = mask_training_input(data, self.stopd.budgets(len(mask)))
             self.all_metrics["topd/training_tokens"] = int(self._stopd_mask(data).sum())
             return data
         data = super().compute_advantages_and_returns(data)

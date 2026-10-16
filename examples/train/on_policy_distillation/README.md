@@ -116,6 +116,8 @@ returns, and advantages are computed once per rollout batch and remain fixed
 through native PPO mini-batches and `trainer.update_epochs_per_batch` epochs.
 Only student logprobs are recomputed after optimizer updates. Evaluation,
 NoRA, FlashRWKV2, and full-weight synchronization retain their native paths.
+Complete TOP-D rollouts use independent request seeds for responses in each
+group, including when STOPD is disabled.
 
 The RWKV launcher exposes a complete recipe matching the paper's group size,
 mini-batch size, clipping defaults, and proximal-teacher coefficient:

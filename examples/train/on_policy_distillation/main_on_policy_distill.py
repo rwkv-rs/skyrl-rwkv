@@ -453,16 +453,20 @@ def compute_no_op_advantage(token_level_rewards: torch.Tensor, **kwargs):
 
 class OnPolicyDistillationExp(BasePPOExp):
     def get_generator(self, cfg, tokenizer, inference_engine_client):
-        if not cfg.trainer.algorithm.stopd.enabled:
+        algorithm = cfg.trainer.algorithm
+        if not algorithm.stopd.enabled and not algorithm.topd.enabled:
             return super().get_generator(cfg, tokenizer, inference_engine_client)
+        stopd_cfg = copy.deepcopy(algorithm.stopd)
+        if not stopd_cfg.enabled:
+            stopd_cfg.seed = cfg.trainer.seed
         return STOPDGenerator(
             generator_cfg=cfg.generator,
             skyrl_gym_cfg=cfg.environment.skyrl_gym,
             inference_engine_client=inference_engine_client,
             tokenizer=tokenizer,
             policy_model_name=resolve_policy_model_name(cfg),
-            stopd_cfg=cfg.trainer.algorithm.stopd,
-            complete_rollouts=cfg.trainer.algorithm.topd.enabled,
+            stopd_cfg=stopd_cfg,
+            complete_rollouts=algorithm.topd.enabled,
         )
 
     def get_trainer(self, *args, **kwargs):

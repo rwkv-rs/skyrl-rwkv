@@ -17,7 +17,7 @@ from examples.train.on_policy_distillation.main_on_policy_distill import (
 from examples.train.on_policy_distillation.stopd import STOPD
 from examples.train.on_policy_distillation.topd import (
     compute_topd_advantage,
-    truncate_training_input,
+    mask_training_input,
 )
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.backends.skyrl_train.utils.ppo_utils import ppo_policy_loss
@@ -122,23 +122,29 @@ def test_constant_single_token_and_padding_groups_are_finite():
     torch.testing.assert_close(returns, torch.tensor([[0.0, 3.0], [0.0, 3.0], [0.0, 0.0]]))
 
 
-def test_prefix_repacking_keeps_tokens_logprobs_and_targets_aligned():
+def test_prefix_loss_mask_preserves_full_forward_layout_and_fixed_targets():
     data = batch()
     data["advantages"], data["returns"], _ = compute_topd_advantage(
         data["rewards"], data["loss_mask"], [(0, 2), (2, 4)]
     )
-    result = truncate_training_input(data, [2, 4, 4, 2], 0)
+    original = copy.deepcopy(data)
+    result = mask_training_input(data, [2, 4, 4, 2])
     for i, kept in enumerate([2, 3, 4, 2]):
         length = int(data["response_mask"][i].sum())
-        old_tokens = data["sequences"][i][data["attention_mask"][i].bool()]
-        prompt_length = len(old_tokens) - length
-        torch.testing.assert_close(
-            result["sequences"][i][result["attention_mask"][i].bool()], old_tokens[: prompt_length + kept]
-        )
-        for key in ("advantages", "returns", "action_log_probs", "base_action_log_probs", "rollout_logprobs"):
-            torch.testing.assert_close(result[key][i, -kept:], data[key][i, -length:][:kept])
-    assert result["sequences"][0, -1].item() == 11  # no synthetic EOS at the cut
-    assert result["sequences"].shape[1] < data["sequences"].shape[1]
+        expected = torch.zeros_like(result["loss_mask"][i])
+        expected[-length : result["loss_mask"].shape[1] - length + kept] = 1
+        torch.testing.assert_close(result["loss_mask"][i], expected)
+    for key in (
+        "sequences",
+        "attention_mask",
+        "response_mask",
+        "returns",
+        "action_log_probs",
+        "base_action_log_probs",
+        "rollout_logprobs",
+    ):
+        torch.testing.assert_close(result[key], original[key], rtol=0, atol=0)
+    assert (result["advantages"][~result["loss_mask"].bool()] == 0).all()
 
 
 def test_stopd_expected_clipped_loss_and_gradient_equal_complete_topd():
@@ -166,7 +172,7 @@ def test_stopd_expected_clipped_loss_and_gradient_equal_complete_topd():
         sample = copy.deepcopy(full)
         sample["advantages"] *= obj.stopd.weights(full["loss_mask"])
         sample["delta"] = delta
-        sample = truncate_training_input(sample, budgets, 0)
+        sample = mask_training_input(sample, budgets)
         obj._normalize_advantages(sample, [(0, 4)])
         current = sample["action_log_probs"] + theta * sample["delta"]
         value, _ = ppo_policy_loss(

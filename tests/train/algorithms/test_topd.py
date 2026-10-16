@@ -87,7 +87,7 @@ def batch():
 def trainer(stopd=True, **overrides):
     obj = object.__new__(OnPolicyDistillationTrainer)
     obj.cfg = config(**overrides)
-    obj.stopd = STOPD(8, 2, 0, 11, seed=42) if stopd else None
+    obj.stopd = STOPD(8, 2, 0, 11, seed=42, require_denominator=False) if stopd else None
     obj.tokenizer = SimpleNamespace(pad_token_id=0)
     obj.all_metrics = {}
     return obj
@@ -296,3 +296,25 @@ def test_resume_preserves_next_data_and_shuffle_at_epoch_boundary(tmp_path, monk
     obj.load_checkpoints()
     torch.testing.assert_close(next(iter(obj.train_dataloader)), expected, rtol=0, atol=0)
     assert obj.stopd.step == completed
+
+
+def test_topd_import_needs_no_legacy_lagged_denominator(tmp_path, monkeypatch):
+    loader = StatefulDataLoader(
+        list(range(8)), batch_size=2, shuffle=True, generator=torch.Generator().manual_seed(123)
+    )
+    next(iter(loader))
+    torch.save(loader.state_dict(), tmp_path / "data.pt")
+    obj = trainer()
+    obj.train_dataloader = StatefulDataLoader(
+        list(range(8)), batch_size=2, shuffle=True, generator=torch.Generator().manual_seed(123)
+    )
+    obj.stopd = STOPD(8, 2, 0, require_denominator=False)
+    monkeypatch.setattr(RayPPOTrainer, "load_checkpoints", lambda self: (1, str(tmp_path)))
+    obj.load_checkpoints()
+    assert obj.stopd.step == 1 and obj.stopd.denominator is None
+    metrics = obj.stopd.end_step(torch.ones(2, 4))
+    assert "denominator" not in metrics
+    assert obj.stopd.step == 2 and obj.stopd.denominator > 0
+    restored = STOPD(8, 2, 0, require_denominator=False)
+    restored.load_state_dict(obj.stopd.state_dict())
+    assert restored.state_dict() == obj.stopd.state_dict()

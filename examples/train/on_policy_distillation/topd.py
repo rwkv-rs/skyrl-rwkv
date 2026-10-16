@@ -10,9 +10,7 @@ from dataclasses import dataclass
 
 import torch
 
-from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.train.config import BaseConfig
-from skyrl.train.dataset.preprocess import convert_prompts_responses_to_batch_tensors
 
 
 @dataclass
@@ -53,39 +51,11 @@ def compute_topd_advantage(token_level_rewards, loss_mask, prompt_boundaries, ep
     return advantages, returns, counts
 
 
-def truncate_training_input(data, budgets, pad_token_id):
-    """Repack complete trajectories as prefixes after computing fixed TOP-D targets.
-
-    Reuses the native collator for token/mask layout and slices all response
-    tensors at the same token positions. No EOS is inserted at a sampled cut.
-    """
-    lengths = data["response_mask"].sum(-1).long().tolist()
-    kept = [min(length, budget) for length, budget in zip(lengths, budgets, strict=True)]
-    prompts, responses = [], []
-    for row, length, count in zip(range(len(lengths)), lengths, kept, strict=True):
-        tokens = data["sequences"][row][data["attention_mask"][row].bool()].tolist()
-        prompt_length = len(tokens) - length
-        prompts.append(tokens[:prompt_length])
-        responses.append(tokens[prompt_length : prompt_length + count])
-    tensors = convert_prompts_responses_to_batch_tensors(
-        pad_token_id, prompts, responses, [[0.0] * count for count in kept], [[1] * count for count in kept]
-    )
-    sequences, attention_mask, response_mask = tensors[:3]
-    result = {}
-    for key, value in data.items():
-        if key in ("sequences", "attention_mask", "response_mask"):
-            continue
-        if value is None:
-            result[key] = None
-            continue
-        # The supported single-turn text path has only response-aligned fields.
-        target = value.new_zeros(response_mask.shape)
-        for row, length, count in zip(range(len(lengths)), lengths, kept, strict=True):
-            if count:
-                target[row, -count:] = value[row, value.shape[1] - length : value.shape[1] - length + count]
-        result[key] = target
-    result.update(sequences=sequences, attention_mask=attention_mask, response_mask=response_mask)
-    batch = TrainingInputBatch(result)
-    batch.metadata = data.metadata.copy()
-    batch.metadata["response_length"] = response_mask.shape[1]
-    return batch
+def mask_training_input(data, budgets):
+    """Select prefix loss tokens while preserving the complete forward layout."""
+    positions = data["response_mask"].long().cumsum(-1)
+    limits = torch.tensor(budgets, device=positions.device).unsqueeze(-1)
+    prefix_mask = positions <= limits
+    data["loss_mask"] = data["loss_mask"] * prefix_mask
+    data["advantages"] = data["advantages"] * prefix_mask
+    return data

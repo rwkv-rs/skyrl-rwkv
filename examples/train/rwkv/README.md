@@ -351,8 +351,8 @@ TEACHER_MODEL="$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-
   > /tmp/results_rwkv_opd.log 2>&1
 ```
 
-Defaults: 8 colocated GPUs, eight TP1 student inference engines, BF16 training and
-teacher scoring with `wkv_mode=fp32io16`, FP16 inference, gradient checkpointing,
+Defaults: 8 colocated GPUs, eight TP1 student inference engines, BF16 student training,
+FP16 frozen-teacher scoring and inference with `wkv_mode=fp32io16`, gradient checkpointing,
 512 prompts per batch, one completion per prompt, policy mini-batch 512, per-GPU
 micro-batch 4 for training and forward passes, and AdamW LR `2e-6`.
 Each fresh rollout batch produces one optimizer
@@ -362,6 +362,26 @@ generation budget. Training sampling uses temperature `1`, top-p `1`, top-k `-1`
 and disabled penalties. Evaluation uses temperature `0.96`, top-p `0.76`, top-k `32`,
 presence penalty `1.0`, frequency penalty `0.1`, penalty decay `0.988`, and 32 samples
 per prompt.
+
+The merged AntiDoom teacher retains its exported FP16 weights. Its FSDP reference
+worker selects the native FP16 forward path and preserves FP32 recurrent states;
+the student continues to use BF16 forward/backward. `TEACHER_DTYPE=bfloat16`
+selects BF16 reference scoring for an explicit precision comparison.
+
+`MAX_GENERATE_LENGTH=16384` extends the training response horizon. With TOP-D or
+STOPD, each request is limited by the remaining space in the configured
+`generator.inference_engine.engine_init_kwargs.max_model_len=25600` context.
+The original prompt dataset is retained. STOPD samples its budget before this
+context cap, so the same inclusion probabilities apply to retained tokens.
+When changing the horizon of a resumed TOP-D run, prepare a checkpoint copy with
+the new `stopd_state.pt` `max_len` and clear its unused lagged denominator;
+preserve its step, seed, block size, and all native training state. The loader
+continues to reject a mismatched STOPD horizon.
+
+TOP-D logs `opd/full_reverse_kl_mean_estimate` and `opd/full_reward_mean_estimate`
+alongside the observed-prefix metrics. These are self-normalized inverse-probability
+estimates over the complete training response horizon, with finite-sample ratio
+estimation error. They do not measure exact full-vocabulary KL or evaluation accuracy.
 
 RWKV Rapid-Sampling uses `raw_logprobs`. The launcher selects it explicitly;
 the inference setup requires an unmodified training distribution so these equal
@@ -374,7 +394,7 @@ Training metrics, evaluation scores, and sampled trajectories are uploaded to W&
 detailed training rollout dumps are written under `$OUTPUT_ROOT/exports/dumped_rollouts`.
 `OUTPUT_ROOT` defaults to `$HOME/skyrl-rwkv-runs/$RUN_NAME`.
 
-`STUDENT_MODEL`, `TEACHER_MODEL`, `DATA_DIR`, `TRAIN_FILE`, `TEST_FILE`, `NUM_GPUS`,
+`STUDENT_MODEL`, `TEACHER_MODEL`, `TEACHER_DTYPE`, `MAX_GENERATE_LENGTH`, `DATA_DIR`, `TRAIN_FILE`, `TEST_FILE`, `NUM_GPUS`,
 `MICRO_BATCH_SIZE`, `MICRO_FORWARD_BATCH_SIZE`, `MINI_BATCH_SIZE`, `LR`, `USE_NORA`,
 `LORA_RANK`, `LORA_ALPHA`, `LOGGER`, `RUN_NAME`, and `OUTPUT_ROOT` accept environment overrides.
 Additional native config overrides are forwarded at the end of the command, for example:

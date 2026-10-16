@@ -11,6 +11,7 @@ from transformers import AutoConfig
 from skyrl.backends.skyrl_train.distributed.dispatch import WorkerOutput
 from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
 from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
+    PrecisionType,
     should_use_meta_init,
 )
 from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
@@ -398,6 +399,11 @@ class FSDPRefWorkerBase(RefWorkerBase):
             language_model_only=self.cfg.ref.language_model_only,
             logprobs_chunk_size=self.cfg.logprobs_chunk_size,
             rwkv_response_only_head=self.cfg.rwkv_response_only_head,
+            rwkv_inference_mode=(
+                model_config.model_type == "rwkv"
+                and self.cfg.ref.fsdp_config.mixed_precision is not None
+                and PrecisionType.to_dtype(self.cfg.ref.fsdp_config.mixed_precision.param_dtype) == torch.float16
+            ),
         )
         self._seq_parallel_monkey_patch(model=wrapped_model.model)
 

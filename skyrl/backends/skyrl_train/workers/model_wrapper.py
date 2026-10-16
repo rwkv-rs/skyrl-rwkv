@@ -165,6 +165,7 @@ class HFModelWrapper(nn.Module):
         packing_samples (bool, optional): Whether to pack samples during training. Defaults to False.
         temperature (float, optional): Temperature for action selection. Defaults to 1.0.
         use_liger_kernel (bool, optional): Whether to use Liger Kernel for the model. Defaults to False.
+        rwkv_inference_mode (bool, optional): Keep a frozen RWKV teacher in FP16 and use its inference kernels.
     """
 
     def __init__(
@@ -193,6 +194,7 @@ class HFModelWrapper(nn.Module):
         logprobs_chunk_size: int = 1024,
         rwkv_chunk_size: int = 0,
         rwkv_response_only_head: bool = False,
+        rwkv_inference_mode: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -201,6 +203,8 @@ class HFModelWrapper(nn.Module):
         self.attn_implementation = "flash_attention_2" if use_flash_attention_2 else "sdpa"
         self.remove_microbatch_padding = remove_microbatch_padding
         self.is_vlm = False
+        self.rwkv_inference_mode = rwkv_inference_mode
+        target_dtype = torch.float16 if rwkv_inference_mode else (torch.bfloat16 if bf16 else torch.float32)
 
         if isinstance(pretrain_or_model, str):
             if load_in_4bit:
@@ -246,7 +250,6 @@ class HFModelWrapper(nn.Module):
             if meta_init:
                 with torch.device("meta"):
                     self.model = model_class.from_config(model_config, trust_remote_code=True)
-                target_dtype = torch.bfloat16 if bf16 else torch.float32
                 # Cast just params + persistent buffers to the target dtype;
                 # leave non-persistent buffers at their init dtype. For example, transformers
                 # builds `Qwen3RotaryEmbedding.inv_freq` via a RoPE init that hardcodes
@@ -267,7 +270,7 @@ class HFModelWrapper(nn.Module):
                     config=model_config,
                     trust_remote_code=True,
                     quantization_config=nf4_config,
-                    torch_dtype=torch.bfloat16 if bf16 else torch.float32,
+                    torch_dtype=target_dtype,
                     device_map=device_map,
                 )
                 if not is_rwkv_config:
@@ -525,9 +528,9 @@ class HFModelWrapper(nn.Module):
             # RWKV's training kernels require native BF16 throughout the model.
             # CUDA autocast promotes LayerNorm to FP32, so disable an enclosing
             # trainer/ref autocast region while the recurrent model runs.  The
-            # BF16 CausalLM head is also selected by ``training=True``; RWKV has
-            # no dropout, so a reference-policy forward can temporarily use that
-            # path while remaining under the caller's no-grad context.
+            # BF16 reference path can temporarily use training mode under
+            # no_grad (RWKV has no dropout). An FP16 frozen teacher stays in
+            # eval mode so its merged adapter updates retain FP16 precision.
             was_training = self.model.training
             head_kwargs = {}
             if response_only:
@@ -541,7 +544,7 @@ class HFModelWrapper(nn.Module):
                 head_valid = offsets < response_lengths.unsqueeze(-1)
                 head_kwargs["logits_to_keep"] = head_positions
                 bucket_labels = bucket_labels.gather(1, head_positions)
-            if not was_training:
+            if not was_training and not self.rwkv_inference_mode:
                 self.model.train()
             try:
                 with torch.autocast(device_type=bucket_sequences.device.type, enabled=False):

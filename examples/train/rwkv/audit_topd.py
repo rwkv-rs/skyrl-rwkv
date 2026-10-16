@@ -132,6 +132,9 @@ def compare_learning_updates(trainer, worker, data, restore, forward, emit, rank
     these measurements are not a generalization benchmark.
     """
     original_stopd = trainer.stopd
+    original_loss_type = trainer.cfg.trainer.algorithm.policy_loss_type
+    plain_config = copy.deepcopy(trainer.cfg.trainer.algorithm)
+    plain_config.policy_loss_type = "regular"
     full = copy.deepcopy(data)
     trainer.stopd = None
     trainer.compute_advantages_and_returns(full)
@@ -157,6 +160,7 @@ def compare_learning_updates(trainer, worker, data, restore, forward, emit, rank
         trainer.compute_advantages_and_returns(observed)
         trainer._normalize_advantages(observed, boundaries)
         worker.policy_loss_fn = ppo_policy_loss if seed is None else topd_stopd_policy_loss
+        worker.cfg.algorithm.policy_loss_type = "regular" if seed is None else "topd_stopd"
         update_metrics = []
         for epoch in range(2):
             for start, end in boundaries:
@@ -171,7 +175,7 @@ def compare_learning_updates(trainer, worker, data, restore, forward, emit, rank
                 after,
                 data["action_log_probs"],
                 full_advantages,
-                trainer.cfg.trainer.algorithm,
+                plain_config,
                 loss_mask=data["loss_mask"],
             )
             delta = after - data["action_log_probs"]
@@ -193,6 +197,7 @@ def compare_learning_updates(trainer, worker, data, restore, forward, emit, rank
                 },
             )
     trainer.stopd = original_stopd
+    trainer.cfg.trainer.algorithm.policy_loss_type = original_loss_type
 
 
 def main():

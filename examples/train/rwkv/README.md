@@ -367,6 +367,10 @@ The merged AntiDoom teacher retains its exported FP16 weights. Its FSDP referenc
 worker selects the native FP16 forward path and preserves FP32 recurrent states;
 the student continues to use BF16 forward/backward. `TEACHER_DTYPE=bfloat16`
 selects BF16 reference scoring for an explicit precision comparison.
+The teacher's input embedding and its norm use the native inference BF16 dtype,
+established before FSDP wraps the frozen parameters. ChannelMix transposes are
+built after each layer's all-gather while FSDP retains ownership of parameter
+placement. These dtypes and caches remain valid across CPU offload and GPU reload.
 
 `MAX_GENERATE_LENGTH=16384` extends the training response horizon. With TOP-D or
 STOPD, each request is limited by the remaining space in the configured

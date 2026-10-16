@@ -31,14 +31,12 @@ from examples.train.on_policy_distillation.stopd import STOPD
 from examples.train.on_policy_distillation.topd import topd_stopd_policy_loss
 from examples.train.rwkv.prepare_flashrwkv2 import check
 from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
-from skyrl.backends.skyrl_train.distributed.fsdp_utils import should_use_meta_init
 from skyrl.backends.skyrl_train.utils.ppo_utils import ppo_policy_loss
 from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
     FSDPPolicyWorkerBase,
     FSDPRefWorkerBase,
 )
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
-from skyrl.backends.skyrl_train.workers.worker import RefWorkerBase
 from skyrl.train.config import MixedPrecisionConfig
 
 
@@ -230,19 +228,14 @@ def compare_conditional_kl(args, cfg, rank, world, emit):
             )
         return output.logits[0].float().log_softmax(-1).cpu()
 
-    ref_strategy = FSDPStrategy(cfg.trainer.ref.fsdp_config, seed=cfg.trainer.seed)
-    ref_strategy.setup_distributed()
-    teacher = HFModelWrapper(
-        cfg.trainer.ref.model.path,
-        bf16=True,
-        model_config_kwargs={"wkv_mode": "fp32io16"},
-        meta_init=should_use_meta_init(mesh=ref_strategy.device_mesh),
-    )
-    teacher = ref_strategy.prepare(teacher)
-    teacher.model.eval()
+    ref_worker = object.__new__(FSDPRefWorkerBase)
+    ref_worker.cfg = cfg.trainer
+    ref_worker.sequence_parallel_size = cfg.trainer.ref.sequence_parallel_size
+    ref_worker.init_model(cfg.trainer.ref.model.path)
+    teacher = ref_worker.model
     targets = [logits(teacher, row) for row in local_rows]
     emit("teacher_states", sum(len(t) for t in targets) * world)
-    del teacher, ref_strategy
+    del teacher, ref_worker
     gc.collect()
     torch.cuda.empty_cache()
     dist.barrier()
@@ -567,21 +560,13 @@ def main():
         return result.cpu()
 
     if args.mode not in ("score", "replay"):
-        ref_strategy = FSDPStrategy(cfg.trainer.ref.fsdp_config, seed=cfg.trainer.seed)
-        ref_strategy.setup_distributed()
-        reference = HFModelWrapper(
-            cfg.trainer.ref.model.path,
-            bf16=True,
-            model_config_kwargs={"wkv_mode": "fp32io16"},
-            rwkv_response_only_head=cfg.trainer.rwkv_response_only_head,
-            meta_init=should_use_meta_init(mesh=ref_strategy.device_mesh),
-        )
-        reference = ref_strategy.prepare(reference)
-        ref_worker = object.__new__(RefWorkerBase)
-        ref_worker.cfg, ref_worker.model = cfg.trainer, reference
+        ref_worker = object.__new__(FSDPRefWorkerBase)
+        ref_worker.cfg = cfg.trainer
+        ref_worker.sequence_parallel_size = cfg.trainer.ref.sequence_parallel_size
+        ref_worker.init_model(cfg.trainer.ref.model.path)
         data["base_action_log_probs"] = forward(ref_worker, data)
         emit("teacher_scored", True)
-        del ref_worker, reference, ref_strategy
+        del ref_worker
         gc.collect()
         torch.cuda.empty_cache()
         dist.barrier()

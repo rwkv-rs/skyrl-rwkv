@@ -191,6 +191,29 @@ def test_balance_rejects_mismatched_microbatch_grid():
         )
 
 
+@pytest.mark.parametrize("response_only", [False, True])
+def test_native_scoring_preserves_response_mask_for_selected_rwkv_head(response_only):
+    obj = trainer(**{"trainer.rwkv_response_only_head": response_only})
+    obj.critic_model = None
+    obj.ref_model = object()
+    obj.dispatch = MagicMock()
+    data = batch()
+    data.metadata["response_length"] = data["response_mask"].shape[1]
+    calls = []
+
+    def forward(model, scored, key, mini_batch_boundaries):
+        calls.append(model)
+        assert ("response_mask" in scored) == response_only
+        if response_only:
+            torch.testing.assert_close(scored["response_mask"], data["response_mask"], rtol=0, atol=0)
+        return torch.zeros_like(data["response_mask"])
+
+    obj._execute_forward_pass = forward
+    result = obj.fwd_logprobs_values_reward(data)
+    assert calls == ["ref", "policy"]
+    assert result["action_log_probs"].shape == result["base_action_log_probs"].shape == data["response_mask"].shape
+
+
 def test_constant_single_token_and_padding_groups_are_finite():
     rewards = torch.tensor([[0.0, 3.0], [99.0, 3.0], [float("nan"), 99.0]])
     mask = torch.tensor([[0, 1], [0, 1], [0, 0]])

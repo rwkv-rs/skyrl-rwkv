@@ -20,7 +20,21 @@ fi
 : "${NUM_GPUS:=8}"
 : "${USE_NORA:=true}"
 : "${USE_STOPD:=false}"
+: "${USE_TOPD:=false}"
 : "${PROXIMAL_TEACHER_ALPHA:=1.0}"
+: "${N_SAMPLES_PER_PROMPT:=1}"
+: "${UPDATE_EPOCHS_PER_BATCH:=1}"
+: "${POLICY_MINI_BATCH_SIZE:=${MINI_BATCH_SIZE:-512}}"
+: "${POLICY_LOSS_TYPE:=importance_sampling}"
+: "${LOSS_REDUCTION:=token_mean}"
+if [[ "$USE_TOPD" == true ]]; then
+  : "${TOPD_GROUP_SIZE:=8}"
+  N_SAMPLES_PER_PROMPT="$TOPD_GROUP_SIZE"
+  POLICY_LOSS_TYPE=regular
+  LOSS_REDUCTION=prompt_mean
+  PROXIMAL_TEACHER_ALPHA="${TOPD_ALPHA:-0.2}"
+  POLICY_MINI_BATCH_SIZE="${TOPD_MINI_BATCH_SIZE:-32}"
+fi
 : "${LIGHTEVAL_PROJECT:=$HOME/Projects/MachineLearning/lighteval-rwkv}"
 : "${LORA_RANK:=256}"
 : "${LORA_ALPHA:=$LORA_RANK}"
@@ -57,10 +71,12 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   data.train_data="['$TRAIN_FILE']" \
   data.val_data="['$TEST_FILE']" \
   trainer.algorithm.advantage_estimator=no_op \
-  trainer.algorithm.policy_loss_type=importance_sampling \
+  trainer.algorithm.policy_loss_type="$POLICY_LOSS_TYPE" \
+  trainer.algorithm.loss_reduction="$LOSS_REDUCTION" \
   trainer.algorithm.use_kl_in_reward=true \
   trainer.algorithm.use_kl_loss=false \
   trainer.algorithm.stopd.enabled="$USE_STOPD" \
+  trainer.algorithm.topd.enabled="$USE_TOPD" \
   trainer.algorithm.proximal_teacher_alpha="$PROXIMAL_TEACHER_ALPHA" \
   trainer.algorithm.lighteval.project="$LIGHTEVAL_PROJECT" \
   trainer.algorithm.lighteval.context_length=25600 \
@@ -96,9 +112,9 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   trainer.placement.ref_num_gpus_per_node="$NUM_GPUS" \
   trainer.epochs=1 \
   trainer.max_training_steps=null \
-  trainer.update_epochs_per_batch=1 \
+  trainer.update_epochs_per_batch="$UPDATE_EPOCHS_PER_BATCH" \
   trainer.train_batch_size="$MINI_BATCH_SIZE" \
-  trainer.policy_mini_batch_size="$MINI_BATCH_SIZE" \
+  trainer.policy_mini_batch_size="$POLICY_MINI_BATCH_SIZE" \
   trainer.micro_train_batch_size_per_gpu="$MICRO_BATCH_SIZE" \
   trainer.micro_forward_batch_size_per_gpu="$MICRO_FORWARD_BATCH_SIZE" \
   trainer.eval_batch_size=64 \
@@ -131,7 +147,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   generator.inference_engine.gpu_memory_utilization=0.8 \
   generator.inference_engine.max_num_seqs=128 \
   generator.batched=false \
-  generator.n_samples_per_prompt=1 \
+  generator.n_samples_per_prompt="$N_SAMPLES_PER_PROMPT" \
   generator.eval_n_samples_per_prompt=32 \
   generator.chat_template_kwargs="{rwkv_prompt_template: bot, rwkv_generation_prompt: open_think}" \
   generator.sampling_params.max_generate_length=8192 \

@@ -1,8 +1,9 @@
 """Replay saved OPD rollouts through native FSDP and an independent TOP-D loss.
 
 Run with torchrun on an idle training node. Model and Adam state are restored
-from a complete checkpoint; diagnostic updates are never saved as training
-checkpoints. The native worker and benchmark_stopd provide the execution paths.
+from a complete checkpoint. Reports and diagnostic parameter snapshots use a
+separate output directory. The native worker and benchmark_stopd provide the
+execution paths.
 """
 
 import argparse
@@ -342,7 +343,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=256)
     parser.add_argument("--mode", choices=("gradient", "control", "score", "kl", "replay"), default="gradient")
-    parser.add_argument("--scored-input", type=Path, help="Complete native TOP-D input before advantage scaling")
+    parser.add_argument("--scored-input", type=Path, help="Saved native TOP-D input before advantage scaling")
     parser.add_argument("--comparison-checkpoints", type=Path, nargs="*", default=[])
     parser.add_argument("--comparison-scales", type=float, nargs="+", default=[1.0])
     parser.add_argument("--learning-rates", type=float, nargs="+", default=[])
@@ -678,12 +679,14 @@ def main():
             after, data["action_log_probs"], data["advantages"], cfg.trainer.algorithm, loss_mask=data["loss_mask"]
         )
         exact_after, _ = reference_loss_gradient(data, after, cfg)
+        direction = compare_tensors(
+            [p - before for p, before in zip(native_parameters, initial)], [-g for g in native_gradients]
+        )
         emit(
             "native_update",
-            compare_tensors(
-                [p - before for p, before in zip(native_parameters, initial)], [-g for g in native_gradients]
-            )
-            | {
+            {
+                "delta_norm": direction["actual_norm"],
+                "negative_gradient_cosine": direction["cosine"],
                 "post_loss": native_objective.item(),
                 "post_reference_loss": exact_after,
                 "mean_abs_logprob_change": (after - data["action_log_probs"])[data["loss_mask"].bool()]

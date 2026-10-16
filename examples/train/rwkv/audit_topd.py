@@ -11,6 +11,7 @@ import gc
 import json
 import math
 import os
+import pickle
 import random
 from pathlib import Path
 from types import SimpleNamespace
@@ -200,6 +201,108 @@ def compare_learning_updates(trainer, worker, data, restore, forward, emit, rank
     trainer.cfg.trainer.algorithm.policy_loss_type = original_loss_type
 
 
+def compare_conditional_kl(args, cfg, rank, world, emit):
+    """Exact vocabulary KL on identical saved prefix states across checkpoints."""
+    rows = []
+    with args.rollouts.open() as handle:
+        for line in handle:
+            rows.append(json.loads(line))
+            if len(rows) == args.samples:
+                break
+    domains = sorted({r["env_extras"]["data_source"] for r in rows})
+    local_rows = rows[rank::world]
+
+    def logits(model, row):
+        prompt, response = row["prompt_token_ids"], row["response_token_ids"]
+        offsets = torch.linspace(0, len(response) - 1, min(16, len(response))).long()
+        positions = (offsets + len(prompt) - 1).unsqueeze(0).to("cuda")
+        ids = torch.tensor([prompt + response], device="cuda")
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            output = model.model(
+                input_ids=ids, attention_mask=torch.ones_like(ids), use_cache=False, logits_to_keep=positions
+            )
+        return output.logits[0].float().log_softmax(-1).cpu()
+
+    ref_strategy = FSDPStrategy(cfg.trainer.ref.fsdp_config, seed=cfg.trainer.seed)
+    ref_strategy.setup_distributed()
+    teacher = HFModelWrapper(
+        cfg.trainer.ref.model.path,
+        bf16=True,
+        model_config_kwargs={"wkv_mode": "fp32io16"},
+        meta_init=should_use_meta_init(mesh=ref_strategy.device_mesh),
+    )
+    teacher = ref_strategy.prepare(teacher)
+    teacher.model.eval()
+    targets = [logits(teacher, row) for row in local_rows]
+    emit("teacher_states", sum(len(t) for t in targets) * world)
+    del teacher, ref_strategy
+    gc.collect()
+    torch.cuda.empty_cache()
+    dist.barrier()
+    adapter = cfg.trainer.policy.model.lora
+    strategy = FSDPStrategy(
+        cfg.trainer.policy.fsdp_config, model_config=cfg.trainer.policy.model, seed=cfg.trainer.seed
+    )
+    strategy.setup_distributed()
+    student = HFModelWrapper(
+        cfg.trainer.policy.model.path,
+        bf16=True,
+        lora_rank=adapter.rank,
+        lora_alpha=adapter.alpha,
+        lora_dropout=0,
+        use_nora=True,
+        target_modules=adapter.target_modules,
+        model_config_kwargs={"wkv_mode": "fp32io16"},
+    )
+    student = strategy.prepare(student)
+    student.model.eval()
+    for index, checkpoint in enumerate([args.checkpoint, *args.comparison_checkpoints]):
+        for module in student.modules():
+            if isinstance(module, FSDPModule):
+                module.reshard()
+        strategy.load_checkpoint(
+            student, str(checkpoint / "policy"), load_optimizer_states=False, load_lr_scheduler_states=False
+        )
+        values = {domain: [0.0, 0.0, 0.0] for domain in domains}
+        per_sample = []
+        for row, target in zip(local_rows, targets, strict=True):
+            logp = logits(student, row)
+            probability = logp.exp()
+            kl = (probability * (logp - target)).sum(-1)
+            entropy = -(probability * logp).sum(-1)
+            item = values[row["env_extras"]["data_source"]]
+            item[0] += kl.double().sum().item()
+            item[1] += entropy.double().sum().item()
+            item[2] += len(kl)
+            per_sample.append(
+                {
+                    "trajectory_id": row["trajectory_id"],
+                    "domain": row["env_extras"]["data_source"],
+                    "reverse_kl": kl.double().mean().item(),
+                    "states": len(kl),
+                }
+            )
+        samples = [None] * world
+        dist.all_gather_object(samples, per_sample)
+        tensor = torch.tensor([values[d] for d in domains], dtype=torch.float64, device="cuda")
+        dist.all_reduce(tensor)
+        totals = tensor.sum(0).cpu()
+        emit(
+            f"checkpoint_{index}",
+            {
+                "path": str(checkpoint),
+                "states": int(totals[2]),
+                "reverse_kl": (totals[0] / totals[2]).item(),
+                "entropy": (totals[1] / totals[2]).item(),
+                "per_sample": [sample for shard in samples for sample in shard],
+                "domains": {
+                    d: {"states": int(v[2]), "reverse_kl": (v[0] / v[2]).item(), "entropy": (v[1] / v[2]).item()}
+                    for d, v in zip(domains, tensor.cpu())
+                },
+            },
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
@@ -207,7 +310,9 @@ def main():
     parser.add_argument("--rollouts", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=256)
-    parser.add_argument("--mode", choices=("gradient", "control"), default="gradient")
+    parser.add_argument("--mode", choices=("gradient", "control", "score", "kl"), default="gradient")
+    parser.add_argument("--scored-input", type=Path, help="Complete native TOP-D input before advantage scaling")
+    parser.add_argument("--comparison-checkpoints", type=Path, nargs="*", default=[])
     args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -230,6 +335,13 @@ def main():
             report[key] = value
             (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps({key: value}), flush=True)
+
+    if args.mode == "kl":
+        compare_conditional_kl(args, cfg, rank, world, emit)
+        emit("complete", True)
+        dist.barrier()
+        dist.destroy_process_group()
+        return
 
     rows = []
     pending = []
@@ -265,6 +377,12 @@ def main():
     uids = [r["env_extras"]["uuid"] for r in rows]
     assert all(uids[i] == uids[i + 1] for i in range(0, len(uids), 2))
     data = trainer.convert_to_training_input(generator_output, uids)
+    if args.mode == "score":
+        if args.scored_input is None:
+            parser.error("score requires --scored-input")
+        with args.scored_input.open("rb") as handle:
+            data = pickle.load(handle)
+        assert len(data) == args.samples
     per_rank = args.samples // world
     emit(
         "batch",
@@ -282,24 +400,25 @@ def main():
         dist.all_gather_into_tensor(result, local.contiguous())
         return result.cpu()
 
-    ref_strategy = FSDPStrategy(cfg.trainer.ref.fsdp_config, seed=cfg.trainer.seed)
-    ref_strategy.setup_distributed()
-    reference = HFModelWrapper(
-        cfg.trainer.ref.model.path,
-        bf16=True,
-        model_config_kwargs={"wkv_mode": "fp32io16"},
-        rwkv_response_only_head=cfg.trainer.rwkv_response_only_head,
-        meta_init=should_use_meta_init(mesh=ref_strategy.device_mesh),
-    )
-    reference = ref_strategy.prepare(reference)
-    ref_worker = object.__new__(RefWorkerBase)
-    ref_worker.cfg, ref_worker.model = cfg.trainer, reference
-    data["base_action_log_probs"] = forward(ref_worker, data)
-    emit("teacher_scored", True)
-    del ref_worker, reference, ref_strategy
-    gc.collect()
-    torch.cuda.empty_cache()
-    dist.barrier()
+    if args.mode != "score":
+        ref_strategy = FSDPStrategy(cfg.trainer.ref.fsdp_config, seed=cfg.trainer.seed)
+        ref_strategy.setup_distributed()
+        reference = HFModelWrapper(
+            cfg.trainer.ref.model.path,
+            bf16=True,
+            model_config_kwargs={"wkv_mode": "fp32io16"},
+            rwkv_response_only_head=cfg.trainer.rwkv_response_only_head,
+            meta_init=should_use_meta_init(mesh=ref_strategy.device_mesh),
+        )
+        reference = ref_strategy.prepare(reference)
+        ref_worker = object.__new__(RefWorkerBase)
+        ref_worker.cfg, ref_worker.model = cfg.trainer, reference
+        data["base_action_log_probs"] = forward(ref_worker, data)
+        emit("teacher_scored", True)
+        del ref_worker, reference, ref_strategy
+        gc.collect()
+        torch.cuda.empty_cache()
+        dist.barrier()
 
     strategy = FSDPStrategy(
         cfg.trainer.policy.fsdp_config,
@@ -330,7 +449,14 @@ def main():
         for module in model.modules():
             if isinstance(module, FSDPModule):
                 module.reshard()
-        strategy.load_checkpoint(model, str(args.checkpoint / "policy"), optimizer, scheduler)
+        strategy.load_checkpoint(
+            model,
+            str(args.checkpoint / "policy"),
+            optimizer,
+            scheduler,
+            load_optimizer_states=args.mode != "score",
+            load_lr_scheduler_states=args.mode != "score",
+        )
         optimizer.zero_grad(set_to_none=True)
 
     restore()
@@ -341,6 +467,49 @@ def main():
     worker.device_mesh = init_device_mesh("cuda", (world, 1), mesh_dim_names=("dp", "sp"))
     worker.policy_loss_fn = topd_stopd_policy_loss
     worker._set_expandable_segments(True)
+    if args.mode == "score":
+        after = forward(worker, data)
+        assert data["advantages"].ndim == 2, "Use the complete TOP-D arm's unscaled input"
+        trainer.stopd = None
+        trainer._normalize_advantages(data, [(0, len(data))])
+        plain = copy.deepcopy(cfg.trainer.algorithm)
+        plain.policy_loss_type = "regular"
+        before_loss, _ = ppo_policy_loss(
+            data["action_log_probs"], data["action_log_probs"], data["advantages"], plain, loss_mask=data["loss_mask"]
+        )
+        after_loss, _ = ppo_policy_loss(
+            after, data["action_log_probs"], data["advantages"], plain, loss_mask=data["loss_mask"]
+        )
+        mask = data["loss_mask"].bool()
+        delta = after - data["action_log_probs"]
+        old_kl = data["action_log_probs"] - data["base_action_log_probs"]
+        change = delta.exp() * (after - data["base_action_log_probs"] - 1) + 1 - old_kl
+        permutation = data.metadata.get("batch_permutation", range(len(data)))
+        domains = [rows[i]["env_extras"]["data_source"] for i in permutation]
+        domain_metrics = {}
+        for domain in sorted(set(domains)):
+            selected = mask & torch.tensor([d == domain for d in domains]).unsqueeze(1)
+            domain_metrics[domain] = {
+                "tokens": int(selected.sum()),
+                "conditional_kl_surrogate_change": change[selected].mean().item(),
+                "mean_abs_logprob_change": delta[selected].abs().mean().item(),
+            }
+        emit(
+            "fixed_complete_trajectory",
+            {
+                "before_loss": before_loss.item(),
+                "after_loss": after_loss.item(),
+                "improvement": before_loss.item() - after_loss.item(),
+                "conditional_kl_surrogate_change": change[mask].mean().item(),
+                "domains": domain_metrics,
+            },
+        )
+        if rank == 0:
+            torch.save(after, args.output / "after_logprobs.pt")
+        emit("complete", True)
+        dist.barrier()
+        dist.destroy_process_group()
+        return
     # With reshard_after_forward=False, a scoring forward exposes temporary
     # BF16 parameters on modules. The optimizer retains the FP32 leaf DTensors
     # receiving reduced gradients and updates; use those stable identities.

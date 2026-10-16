@@ -11,6 +11,7 @@ import ray
 import torch
 
 from examples.train.on_policy_distillation.stopd import STOPD, STOPDConfig, request_seed
+from examples.train.on_policy_distillation.topd import TOPDConfig, compute_topd_advantage, truncate_training_input
 from skyrl.backends.skyrl_train.inference_servers.utils import resolve_policy_model_name
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.backends.skyrl_train.utils.io import io
@@ -45,6 +46,7 @@ class OnPolicyDistillationAlgorithmConfig(AlgorithmConfig):
     """TOP-D probability mixture weight for the teacher; 1.0 preserves native OPD."""
     stopd: STOPDConfig = field(default_factory=STOPDConfig)
     """Optional stochastic truncation, inverse-probability weights, and lagged normalization."""
+    topd: TOPDConfig = field(default_factory=TOPDConfig)
 
     def __post_init__(self):
         if not isinstance(self.proximal_teacher_alpha, (int, float)) or not 0 < self.proximal_teacher_alpha <= 1:
@@ -55,14 +57,44 @@ OnPolicyDistillationConfig = make_config(algorithm_cls=OnPolicyDistillationAlgor
 
 
 def validate_stopd_cfg(cfg):
-    if not cfg.trainer.algorithm.stopd.enabled:
-        return
     algorithm = cfg.trainer.algorithm
     generator = cfg.generator
+    if algorithm.topd.enabled:
+        if (
+            algorithm.advantage_estimator != "no_op"
+            or algorithm.policy_loss_type != "regular"
+            or algorithm.loss_reduction != "prompt_mean"
+            or not algorithm.use_kl_in_reward
+            or algorithm.use_kl_loss
+            or algorithm.use_entropy_loss
+            or algorithm.advantage_batch_normalize
+            or generator.n_samples_per_prompt < 2
+        ):
+            raise ValueError(
+                "TOP-D requires no_op, regular PPO, prompt_mean, dense rewards, and >= 2 responses per prompt"
+            )
+        if (
+            generator.max_turns != 1
+            or generator.batched
+            or generator.step_wise_trajectories
+            or not generator.use_conversation_multi_turn
+            or generator.vision_language_generator
+            or cfg.trainer.fully_async.enabled
+            or algorithm.dynamic_sampling.type is not None
+            or generator.apply_overlong_filtering
+            or algorithm.off_policy_correction.tis_ratio_type is not None
+            or algorithm.off_policy_correction.sequence_mask_metric is not None
+            or algorithm.enable_sample_support_replay
+            or generator.inference_engine.enable_return_routed_experts
+        ):
+            raise ValueError("TOP-D requires synchronous single-turn text rollouts without filtering or replay")
+        generator.preserve_truncated_action_mask = True
+    if not cfg.trainer.algorithm.stopd.enabled:
+        return
     if generator.apply_overlong_filtering:
         raise ValueError("STOPD requires apply_overlong_filtering=false to retain sampled prefixes")
     generator.preserve_truncated_action_mask = True
-    if (
+    if not algorithm.topd.enabled and (
         algorithm.advantage_estimator != "no_op"
         or algorithm.policy_loss_type != "importance_sampling"
         or not algorithm.use_kl_in_reward
@@ -78,11 +110,16 @@ def validate_stopd_cfg(cfg):
         or generator.step_wise_trajectories
         or not generator.use_conversation_multi_turn
         or generator.vision_language_generator
-        or generator.n_samples_per_prompt != 1
         or cfg.trainer.fully_async.enabled
         or algorithm.dynamic_sampling.type is not None
-        or cfg.trainer.update_epochs_per_batch != 1
-        or cfg.trainer.policy_mini_batch_size != cfg.trainer.train_batch_size
+        or (
+            not algorithm.topd.enabled
+            and (
+                generator.n_samples_per_prompt != 1
+                or cfg.trainer.update_epochs_per_batch != 1
+                or cfg.trainer.policy_mini_batch_size != cfg.trainer.train_batch_size
+            )
+        )
     ):
         raise ValueError("STOPD requires synchronous single-turn rollouts and one optimizer step per rollout batch")
     if algorithm.stopd.block > generator.sampling_params.max_generate_length:
@@ -92,8 +129,11 @@ def validate_stopd_cfg(cfg):
 class STOPDGenerator(SkyRLGymGenerator):
     """Use native trajectory generation with independent per-request token budgets."""
 
-    def __init__(self, *args, stopd_cfg, **kwargs):
+    complete_rollouts = False
+
+    def __init__(self, *args, stopd_cfg, complete_rollouts=False, **kwargs):
         super().__init__(*args, **kwargs)
+        self.complete_rollouts = complete_rollouts
         self.stopd = STOPD(
             self.generator_cfg.sampling_params.max_generate_length,
             **{key: value for key, value in vars(stopd_cfg).items() if key != "enabled"},
@@ -104,7 +144,11 @@ class STOPDGenerator(SkyRLGymGenerator):
         if metadata.training_phase == TRAINING_PHASE_EVAL:
             return await super().generate(input_batch, disable_tqdm=disable_tqdm)
         self.stopd.step = metadata.global_step - 1
-        budgets = self.stopd.budgets(len(input_batch["prompts"]))
+        budgets = (
+            [self.stopd.max_len] * len(input_batch["prompts"])
+            if self.complete_rollouts
+            else self.stopd.budgets(len(input_batch["prompts"]))
+        )
         input_batch = {**input_batch, "env_extras": copy.deepcopy(input_batch["env_extras"])}
         for index, (extras, budget) in enumerate(zip(input_batch["env_extras"], budgets, strict=True)):
             extras["_stopd_budget"] = budget
@@ -253,6 +297,35 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
         return mask
 
     def compute_advantages_and_returns(self, data):
+        if self.cfg.trainer.algorithm.topd.enabled:
+            mask = self._stopd_mask(data)
+            advantages, returns, counts = compute_topd_advantage(
+                data["rewards"],
+                mask,
+                data.metadata["policy_prompt_boundaries"],
+                self.cfg.trainer.algorithm.topd.epsilon,
+            )
+            data["advantages"], data["returns"] = advantages, returns
+            data.metadata["topd_full_token_counts"] = counts
+            self.all_metrics.update(
+                {
+                    "topd/full_tokens": int(mask.sum()),
+                    "topd/return_mean": returns[mask].mean().item(),
+                    "topd/advantage_mean": advantages[mask].mean().item(),
+                    "topd/advantage_abs_mean": advantages[mask].abs().mean().item(),
+                    "topd/optimizer_steps_per_batch": len(data.metadata["policy_mini_batch_boundaries"])
+                    * self.cfg.trainer.update_epochs_per_batch,
+                }
+            )
+            if self.cfg.trainer.dump_data_batch:
+                self.dump_data(data, file_name=f"global_step_{self.global_step}_full_topd_input")
+            if self.stopd is not None and self.stopd.truncating:
+                # Complete-group moments stay fixed before drawing loss prefixes.
+                # Conditional on this rollout, E[I(t <= B) / P(B >= t)] = 1.
+                data["advantages"] *= self.stopd.weights(mask)
+                data = truncate_training_input(data, self.stopd.budgets(len(mask)), self.tokenizer.pad_token_id)
+            self.all_metrics["topd/training_tokens"] = int(self._stopd_mask(data).sum())
+            return data
         data = super().compute_advantages_and_returns(data)
         if self.stopd is not None and self.stopd.truncating:
             # Native token_mean divides by the complete mini-batch's loss mask
@@ -263,10 +336,24 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
             data["advantages"] = data["advantages"] * self.stopd.multiplier(mask, n_obs)
         return data
 
+    def _normalize_advantages(self, data, mini_batch_boundaries, prompt_boundaries=None):
+        if not self.cfg.trainer.algorithm.topd.enabled:
+            return super()._normalize_advantages(data, mini_batch_boundaries, prompt_boundaries)
+        # Eq. (7): mean over prompts of token means within each complete group.
+        # A random prefix token count must never enter the loss denominator.
+        normalized = torch.zeros_like(data["advantages"])
+        for start, end in mini_batch_boundaries:
+            groups = [(a, b, n) for a, b, n in data.metadata["topd_full_token_counts"] if start <= a < end]
+            for a, b, count in groups:
+                normalized[a:b] = data["advantages"][a:b] / (len(groups) * max(count, 1))
+        data["advantages"] = normalized
+        return data
+
     def train_critic_and_policy(self, data):
         status = super().train_critic_and_policy(data)
         if self.stopd is not None:
             metrics = self.stopd.end_step(self._stopd_mask(data))
+            metrics["training_prefix_only"] = int(self.cfg.trainer.algorithm.topd.enabled)
             self.all_metrics.update({f"stopd/{key}": value for key, value in metrics.items()})
         return status
 
@@ -282,11 +369,32 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
 
     def load_checkpoints(self):
         global_step, checkpoint_path = super().load_checkpoints()
-        if self.stopd is not None and checkpoint_path is not None:
+        if checkpoint_path is not None and (self.stopd is not None or self.cfg.trainer.algorithm.topd.enabled):
             # A STOPD continuation must restore the exact data position; propagate
             # a load failure rather than the native best-effort dataloader fallback.
             with io.open_file(os.path.join(checkpoint_path, "data.pt"), "rb") as handle:
-                self.train_dataloader.load_state_dict(torch.load(handle, map_location="cpu", weights_only=False))
+                dataloader_state = torch.load(handle, map_location="cpu", weights_only=False)
+            self.train_dataloader.load_state_dict(dataloader_state)
+            if "_iterator_finished" in dataloader_state:
+                # Restore the iterator now without consuming a batch. The native
+                # single-process sampler snapshot precedes the worker-seed RNG
+                # draw; loading that sampler resets the draw. Multi-process
+                # snapshots already include it in the sampler's generator state.
+                self.train_dataloader.state_dict()
+                if self.train_dataloader.num_workers == 0:
+                    torch.empty((), dtype=torch.int64).random_(generator=self.train_dataloader.generator)
+            if (
+                "_iterator_finished" in dataloader_state
+                and not dataloader_state["_iterator_finished"]
+                and global_step > 0
+                and global_step % len(self.train_dataloader) == 0
+            ):
+                # Native epoch-end saves happen just before StopIteration. Finish
+                # that iterator so the trainer's next epoch gets the next shuffle,
+                # rather than spending its first resumed epoch on an empty iterator.
+                if next(iter(self.train_dataloader), None) is not None:
+                    raise ValueError("Epoch-end checkpoint has unconsumed training batches")
+        if self.stopd is not None and checkpoint_path is not None:
             state_path = os.path.join(checkpoint_path, "stopd_state.pt")
             if io.exists(state_path):
                 with io.open_file(state_path, "rb") as handle:
@@ -321,7 +429,7 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
         rewards = rewards * loss_masks_all
         data["rewards"] = rewards
         mask = self._stopd_mask(data)
-        if self.stopd is not None and self.stopd.truncating:
+        if self.stopd is not None and self.stopd.truncating and not self.cfg.trainer.algorithm.topd.enabled:
             weights, denominator = self.stopd.weights(mask), self.stopd.denominator
         else:
             weights, denominator = mask, mask.sum().item()
@@ -352,6 +460,7 @@ class OnPolicyDistillationExp(BasePPOExp):
             tokenizer=tokenizer,
             policy_model_name=resolve_policy_model_name(cfg),
             stopd_cfg=cfg.trainer.algorithm.stopd,
+            complete_rollouts=cfg.trainer.algorithm.topd.enabled,
         )
 
     def get_trainer(self, *args, **kwargs):

@@ -389,8 +389,10 @@ def test_disabled_mode_uses_native_generator_and_masks(monkeypatch):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("phase", ["train", "eval"])
 @pytest.mark.parametrize("warmup_steps", [0, 25])
-async def test_request_budgets_and_seeds_preserve_eval_and_inputs(monkeypatch, phase, warmup_steps):
+@pytest.mark.parametrize("complete_rollouts", [False, True])
+async def test_request_budgets_and_seeds_preserve_eval_and_inputs(monkeypatch, phase, warmup_steps, complete_rollouts):
     generator = object.__new__(STOPDGenerator)
+    generator.complete_rollouts = complete_rollouts
     generator.stopd = STOPD(8, 2, warmup_steps, 11, seed=42)
     inputs, _ = prepare_generator_input(
         [
@@ -433,7 +435,7 @@ async def test_request_budgets_and_seeds_preserve_eval_and_inputs(monkeypatch, p
         assert len({row["sampling"]["seed"] for row in result}) == 32
         assert result[0]["sampling"]["seed"] == request_seed(42, 5, 0, 0, "rollout")
         assert all(row["sampling"]["max_tokens"] == row["budget"] for row in result)
-        assert {row["budget"] for row in result} == ({8} if warmup_steps else {2, 4, 6, 8})
+        assert {row["budget"] for row in result} == ({8} if warmup_steps or complete_rollouts else {2, 4, 6, 8})
 
 
 @pytest.mark.asyncio
@@ -513,6 +515,7 @@ def test_import_vanilla_checkpoint_requires_its_preceding_token_count(tmp_path, 
 
 def test_warmup_preserves_native_advantage_dtype(monkeypatch):
     trainer = object.__new__(OnPolicyDistillationTrainer)
+    trainer.cfg = config()
     trainer.stopd = STOPD(8, 2, 25)
     data = {"advantages": torch.ones(2, 3, dtype=torch.bfloat16)}
     monkeypatch.setattr(RayPPOTrainer, "compute_advantages_and_returns", lambda self, batch: batch)

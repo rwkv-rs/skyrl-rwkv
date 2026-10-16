@@ -136,6 +136,7 @@ class STOPDGenerator(SkyRLGymGenerator):
         self.complete_rollouts = complete_rollouts
         self.stopd = STOPD(
             self.generator_cfg.sampling_params.max_generate_length,
+            require_denominator=not complete_rollouts,
             **{key: value for key, value in vars(stopd_cfg).items() if key != "enabled"},
         )
 
@@ -196,6 +197,7 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
         self.stopd = (
             STOPD(
                 self.cfg.generator.sampling_params.max_generate_length,
+                require_denominator=not self.cfg.trainer.algorithm.topd.enabled,
                 **{key: value for key, value in vars(stopd_cfg).items() if key != "enabled"},
             )
             if stopd_cfg.enabled
@@ -403,7 +405,7 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
                     raise ValueError("STOPD state and trainer checkpoint steps do not match")
             else:
                 self.stopd.step = global_step
-                if self.stopd.truncating and self.stopd.denominator is None:
+                if self.stopd.require_denominator and self.stopd.truncating and self.stopd.denominator is None:
                     raise ValueError("Importing a Vanilla OPD checkpoint requires stopd.initial_denominator")
         return global_step, checkpoint_path
 

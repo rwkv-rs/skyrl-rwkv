@@ -158,7 +158,11 @@ Native checkpoints restore the model, optimizer, scheduler, RNG, and data cursor
 the existing STOPD sidecar also restores its step and budget seed. TOP-D adds
 no persistent statistics: each new batch recomputes group moments. An existing
 OPD/STOPD checkpoint can enter TOP-D without resetting the student or data
-position. `topd/full_tokens`, `topd/training_tokens`, group advantage statistics,
+position. TOP-D uses complete group token counts and needs no legacy lagged
+denominator when importing a checkpoint without STOPD state.
+Epoch-end resumes finish the saved iterator before entering the next epoch,
+preserving the next shuffle as well as mid-epoch data order.
+`topd/full_tokens`, `topd/training_tokens`, group advantage statistics,
 and `topd/optimizer_steps_per_batch` expose actual training work in the tracker.
 Keep training and evaluation lengths separate; this recipe retains the RWKV
 training response limit of 8192 and LightEval's total context budget of 25600.

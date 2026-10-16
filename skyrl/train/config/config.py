@@ -17,6 +17,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Type, TypeVar,
 
 import yaml
 from omegaconf import DictConfig, OmegaConf
+
 from skyrl_gym.envs.search.env import SearchEnvConfig
 from skyrl_gym.envs.sql.env import Text2SQLEnvConfig
 
@@ -1734,6 +1735,12 @@ class TrainerConfig(BaseConfig):
 
     Positive values checkpoint each chunk while preserving differentiable recurrent
     states across the complete sequence. This does not truncate or detach the history.
+    """
+    rwkv_response_only_head: bool = False
+    """Project only response prediction positions in the non-chunked RWKV dense head.
+
+    Keeps the complete recurrent history and its gradients. Prompt/padding logits
+    and entropy are omitted; returned response logprobs and entropy keep their layout.
     """
     vocab_entropy_chunk_size: Optional[int] = 0
     """Chunk size along the sequence dimension when computing Megatron vocab entropy.

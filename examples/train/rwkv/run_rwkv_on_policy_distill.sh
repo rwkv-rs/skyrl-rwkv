@@ -21,6 +21,8 @@ fi
 : "${USE_NORA:=true}"
 : "${USE_STOPD:=false}"
 : "${USE_TOPD:=false}"
+: "${TOPD_BALANCE_BATCH:=false}"
+: "${RWKV_RESPONSE_ONLY_HEAD:=false}"
 : "${PROXIMAL_TEACHER_ALPHA:=1.0}"
 : "${N_SAMPLES_PER_PROMPT:=1}"
 : "${UPDATE_EPOCHS_PER_BATCH:=1}"
@@ -80,6 +82,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   trainer.algorithm.use_kl_loss=false \
   trainer.algorithm.stopd.enabled="$USE_STOPD" \
   trainer.algorithm.topd.enabled="$USE_TOPD" \
+  trainer.algorithm.topd.balance_batch="$TOPD_BALANCE_BATCH" \
   trainer.algorithm.proximal_teacher_alpha="$PROXIMAL_TEACHER_ALPHA" \
   trainer.algorithm.lighteval.project="$LIGHTEVAL_PROJECT" \
   trainer.algorithm.lighteval.context_length=25600 \
@@ -104,6 +107,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   trainer.ref.sequence_parallel_size=1 \
   trainer.policy.use_torch_compile=false \
   trainer.gradient_checkpointing=true \
+  trainer.rwkv_response_only_head="$RWKV_RESPONSE_ONLY_HEAD" \
   trainer.policy.fsdp_config.fsdp_size=1 \
   trainer.policy.fsdp_config.reshard_after_forward=false \
   trainer.policy.fsdp_config.sync_gradients_each_microbatch=false \

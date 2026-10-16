@@ -16,6 +16,7 @@ from examples.train.on_policy_distillation.main_on_policy_distill import (
 )
 from examples.train.on_policy_distillation.stopd import STOPD
 from examples.train.on_policy_distillation.topd import (
+    balance_training_input,
     compute_topd_advantage,
     compute_topd_stopd_advantage,
     topd_stopd_policy_loss,
@@ -122,6 +123,72 @@ def test_returns_and_group_moments_match_independent_scalar_equations():
         ref = (values - values.mean()) / (values.std(correction=0) + 1e-6)
         torch.testing.assert_close(advantages[start:end][mask], ref)
     assert (advantages[~data["loss_mask"].bool()] == 0).all()
+
+
+def test_balance_preserves_prompt_mini_batches_signed_targets_and_gradients():
+    lengths = [80, 79, 3, 2, 70, 68, 4, 3, 60, 59, 5, 4, 50, 49, 6, 5] * 4
+    rows = len(lengths)
+    tensors = convert_prompts_responses_to_batch_tensors(
+        0,
+        [[1, 2]] * rows,
+        [[3 + i % 10] * length for i, length in enumerate(lengths)],
+        [[(t % 7 - 3) * 0.1 + i * 0.01 for t in range(length)] for i, length in enumerate(lengths)],
+        [[1] * length for length in lengths],
+    )
+    data = TrainingInputBatch(
+        dict(zip(["sequences", "attention_mask", "response_mask", "rewards", "loss_mask"], tensors[:5]))
+    )
+    data["features"] = torch.linspace(-0.7, 0.7, data["rewards"].numel()).reshape_as(data["rewards"])
+    groups = [(i, i + 2) for i in range(0, rows, 2)]
+    data.metadata = {
+        "uids": [str(i // 2) for i in range(rows)],
+        "policy_prompt_boundaries": groups,
+        "policy_mini_batch_boundaries": [(0, 32), (32, 64)],
+    }
+    original_uids = data.metadata["uids"].copy()
+    balanced, metrics = balance_training_input(data, dp_size=4, micro_batch_size=4)
+    order = balanced.metadata["batch_permutation"]
+    assert sorted(order) == list(range(rows))
+    assert data.metadata["uids"] == original_uids
+    assert metrics["perf/dense_tokens_after_balance"] < metrics["perf/dense_tokens_before_balance"]
+    assert metrics["perf/policy_rank_max_tokens_after_balance"] < metrics["perf/policy_rank_max_tokens_before_balance"]
+    for start, end in data.metadata["policy_mini_batch_boundaries"]:
+        assert set(order[start:end]) == set(range(start, end))
+    for start, end in groups:
+        assert len(set(balanced.metadata["uids"][start:end])) == 1
+    for key, value in data.items():
+        torch.testing.assert_close(balanced[key], value[order], rtol=0, atol=0)
+    targets = []
+    theta = torch.tensor(0.8, requires_grad=True)
+    losses, grads = [], []
+    for current in [data, balanced]:
+        coefficients, _, _ = compute_topd_stopd_advantage(
+            current["rewards"], current["loss_mask"], groups, 128, 16, True
+        )
+        targets.append(coefficients)
+        loss, _ = topd_stopd_policy_loss(
+            theta * current["features"],
+            torch.zeros_like(current["features"]),
+            coefficients / len(groups),
+            config().trainer.algorithm,
+            current["loss_mask"],
+        )
+        losses.append(loss)
+        grads.append(torch.autograd.grad(loss, theta)[0])
+    torch.testing.assert_close(targets[1], targets[0][order], rtol=0, atol=0)
+    torch.testing.assert_close(losses[0], losses[1])
+    torch.testing.assert_close(grads[0], grads[1])
+
+
+def test_balance_rejects_mismatched_microbatch_grid():
+    with pytest.raises(ValueError, match="balance_batch"):
+        config(
+            **{
+                "trainer.algorithm.topd.balance_batch": True,
+                "trainer.micro_train_batch_size_per_gpu": 4,
+                "trainer.micro_forward_batch_size_per_gpu": 2,
+            }
+        )
 
 
 def test_constant_single_token_and_padding_groups_are_finite():

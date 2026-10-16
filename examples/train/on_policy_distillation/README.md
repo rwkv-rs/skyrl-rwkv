@@ -179,6 +179,24 @@ and `topd/optimizer_steps_per_batch` expose actual training work in the tracker.
 Keep training and evaluation lengths separate; this recipe retains the RWKV
 training response limit of 8192 and LightEval's total context budget of 25600.
 
+For padded RWKV kernels, `trainer.algorithm.topd.balance_batch=true` sorts
+whole prompt groups by length within each existing PPO mini-batch, then balances
+equal-size microbatch units across data-parallel ranks. It preserves mini-batch
+membership, group statistics, and optimizer update counts. Behavior logprobs and
+training use the same reordered microbatches. The batch records the original row
+mapping in `batch_permutation`; `perf/dense_tokens_*` and
+`perf/policy_rank_max_tokens_*` report the change in padded work. This option
+requires fixed, equal forward/train microbatches aligned with the prompt/DP grid.
+
+`trainer.rwkv_response_only_head=true` uses the installed RWKV model's
+`logits_to_keep` API to project only response prediction positions. The full
+recurrent history and its gradients are retained. Valid response logprobs and
+entropy keep their native positions; unused prompt/padding outputs are zero.
+This applies to the non-chunked dense RWKV path; score centering retains its
+full support layout. Other model paths are unchanged. Both performance options
+are disabled by default. The RWKV launcher exposes them as
+`TOPD_BALANCE_BATCH=true RWKV_RESPONSE_ONLY_HEAD=true`.
+
 ## RWKV evaluation and metrics
 
 The RWKV launcher evaluates the synchronized student with the existing

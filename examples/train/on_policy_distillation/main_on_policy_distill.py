@@ -13,6 +13,7 @@ import torch
 from examples.train.on_policy_distillation.stopd import STOPD, STOPDConfig, request_seed
 from examples.train.on_policy_distillation.topd import (
     TOPDConfig,
+    balance_training_input,
     compute_topd_advantage,
     compute_topd_stopd_advantage,
     topd_stopd_policy_loss,
@@ -96,6 +97,22 @@ def validate_stopd_cfg(cfg):
         ):
             raise ValueError("TOP-D requires synchronous single-turn text rollouts without filtering or replay")
         generator.preserve_truncated_action_mask = True
+        if algorithm.topd.balance_batch:
+            trainer = cfg.trainer
+            dp_size = trainer.placement.policy_num_nodes * trainer.placement.policy_num_gpus_per_node
+            unit_size = math.lcm(generator.n_samples_per_prompt, trainer.micro_train_batch_size_per_gpu)
+            if (
+                trainer.strategy != "fsdp"
+                or trainer.policy.sequence_parallel_size != 1
+                or trainer.max_tokens_per_microbatch > 0
+                or trainer.micro_forward_batch_size_per_gpu != trainer.micro_train_batch_size_per_gpu
+                or trainer.train_batch_size * generator.n_samples_per_prompt % (dp_size * unit_size)
+                or trainer.policy_mini_batch_size * generator.n_samples_per_prompt % (dp_size * unit_size)
+            ):
+                raise ValueError(
+                    "TOP-D balance_batch requires FSDP without sequence parallelism, equal fixed forward/train "
+                    "microbatches, and batch/mini-batch sizes divisible by the DP prompt/microbatch grid"
+                )
     if not cfg.trainer.algorithm.stopd.enabled:
         return
     if generator.apply_overlong_filtering:
@@ -215,6 +232,15 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
             if stopd_cfg.enabled
             else None
         )
+
+    def convert_to_training_input(self, generator_output, uids):
+        data = super().convert_to_training_input(generator_output, uids)
+        if self.cfg.trainer.algorithm.topd.enabled and self.cfg.trainer.algorithm.topd.balance_batch:
+            data, metrics = balance_training_input(
+                data, self.dispatch.dp_size("policy"), self.cfg.trainer.micro_train_batch_size_per_gpu
+            )
+            self.all_metrics.update(metrics)
+        return data
 
     async def eval(self, vllm_metrics_scraper=None):
         config = self.cfg.trainer.algorithm.lighteval

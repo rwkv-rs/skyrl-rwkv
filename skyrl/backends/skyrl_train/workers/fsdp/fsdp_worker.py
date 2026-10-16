@@ -90,6 +90,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             language_model_only=self.cfg.policy.language_model_only,
             logprobs_chunk_size=self.cfg.logprobs_chunk_size,
             rwkv_chunk_size=self.cfg.rwkv_chunk_size,
+            rwkv_response_only_head=self.cfg.rwkv_response_only_head,
         )
         if (
             wrapped_model.is_rwkv
@@ -386,6 +387,7 @@ class FSDPRefWorkerBase(RefWorkerBase):
             meta_init=use_meta,
             language_model_only=self.cfg.ref.language_model_only,
             logprobs_chunk_size=self.cfg.logprobs_chunk_size,
+            rwkv_response_only_head=self.cfg.rwkv_response_only_head,
         )
         self._seq_parallel_monkey_patch(model=wrapped_model.model)
 

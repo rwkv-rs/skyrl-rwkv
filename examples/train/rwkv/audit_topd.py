@@ -341,10 +341,11 @@ def main():
     parser.add_argument("--rollouts", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=256)
-    parser.add_argument("--mode", choices=("gradient", "control", "score", "kl"), default="gradient")
+    parser.add_argument("--mode", choices=("gradient", "control", "score", "kl", "replay"), default="gradient")
     parser.add_argument("--scored-input", type=Path, help="Complete native TOP-D input before advantage scaling")
     parser.add_argument("--comparison-checkpoints", type=Path, nargs="*", default=[])
     parser.add_argument("--comparison-scales", type=float, nargs="+", default=[1.0])
+    parser.add_argument("--learning-rates", type=float, nargs="+", default=[])
     args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -409,9 +410,9 @@ def main():
     uids = [r["env_extras"]["uuid"] for r in rows]
     assert all(uids[i] == uids[i + 1] for i in range(0, len(uids), 2))
     data = trainer.convert_to_training_input(generator_output, uids)
-    if args.mode == "score":
+    if args.mode in ("score", "replay"):
         if args.scored_input is None:
-            parser.error("score requires --scored-input")
+            parser.error(f"{args.mode} requires --scored-input")
         with args.scored_input.open("rb") as handle:
             data = pickle.load(handle)
         assert len(data) == args.samples
@@ -432,7 +433,7 @@ def main():
         dist.all_gather_into_tensor(result, local.contiguous())
         return result.cpu()
 
-    if args.mode != "score":
+    if args.mode not in ("score", "replay"):
         ref_strategy = FSDPStrategy(cfg.trainer.ref.fsdp_config, seed=cfg.trainer.seed)
         ref_strategy.setup_distributed()
         reference = HFModelWrapper(
@@ -499,6 +500,40 @@ def main():
     worker.device_mesh = init_device_mesh("cuda", (world, 1), mesh_dim_names=("dp", "sp"))
     worker.policy_loss_fn = topd_stopd_policy_loss
     worker._set_expandable_segments(True)
+    if args.mode == "replay":
+        if not args.learning_rates or any(not 0 < lr < float("inf") for lr in args.learning_rates):
+            parser.error("replay requires positive finite --learning-rates")
+        if data["advantages"].ndim == 2:
+            trainer.stopd = None
+            worker.policy_loss_fn = ppo_policy_loss
+            worker.cfg.algorithm.policy_loss_type = "regular"
+        boundaries = data.metadata["policy_mini_batch_boundaries"]
+        for learning_rate in args.learning_rates:
+            restore()
+            for group in optimizer.param_groups:
+                group["lr"] = group["initial_lr"] = learning_rate
+            scheduler.base_lrs = [learning_rate] * len(optimizer.param_groups)
+            scheduler._last_lr = list(scheduler.base_lrs)
+            observed = copy.deepcopy(data)
+            trainer._normalize_advantages(observed, boundaries)
+            updates = []
+            for epoch in range(cfg.trainer.update_epochs_per_batch):
+                for start, end in boundaries:
+                    count = (end - start) // world
+                    shard = copy.deepcopy(observed[start + rank * count : start + (rank + 1) * count])
+                    metrics = worker.forward_backward(shard, return_per_token_outputs=False).metrics
+                    norm = worker.optim_step()
+                    updates.append({"epoch": epoch, "grad_norm": norm, "metrics": metrics})
+            checkpoint = args.output / f"lr_{learning_rate:g}"
+            for module in model.modules():
+                if isinstance(module, FSDPModule):
+                    module.reshard()
+            strategy.save_checkpoint(model, str(checkpoint / "policy"), rank, optimizer, scheduler)
+            emit(f"lr_{learning_rate:g}", {"checkpoint": str(checkpoint), "updates": updates})
+        emit("complete", True)
+        dist.barrier()
+        dist.destroy_process_group()
+        return
     if args.mode == "score":
         after = forward(worker, data)
         assert data["advantages"].ndim == 2, "Use the complete TOP-D arm's unscaled input"

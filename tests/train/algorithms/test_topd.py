@@ -104,6 +104,26 @@ def trainer(stopd=True, **overrides):
     return obj
 
 
+@pytest.mark.parametrize("stopd", [False, True])
+def test_full_response_metrics_recover_mean_across_all_stop_budgets(stopd):
+    obj = trainer(stopd=stopd)
+    # Enumerate every equally likely block budget, with two responses per group.
+    budgets = torch.tensor([2, 4, 6, 8]).repeat_interleave(2) if stopd else torch.full((8,), 8)
+    mask = (torch.arange(8)[None, :] < budgets[:, None]).float()
+    kl = torch.arange(1, 9).float().expand(8, -1)
+    old = torch.full_like(kl, -1)
+    data = TrainingInputBatch(
+        {"action_log_probs": old, "base_action_log_probs": old - kl, "response_mask": mask, "loss_mask": mask}
+    )
+    data.metadata = {"pad_size": 0}
+    result = obj.apply_reward_kl_penalty(data)
+    expected_reward = torch.log(0.2 * torch.exp(-kl) + 0.8)
+    torch.testing.assert_close(result["rewards"], expected_reward * mask)
+    assert obj.all_metrics["opd/reverse_kl_mean"] == pytest.approx(3.5 if stopd else 4.5)
+    assert obj.all_metrics["opd/full_reverse_kl_mean_estimate"] == pytest.approx(4.5)
+    assert obj.all_metrics["opd/full_reward_mean_estimate"] == pytest.approx(expected_reward[0].mean().item())
+
+
 def test_returns_and_group_moments_match_independent_scalar_equations():
     data = batch()
     advantages, returns, counts = compute_topd_advantage(

@@ -477,6 +477,20 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
                 / denominator,
             }
         )
+        if self.cfg.trainer.algorithm.topd.enabled:
+            # Self-normalized IPW estimates complete-response token means:
+            # later tokens have lower STOPD observation probabilities.
+            full_weights = self.stopd.weights(mask) if self.stopd is not None else mask
+            full_count = full_weights.sum().item()
+            self.all_metrics.update(
+                {
+                    "opd/full_reward_mean_estimate": (rewards * full_weights).sum().item() / full_count,
+                    "opd/full_reverse_kl_mean_estimate": ((action_log_probs - teacher_action_log_probs) * full_weights)
+                    .sum()
+                    .item()
+                    / full_count,
+                }
+            )
         return data
 
 

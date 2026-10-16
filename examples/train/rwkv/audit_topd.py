@@ -33,7 +33,10 @@ from examples.train.rwkv.prepare_flashrwkv2 import check
 from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
 from skyrl.backends.skyrl_train.distributed.fsdp_utils import should_use_meta_init
 from skyrl.backends.skyrl_train.utils.ppo_utils import ppo_policy_loss
-from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase, FSDPRefWorkerBase
+from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
+    FSDPPolicyWorkerBase,
+    FSDPRefWorkerBase,
+)
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
 from skyrl.backends.skyrl_train.workers.worker import RefWorkerBase
 from skyrl.train.config import MixedPrecisionConfig

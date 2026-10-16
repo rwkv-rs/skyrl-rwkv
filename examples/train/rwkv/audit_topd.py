@@ -11,6 +11,7 @@ import gc
 import json
 import math
 import os
+import random
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +29,7 @@ from examples.train.on_policy_distillation.topd import topd_stopd_policy_loss
 from examples.train.rwkv.prepare_flashrwkv2 import check
 from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
 from skyrl.backends.skyrl_train.distributed.fsdp_utils import should_use_meta_init
+from skyrl.backends.skyrl_train.utils.ppo_utils import ppo_policy_loss
 from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
 from skyrl.backends.skyrl_train.workers.worker import RefWorkerBase
@@ -119,6 +121,79 @@ def compare_tensors(actual, expected):
     }
 
 
+def compare_learning_updates(trainer, worker, data, restore, forward, emit, rank, world):
+    """Pair eight real Adam updates on complete trajectories and random prefixes.
+
+    Both arms retain the same computation shapes, checkpoint, Adam state, old
+    logprobs, prompts, and teacher scores. Only the loss's prefix observation
+    changes. This isolates the estimator from generation and kernel rounding.
+    The complete EOS trajectories are selected for a controlled replay, so
+    these measurements are not a generalization benchmark.
+    """
+    original_stopd = trainer.stopd
+    full = copy.deepcopy(data)
+    trainer.stopd = None
+    trainer.compute_advantages_and_returns(full)
+    trainer._normalize_advantages(full, [(0, len(full))])
+    full_advantages = full["advantages"].clone()
+    minibatch_rows = len(data) // 4
+    boundaries = [(i, i + minibatch_rows) for i in range(0, len(data), minibatch_rows)]
+    assert minibatch_rows % (world * trainer.cfg.trainer.micro_train_batch_size_per_gpu) == 0
+    groups = data.metadata["policy_prompt_boundaries"]
+    mask = data["loss_mask"].bool()
+    positions = data["response_mask"].long().cumsum(-1)
+    for name, seed in [("full_topd", None), ("stopd_seed0", 0), ("stopd_seed1", 1), ("stopd_seed2", 2)]:
+        restore()
+        observed = copy.deepcopy(data)
+        observed.metadata["policy_mini_batch_boundaries"] = boundaries
+        trainer.stopd = None if seed is None else original_stopd
+        if seed is not None:
+            rng = random.Random(seed)
+            for start, end in groups:
+                anchor = rng.randrange(original_stopd.max_len)
+                budget = min((anchor // original_stopd.block + 1) * original_stopd.block, original_stopd.max_len)
+                observed["loss_mask"][start:end] *= (positions[start:end] <= budget).to(observed["loss_mask"].dtype)
+        trainer.compute_advantages_and_returns(observed)
+        trainer._normalize_advantages(observed, boundaries)
+        worker.policy_loss_fn = ppo_policy_loss if seed is None else topd_stopd_policy_loss
+        update_metrics = []
+        for epoch in range(2):
+            for start, end in boundaries:
+                per_rank = (end - start) // world
+                shard = copy.deepcopy(observed[start + rank * per_rank : start + (rank + 1) * per_rank])
+                result = worker.forward_backward(shard, return_per_token_outputs=False)
+                norm = worker.optim_step()
+                update_metrics.append({"epoch": epoch, "grad_norm": norm, "metrics": result.metrics})
+        after = forward(worker, data)
+        if rank == 0:
+            loss, _ = ppo_policy_loss(
+                after,
+                data["action_log_probs"],
+                full_advantages,
+                trainer.cfg.trainer.algorithm,
+                loss_mask=data["loss_mask"],
+            )
+            delta = after - data["action_log_probs"]
+            ratio = delta.exp()
+            old_kl = data["action_log_probs"] - data["base_action_log_probs"]
+            # Fixed-prefix conditional-KL Monte Carlo surrogate, with a
+            # ratio-1 control variate. This does not estimate new state visits.
+            kl_change = (ratio * (after - data["base_action_log_probs"] - 1) + 1 - old_kl)[mask].mean()
+            emit(
+                name,
+                {
+                    "observed_tokens": int(observed["loss_mask"].sum()),
+                    "complete_tokens": int(mask.sum()),
+                    "full_topd_loss_after": loss.item(),
+                    "conditional_kl_surrogate_change": kl_change.item(),
+                    "linear_kl_change": (delta * old_kl)[mask].mean().item(),
+                    "mean_abs_logprob_change": delta[mask].abs().mean().item(),
+                    "updates": update_metrics,
+                },
+            )
+    trainer.stopd = original_stopd
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
@@ -126,6 +201,7 @@ def main():
     parser.add_argument("--rollouts", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=256)
+    parser.add_argument("--mode", choices=("gradient", "control"), default="gradient")
     args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     world = int(os.environ["WORLD_SIZE"])
@@ -150,9 +226,15 @@ def main():
             print(json.dumps({key: value}), flush=True)
 
     rows = []
+    pending = []
     with args.rollouts.open() as handle:
         for line in handle:
-            rows.append(json.loads(line))
+            pending.append(json.loads(line))
+            if len(pending) != 2:
+                continue
+            if args.mode != "control" or all(r["ended_with_eos"] and not r["truncated"] for r in pending):
+                rows.extend(pending)
+            pending = []
             if len(rows) == args.samples:
                 break
     assert len(rows) == args.samples
@@ -248,11 +330,31 @@ def main():
     worker.device_mesh = init_device_mesh("cuda", (world, 1), mesh_dim_names=("dp", "sp"))
     worker.policy_loss_fn = topd_stopd_policy_loss
     worker._set_expandable_segments(True)
+    # With reshard_after_forward=False, a scoring forward exposes temporary
+    # BF16 parameters on modules. The optimizer retains the FP32 leaf DTensors
+    # receiving reduced gradients and updates; use those stable identities.
+    parameters = [p for group in optimizer.param_groups for p in group["params"]]
+    parameter_names = {id(p): name for name, p in model.named_parameters()}
+    names = [parameter_names[id(p)] for p in parameters]
     data["action_log_probs"] = forward(worker, data)
+    emit(
+        "parameters_after_scoring",
+        {
+            "optimizer_parameters": len(parameters),
+            "optimizer_leaves_absent_from_module_view": len(
+                {id(p) for p in parameters} - {id(p) for p in model.parameters()}
+            ),
+        },
+    )
     trainer.apply_reward_kl_penalty(data)
+    if args.mode == "control":
+        compare_learning_updates(trainer, worker, data, restore, forward, emit, rank, world)
+        emit("complete", True)
+        dist.barrier()
+        dist.destroy_process_group()
+        return
     trainer.compute_advantages_and_returns(data)
     trainer._normalize_advantages(data, data.metadata["policy_mini_batch_boundaries"])
-    parameters = [p for p in model.parameters() if p.requires_grad]
     initial = [local_tensor(p).detach().cpu().clone() for p in parameters] if rank == 0 else None
     if rank == 0:
         torch.save(data, args.output / "scored.pt")
@@ -306,13 +408,19 @@ def main():
         status = worker.forward_backward(
             copy.deepcopy(batch[rank * per_rank : (rank + 1) * per_rank]), return_per_token_outputs=False
         )
-        assert all(p.grad is not None and torch.isfinite(local_tensor(p.grad)).all() for p in parameters)
+        missing = [name for name, p in zip(names, parameters) if p.grad is None]
+        nonfinite = [
+            name
+            for name, p in zip(names, parameters)
+            if p.grad is not None and not torch.isfinite(local_tensor(p.grad)).all()
+        ]
+        emit("gradient_presence", {"missing": missing, "nonfinite": nonfinite})
+        assert not missing and not nonfinite, (missing, nonfinite)
         return status.metrics
 
     emit("native_backward", backward(data, topd_stopd_policy_loss))
     native_gradients = [local_tensor(p.grad).detach().cpu().clone() for p in parameters] if rank == 0 else None
     if rank == 0:
-        names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
         norms = {name: gradient.double().norm().item() for name, gradient in zip(names, native_gradients)}
         emit("parameter_gradient_norms", norms)
     emit("native_grad_norm", worker.optim_step())

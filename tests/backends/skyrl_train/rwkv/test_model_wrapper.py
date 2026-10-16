@@ -488,7 +488,8 @@ def test_non_rwkv_model_keeps_direct_forward_path():
     assert torch.equal(model.calls[0][1]["attention_mask"], attention_mask)
 
 
-def test_rwkv_disables_outer_autocast_without_changing_direct_forward():
+@pytest.mark.parametrize("inference_mode", [False, True])
+def test_rwkv_disables_outer_autocast_without_changing_direct_forward(inference_mode):
     sequences = torch.tensor([[1, 2, 3]])
     attention_mask = torch.ones_like(sequences)
     rwkv_model = AutocastAwareToyCausalLM("rwkv")
@@ -497,12 +498,14 @@ def test_rwkv_disables_outer_autocast_without_changing_direct_forward():
     direct_model.eval()
 
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-        HFModelWrapper(rwkv_model)(sequences, num_actions=2, attention_mask=attention_mask)
+        HFModelWrapper(rwkv_model, rwkv_inference_mode=inference_mode)(
+            sequences, num_actions=2, attention_mask=attention_mask
+        )
         HFModelWrapper(direct_model)(sequences, num_actions=2, attention_mask=attention_mask)
 
     assert rwkv_model.autocast_states == [False]
     assert direct_model.autocast_states == [True]
-    assert rwkv_model.training_states == [True]
+    assert rwkv_model.training_states == [not inference_mode]
     assert direct_model.training_states == [False]
     assert not rwkv_model.training
 
@@ -522,7 +525,8 @@ def test_rwkv_policy_does_not_write_tokenizer_padding_into_model_config():
     assert direct_wrapper.model.config.pad_token_id == 0
 
 
-def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):
+@pytest.mark.parametrize("inference_mode", [False, True])
+def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch, inference_mode):
     config = SimpleNamespace(
         model_type="rwkv",
         vision_config=None,
@@ -549,11 +553,12 @@ def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):
         fake_from_pretrained,
     )
 
-    wrapper = HFModelWrapper("rwkv-checkpoint", bf16=False)
+    wrapper = HFModelWrapper("rwkv-checkpoint", bf16=False, rwkv_inference_mode=inference_mode)
 
     assert wrapper.is_rwkv
     assert "attn_implementation" not in captured_kwargs
     assert not hasattr(config, "_attn_implementation")
+    assert captured_kwargs["torch_dtype"] == (torch.float16 if inference_mode else torch.float32)
 
 
 @pytest.mark.parametrize(

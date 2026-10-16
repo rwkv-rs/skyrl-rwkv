@@ -14,6 +14,8 @@ fi
 
 : "${STUDENT_MODEL:=$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600}"
 : "${TEACHER_MODEL:=$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora}"
+: "${TEACHER_DTYPE:=float16}"
+: "${MAX_GENERATE_LENGTH:=8192}"
 : "${DATA_DIR:=$HOME/data/ultradata-opd}"
 : "${TRAIN_FILE:=$DATA_DIR/train.parquet}"
 : "${TEST_FILE:=$HOME/data/dapo/aime-2024-cleaned.parquet}"
@@ -113,6 +115,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   trainer.policy.fsdp_config.sync_gradients_each_microbatch=false \
   trainer.ref.fsdp_config.fsdp_size="$NUM_GPUS" \
   trainer.ref.fsdp_config.reshard_after_forward=false \
+  trainer.ref.fsdp_config.mixed_precision.param_dtype="$TEACHER_DTYPE" \
   trainer.update_ref_every_epoch=false \
   trainer.placement.colocate_all=true \
   trainer.placement.policy_num_gpus_per_node="$NUM_GPUS" \
@@ -146,6 +149,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   generator.inference_engine.router_init_kwargs.policy=round_robin \
   generator.inference_engine.engine_init_kwargs.logprobs_mode=raw_logprobs \
   generator.inference_engine.engine_init_kwargs.kv_cache_memory_bytes=2147483648 \
+  generator.inference_engine.engine_init_kwargs.max_model_len=25600 \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.num_engines="$NUM_GPUS" \
   generator.inference_engine.tensor_parallel_size=1 \
@@ -157,7 +161,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   generator.n_samples_per_prompt="$N_SAMPLES_PER_PROMPT" \
   generator.eval_n_samples_per_prompt=32 \
   generator.chat_template_kwargs="{rwkv_prompt_template: bot, rwkv_generation_prompt: open_think}" \
-  generator.sampling_params.max_generate_length=8192 \
+  generator.sampling_params.max_generate_length="$MAX_GENERATE_LENGTH" \
   generator.sampling_params.temperature=1.0 \
   generator.sampling_params.top_p=1.0 \
   generator.sampling_params.top_k=-1 \

@@ -260,13 +260,26 @@ def compare_conditional_kl(args, cfg, rank, world, emit):
     student.model.eval()
     proximal_targets = []
     alpha = cfg.trainer.algorithm.proximal_teacher_alpha
-    for index, checkpoint in enumerate([args.checkpoint, *args.comparison_checkpoints]):
+    baseline_adapters = {}
+    comparisons = [(args.checkpoint, 1.0)] + [
+        (checkpoint, scale) for checkpoint in args.comparison_checkpoints for scale in args.comparison_scales
+    ]
+    for index, (checkpoint, scale) in enumerate(comparisons):
         for module in student.modules():
             if isinstance(module, FSDPModule):
                 module.reshard()
         strategy.load_checkpoint(
             student, str(checkpoint / "policy"), load_optimizer_states=False, load_lr_scheduler_states=False
         )
+        with torch.no_grad():
+            for name, parameter in student.named_parameters():
+                if ".lora_A." not in name and ".lora_B." not in name:
+                    continue
+                value = local_tensor(parameter)
+                if index == 0:
+                    baseline_adapters[name] = value.detach().cpu().clone()
+                elif scale != 1:
+                    value.lerp_(baseline_adapters[name].to(value.device), 1 - scale)
         values = {domain: [0.0, 0.0, 0.0, 0.0] for domain in domains}
         per_sample = []
         for sample_index, (row, target) in enumerate(zip(local_rows, targets, strict=True)):
@@ -302,6 +315,7 @@ def compare_conditional_kl(args, cfg, rank, world, emit):
             f"checkpoint_{index}",
             {
                 "path": str(checkpoint),
+                "update_scale": scale,
                 "states": int(totals[2]),
                 "reverse_kl": (totals[0] / totals[2]).item(),
                 "entropy": (totals[1] / totals[2]).item(),
@@ -330,6 +344,7 @@ def main():
     parser.add_argument("--mode", choices=("gradient", "control", "score", "kl"), default="gradient")
     parser.add_argument("--scored-input", type=Path, help="Complete native TOP-D input before advantage scaling")
     parser.add_argument("--comparison-checkpoints", type=Path, nargs="*", default=[])
+    parser.add_argument("--comparison-scales", type=float, nargs="+", default=[1.0])
     args = parser.parse_args()
     rank = int(os.environ["LOCAL_RANK"])
     world = int(os.environ["WORLD_SIZE"])

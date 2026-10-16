@@ -256,6 +256,8 @@ def compare_conditional_kl(args, cfg, rank, world, emit):
     )
     student = strategy.prepare(student)
     student.model.eval()
+    proximal_targets = []
+    alpha = cfg.trainer.algorithm.proximal_teacher_alpha
     for index, checkpoint in enumerate([args.checkpoint, *args.comparison_checkpoints]):
         for module in student.modules():
             if isinstance(module, FSDPModule):
@@ -263,22 +265,29 @@ def compare_conditional_kl(args, cfg, rank, world, emit):
         strategy.load_checkpoint(
             student, str(checkpoint / "policy"), load_optimizer_states=False, load_lr_scheduler_states=False
         )
-        values = {domain: [0.0, 0.0, 0.0] for domain in domains}
+        values = {domain: [0.0, 0.0, 0.0, 0.0] for domain in domains}
         per_sample = []
-        for row, target in zip(local_rows, targets, strict=True):
+        for sample_index, (row, target) in enumerate(zip(local_rows, targets, strict=True)):
             logp = logits(student, row)
+            if index == 0:
+                proximal_targets.append(
+                    target if alpha == 1 else torch.logaddexp(target + math.log(alpha), logp + math.log1p(-alpha))
+                )
             probability = logp.exp()
             kl = (probability * (logp - target)).sum(-1)
+            proximal_kl = (probability * (logp - proximal_targets[sample_index])).sum(-1)
             entropy = -(probability * logp).sum(-1)
             item = values[row["env_extras"]["data_source"]]
             item[0] += kl.double().sum().item()
             item[1] += entropy.double().sum().item()
             item[2] += len(kl)
+            item[3] += proximal_kl.double().sum().item()
             per_sample.append(
                 {
                     "trajectory_id": row["trajectory_id"],
                     "domain": row["env_extras"]["data_source"],
                     "reverse_kl": kl.double().mean().item(),
+                    "proximal_kl": proximal_kl.double().mean().item(),
                     "states": len(kl),
                 }
             )
@@ -294,9 +303,15 @@ def compare_conditional_kl(args, cfg, rank, world, emit):
                 "states": int(totals[2]),
                 "reverse_kl": (totals[0] / totals[2]).item(),
                 "entropy": (totals[1] / totals[2]).item(),
+                "proximal_kl": (totals[3] / totals[2]).item(),
                 "per_sample": [sample for shard in samples for sample in shard],
                 "domains": {
-                    d: {"states": int(v[2]), "reverse_kl": (v[0] / v[2]).item(), "entropy": (v[1] / v[2]).item()}
+                    d: {
+                        "states": int(v[2]),
+                        "reverse_kl": (v[0] / v[2]).item(),
+                        "entropy": (v[1] / v[2]).item(),
+                        "proximal_kl": (v[3] / v[2]).item(),
+                    }
                     for d, v in zip(domains, tensor.cpu())
                 },
             },

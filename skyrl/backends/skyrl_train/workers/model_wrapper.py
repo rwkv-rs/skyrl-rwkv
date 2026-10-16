@@ -192,6 +192,7 @@ class HFModelWrapper(nn.Module):
         language_model_only: bool = False,
         logprobs_chunk_size: int = 1024,
         rwkv_chunk_size: int = 0,
+        rwkv_response_only_head: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -368,6 +369,7 @@ class HFModelWrapper(nn.Module):
 
         self.logprobs_chunk_size = logprobs_chunk_size
         self.rwkv_chunk_size = rwkv_chunk_size
+        self.rwkv_response_only_head = rwkv_response_only_head
 
         # TODO (sumanthrh): do the same for `logprobs_from_logits` and test.
         # Credits: https://www.tylerromero.com/posts/2025-02-selective-log-softmax/#efficient-solution
@@ -430,10 +432,14 @@ class HFModelWrapper(nn.Module):
         entropy_requires_grad: bool,
         sample_support: Optional[PackedSampleSupport] = None,
         enable_score_centering: bool = False,
+        response_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run independent recurrent streams without left padding."""
         batch_size, padded_length = sequences.shape
         valid_lengths = attention_mask.sum(dim=-1)
+        response_only = self.rwkv_response_only_head and not enable_score_centering
+        if response_only and response_mask is None:
+            raise ValueError("rwkv_response_only_head requires response_mask")
         log_probs = None
         entropy = None
         score_centering_train_logprobs = None
@@ -523,11 +529,23 @@ class HFModelWrapper(nn.Module):
             # no dropout, so a reference-policy forward can temporarily use that
             # path while remaining under the caller's no-grad context.
             was_training = self.model.training
+            head_kwargs = {}
+            if response_only:
+                # The target at response position t is predicted at input t-1.
+                # Retain complete recurrent inputs, selecting only the head rows.
+                response_lengths = torch.minimum(response_mask[bucket_indices].bool().sum(-1), bucket_lengths - 1)
+                head_length = max(int(response_lengths.max().item()), 1)
+                offsets = torch.arange(head_length, device=sequences.device).unsqueeze(0)
+                head_positions = (bucket_lengths - response_lengths - 1).unsqueeze(-1) + offsets
+                head_positions = torch.minimum(head_positions, (bucket_lengths - 1).unsqueeze(-1))
+                head_valid = offsets < response_lengths.unsqueeze(-1)
+                head_kwargs["logits_to_keep"] = head_positions
+                bucket_labels = bucket_labels.gather(1, head_positions)
             if not was_training:
                 self.model.train()
             try:
                 with torch.autocast(device_type=bucket_sequences.device.type, enabled=False):
-                    bucket_output = self.model(bucket_sequences)
+                    bucket_output = self.model(bucket_sequences, **head_kwargs)
             finally:
                 self.model.train(was_training)
             bucket_logits = bucket_output["logits"]
@@ -545,12 +563,18 @@ class HFModelWrapper(nn.Module):
                 bucket_labels,
                 inplace_backward=True,
             )
-            bucket_log_probs = torch.stack(
-                [
-                    nn.functional.pad(row[: int(length.item())], (padded_length - int(length.item()), 0))
-                    for row, length in zip(bucket_log_probs, bucket_lengths, strict=True)
-                ]
-            )
+            if response_only:
+                output_positions = (padded_length - bucket_lengths).unsqueeze(-1) + head_positions
+                bucket_log_probs = bucket_log_probs.new_zeros((len(bucket_indices), padded_length)).scatter_add(
+                    1, output_positions, bucket_log_probs * head_valid
+                )
+            else:
+                bucket_log_probs = torch.stack(
+                    [
+                        nn.functional.pad(row[: int(length.item())], (padded_length - int(length.item()), 0))
+                        for row, length in zip(bucket_log_probs, bucket_lengths, strict=True)
+                    ]
+                )
             if log_probs is None:
                 log_probs = bucket_log_probs.new_zeros((batch_size, padded_length))
             log_probs = log_probs.index_copy(0, bucket_indices, bucket_log_probs)
@@ -595,12 +619,17 @@ class HFModelWrapper(nn.Module):
                     attention_mask=None,
                     chunk_size=self.logprobs_chunk_size,
                 )
-                bucket_entropy = torch.stack(
-                    [
-                        nn.functional.pad(row[: int(length.item())], (padded_length - int(length.item()), 0))
-                        for row, length in zip(bucket_entropy, bucket_lengths, strict=True)
-                    ]
-                )
+                if response_only:
+                    bucket_entropy = bucket_entropy.new_zeros((len(bucket_indices), padded_length)).scatter_add(
+                        1, output_positions, bucket_entropy * head_valid
+                    )
+                else:
+                    bucket_entropy = torch.stack(
+                        [
+                            nn.functional.pad(row[: int(length.item())], (padded_length - int(length.item()), 0))
+                            for row, length in zip(bucket_entropy, bucket_lengths, strict=True)
+                        ]
+                    )
                 if entropy is None:
                     entropy = bucket_entropy.new_zeros((batch_size, padded_length))
                 entropy = entropy.index_copy(0, bucket_indices, bucket_entropy)
@@ -639,6 +668,7 @@ class HFModelWrapper(nn.Module):
         loss_mask: Optional[torch.Tensor] = None,
         enable_sample_support_replay: bool = False,
         enable_score_centering: bool = False,
+        response_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Returns action log probs"""
         if self.is_rwkv:
@@ -654,6 +684,7 @@ class HFModelWrapper(nn.Module):
                 entropy_requires_grad,
                 sample_support=sample_support,
                 enable_score_centering=enable_score_centering,
+                response_mask=response_mask,
             )
 
         has_image_inputs = pixel_values is not None or image_grid_thw is not None

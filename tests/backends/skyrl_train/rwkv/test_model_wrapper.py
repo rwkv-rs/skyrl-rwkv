@@ -112,6 +112,63 @@ class ToyRecurrentCausalLM(ToyCausalLM):
         return {"logits": self.lm_head(hidden), "past_key_values": cache}
 
 
+@pytest.mark.parametrize("distributed", [False, True])
+@pytest.mark.parametrize("entropy_requires_grad", [False, True])
+def test_rwkv_response_only_head_preserves_loss_context_gradients_and_entropy(
+    monkeypatch, distributed, entropy_requires_grad
+):
+    class SelectedHeadToyCausalLM(ToyRecurrentCausalLM):
+        def forward(self, input_ids, logits_to_keep=0):
+            self.calls.append((input_ids.detach().clone(), logits_to_keep))
+            hidden = self.embed_tokens(input_ids).cumsum(1)
+            if isinstance(logits_to_keep, torch.Tensor):
+                hidden = hidden.gather(1, logits_to_keep.unsqueeze(-1).expand(-1, -1, hidden.shape[-1]))
+            return {"logits": self.lm_head(hidden)}
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: distributed)
+    torch.manual_seed(42)
+    model = SelectedHeadToyCausalLM()
+    wrapper = HFModelWrapper(model)
+    ids = torch.tensor([[0, 0, 1, 2, 3, 4, 5, 6, 7], [0, 0, 0, 0, 8, 9, 10, 11, 12], [1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    mask = ids.ne(0)
+    response_mask = torch.tensor([[0, 0, 0, 1, 1, 1], [0, 0, 0, 0, 0, 1], [0, 0, 1, 1, 1, 1]])
+
+    def run():
+        lp, output = wrapper(
+            ids,
+            6,
+            attention_mask=mask,
+            response_mask=response_mask,
+            return_output=True,
+            compute_entropy=True,
+            entropy_requires_grad=entropy_requires_grad,
+        )
+        ent = output["entropy"][:, -7:-1]
+        loss = (-(lp * response_mask).sum() + 0.01 * (ent * response_mask).sum()) / response_mask.sum()
+        loss.backward()
+        return lp.detach(), ent.detach(), [p.grad.clone() for p in model.parameters()]
+
+    expected_lp, expected_entropy, expected_grads = run()
+    model.zero_grad(set_to_none=True)
+    model.calls.clear()
+    wrapper.rwkv_response_only_head = True
+    actual_lp, actual_entropy, actual_grads = run()
+    torch.testing.assert_close(actual_lp[response_mask.bool()], expected_lp[response_mask.bool()])
+    torch.testing.assert_close(actual_entropy[response_mask.bool()], expected_entropy[response_mask.bool()])
+    assert actual_lp[~response_mask.bool()].count_nonzero() == 0
+    for actual, expected in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    assert actual_grads[0][1].abs().sum() > 0  # Prompt history still receives gradients.
+    assert all(isinstance(selection, torch.Tensor) and selection.shape[1] <= 4 for _, selection in model.calls)
+
+
+def test_rwkv_response_only_head_requires_response_mask():
+    wrapper = HFModelWrapper(ToyCausalLM(), rwkv_response_only_head=True)
+    ids = torch.tensor([[1, 2, 3]])
+    with pytest.raises(ValueError, match="response_mask"):
+        wrapper(ids, 2, attention_mask=torch.ones_like(ids))
+
+
 def test_rwkv_infctx_preserves_cross_chunk_labels_states_and_gradients():
     model = ToyRecurrentCausalLM()
     wrapper = HFModelWrapper(model, rwkv_chunk_size=2)

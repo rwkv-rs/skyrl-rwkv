@@ -1155,6 +1155,7 @@ class PolicyWorkerBase(Worker):
                 loss_mask=loss_mask if (sample_support_replay or score_centering) else None,
                 enable_sample_support_replay=sample_support_replay,
                 enable_score_centering=score_centering,
+                response_mask=experience.response_mask,
             )
             # loss function
             # TODO: recompute advantages
@@ -1447,6 +1448,7 @@ class PolicyWorkerBase(Worker):
                 loss_mask=loss_mask if (sample_support_replay or score_centering) else None,
                 enable_sample_support_replay=sample_support_replay,
                 enable_score_centering=score_centering,
+                response_mask=experience.response_mask,
             )
             policy_loss_kwargs = {
                 "loss_mask": loss_mask,
@@ -1531,6 +1533,7 @@ class PolicyWorkerBase(Worker):
                 sample_support=micro_batch.get(SAMPLE_SUPPORT_FIELD) if sample_support_replay else None,
                 loss_mask=micro_batch.get("loss_mask") if sample_support_replay else None,
                 enable_sample_support_replay=sample_support_replay,
+                response_mask=micro_batch.get("response_mask"),
             )
         policy_logprob = policy_logprob.to("cpu")
         output = TrainingOutputBatch(
@@ -1840,6 +1843,7 @@ class RefWorkerBase(Worker):
                 sample_support=micro_batch.get(SAMPLE_SUPPORT_FIELD) if sample_support_replay else None,
                 loss_mask=micro_batch.get("loss_mask") if sample_support_replay else None,
                 enable_sample_support_replay=sample_support_replay,
+                response_mask=micro_batch.get("response_mask"),
             )
         log_probs = log_probs.to("cpu")
         output = TrainingOutputBatch(

@@ -11,6 +11,7 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 
 from examples.train.on_policy_distillation.main_on_policy_distill import (
     OnPolicyDistillationConfig,
+    OnPolicyDistillationExp,
     OnPolicyDistillationTrainer,
     validate_stopd_cfg,
 )
@@ -318,3 +319,19 @@ def test_topd_import_needs_no_legacy_lagged_denominator(tmp_path, monkeypatch):
     restored = STOPD(8, 2, 0, require_denominator=False)
     restored.load_state_dict(obj.stopd.state_dict())
     assert restored.state_dict() == obj.stopd.state_dict()
+
+
+@pytest.mark.parametrize("stopd", [False, True])
+def test_topd_uses_independent_request_seeds_with_or_without_stopd(monkeypatch, stopd):
+    cfg = config(**{"trainer.algorithm.stopd.enabled": stopd, "trainer.seed": 42, "trainer.algorithm.stopd.seed": 19})
+    captured = {}
+
+    def generator(**kwargs):
+        captured.update(kwargs)
+        return captured
+
+    monkeypatch.setattr("examples.train.on_policy_distillation.main_on_policy_distill.STOPDGenerator", generator)
+    result = object.__new__(OnPolicyDistillationExp).get_generator(cfg, None, None)
+    assert result["complete_rollouts"]
+    assert result["stopd_cfg"].seed == (19 if stopd else 42)
+    assert cfg.trainer.algorithm.stopd.seed == 19

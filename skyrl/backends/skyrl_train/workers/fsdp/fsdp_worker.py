@@ -372,6 +372,14 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
 
 
 class FSDPRefWorkerBase(RefWorkerBase):
+    @staticmethod
+    def _prepare_rwkv_inference_weights(layer, inputs):
+        # HF's FP16 path builds this transpose and then moves the original
+        # parameter to CPU. FSDP owns that parameter's storage. Prepare the same
+        # cache after FSDP's all-gather, keeping parameter placement unchanged.
+        if layer.mlp._value_runtime is None:
+            layer.mlp._value_runtime = layer.mlp.value.weight.t().contiguous()
+
     def init_model(self, model_path):
         assert self.cfg.strategy == "fsdp"
         strategy = FSDPStrategy(
@@ -409,6 +417,9 @@ class FSDPRefWorkerBase(RefWorkerBase):
 
         self.model = strategy.prepare(wrapped_model)
         self.model.eval()
+        if wrapped_model.rwkv_inference_mode:
+            for layer in self.model.model.model.layers:
+                layer.register_forward_pre_hook(self._prepare_rwkv_inference_weights)
 
         self._set_expandable_segments(True)
 

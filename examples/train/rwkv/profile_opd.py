@@ -59,6 +59,9 @@ def profile_inference(args):
     Prototype: native vLLM LLM generation and RWKV weight-sync finalization.
     This is a standalone GPU process, separate from a running training job.
     """
+    # Match run_engines_locally/vllm_v1_disable_multiproc in the OPD recipe.
+    # The diagnostic callbacks then execute locally without pickle transport.
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     from vllm import LLM, SamplingParams
 
     prompts = []

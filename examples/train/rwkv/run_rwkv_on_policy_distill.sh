@@ -158,11 +158,12 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   generator.inference_engine.engine_init_kwargs.logprobs_mode=raw_logprobs \
   generator.inference_engine.engine_init_kwargs.kv_cache_memory_bytes=2147483648 \
   generator.inference_engine.engine_init_kwargs.max_model_len=25600 \
+  generator.inference_engine.engine_init_kwargs.compilation_config='{"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}' \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.num_engines="$NUM_GPUS" \
   generator.inference_engine.tensor_parallel_size=1 \
   generator.inference_engine.weight_sync_backend=nccl \
-  generator.inference_engine.enforce_eager=true \
+  generator.inference_engine.enforce_eager=false \
   generator.inference_engine.gpu_memory_utilization=0.8 \
   generator.inference_engine.max_num_seqs=128 \
   generator.batched=false \

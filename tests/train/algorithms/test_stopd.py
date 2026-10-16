@@ -107,6 +107,8 @@ async def test_native_opd_eval_is_preserved_when_lighteval_disabled(monkeypatch)
 @pytest.mark.asyncio
 @pytest.mark.parametrize("returncode", [0, 1])
 async def test_lighteval_uses_live_pool_without_changing_training_or_stopd(monkeypatch, tmp_path, returncode):
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising=False)
+    monkeypatch.delenv("HF_DATASETS_OFFLINE", raising=False)
     trainer = object.__new__(OnPolicyDistillationTrainer)
     trainer.cfg = config(**{"trainer.algorithm.lighteval.project": "/producer"})
     trainer.cfg.trainer.export_path = str(tmp_path)
@@ -160,6 +162,8 @@ async def test_lighteval_uses_live_pool_without_changing_training_or_stopd(monke
     assert args[args.index("--url") + 1] == "http://localhost:8000"
     assert args[args.index("--context-length") + 1] == "25600"
     assert args[args.index("--num-samples") + 1] == "32"
+    assert process.call_args.kwargs["env"]["HF_HUB_OFFLINE"] == "1"
+    assert process.call_args.kwargs["env"]["HF_DATASETS_OFFLINE"] == "1"
     assert asdict(trainer.cfg) == before
 
 

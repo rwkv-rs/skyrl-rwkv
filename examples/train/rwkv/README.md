@@ -632,6 +632,20 @@ estimation error. They do not measure exact full-vocabulary KL or evaluation acc
 RWKV Rapid-Sampling uses `raw_logprobs`. The launcher selects it explicitly;
 the inference setup requires an unmodified training distribution so these equal
 the sampling logprobs used by OPD. Evaluation logprobs do not enter the loss.
+
+OPD inference uses vLLM `FULL_DECODE_ONLY` CUDA Graphs with compilation mode 0.
+Prefill remains eager, and rollout requests still return raw logprobs. Override
+`generator.inference_engine.enforce_eager=true` for an eager comparison.
+`profile_opd.py --role inference` compares fixed-length decoding on saved rollout
+prompts and checks weight replacement, restoration, and sleep/wake cycles. Pass
+`--model`, `--comparison-model`, `--rollouts`, and `--output`; use the same arguments
+with `--enforce-eager` for the control report.
+
+Prepare the native LightEval benchmark cache before starting training. Evaluation
+subprocesses default `HF_HUB_OFFLINE=1` and `HF_DATASETS_OFFLINE=1` so Hub metadata
+retries cannot stall the synchronous training loop. Explicit environment values
+take precedence; set both to 0 when preparing a previously uncached benchmark.
+The native task, prompt, extraction, and grading implementations are unchanged.
 Each engine has a 2-GiB recurrent-state cache budget and up to 128 active requests.
 The launcher advertises 32 Ray CPU resources and defaults to two OpenMP threads
 and two glibc allocator arenas per process. Existing environment values override

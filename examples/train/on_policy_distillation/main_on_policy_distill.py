@@ -300,6 +300,10 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
         # subprocess, using this project's interpreter and virtual environment.
         dependencies = Path(sys.executable).parent.parent / "rwkv-eval"
         env = os.environ | {"PYTHONPATH": f"{dependencies}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"}
+        # Benchmarks are prepared before training. Avoid Hub retries on the
+        # synchronous evaluation path when the dataset is already cached.
+        env.setdefault("HF_HUB_OFFLINE", "1")
+        env.setdefault("HF_DATASETS_OFFLINE", "1")
         if vllm_metrics_scraper is not None:
             vllm_metrics_scraper.resume()
         try:

@@ -257,6 +257,30 @@ def main():
     if rank == 0:
         torch.save(data, args.output / "scored.pt")
     emit("target_metrics", trainer.all_metrics)
+    mask = data["loss_mask"].bool()
+    response_ids = data["sequences"][:, -mask.shape[1] :]
+    positions = data["response_mask"].long().cumsum(-1)
+    coefficient = data["advantages"].sum(-1)
+    regions = {"eos": mask & (response_ids == 0), "other": mask & (response_ids != 0)}
+    regions.update(
+        {
+            f"tokens_{a}_{b}": mask & (positions > a) & (positions <= b)
+            for a, b in ((0, 128), (128, 512), (512, 2048), (2048, 4096), (4096, 8192))
+        }
+    )
+    emit(
+        "token_regions",
+        {
+            name: {
+                "tokens": int(selected.sum()),
+                "reward_mean": data["rewards"][selected].mean().item(),
+                "positive_gradient_coefficient_fraction": (coefficient[selected] > 0).float().mean().item(),
+                "absolute_coefficient_sum": coefficient[selected].abs().sum().item(),
+            }
+            for name, selected in regions.items()
+            if selected.any()
+        },
+    )
 
     if rank == 0:
         ref_loss, ref_derivative = reference_loss_gradient(data, data["action_log_probs"], cfg)
@@ -287,6 +311,10 @@ def main():
 
     emit("native_backward", backward(data, topd_stopd_policy_loss))
     native_gradients = [local_tensor(p.grad).detach().cpu().clone() for p in parameters] if rank == 0 else None
+    if rank == 0:
+        names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
+        norms = {name: gradient.double().norm().item() for name, gradient in zip(names, native_gradients)}
+        emit("parameter_gradient_norms", norms)
     emit("native_grad_norm", worker.optim_step())
     native_parameters = [local_tensor(p).detach().cpu().clone() for p in parameters] if rank == 0 else None
     after = forward(worker, data)

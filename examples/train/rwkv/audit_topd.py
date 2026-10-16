@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.fsdp import FSDPModule
 from torch.distributed.tensor import DTensor
 
 from examples.train.on_policy_distillation.main_on_policy_distill import (
@@ -319,6 +320,11 @@ def main():
     model, optimizer, scheduler = strategy.prepare((model, None, None))
 
     def restore():
+        # Scoring retains unsharded BF16 views. Restore the registered DTensor
+        # parameters before DCP copies the saved model and Adam state.
+        for module in model.modules():
+            if isinstance(module, FSDPModule):
+                module.reshard()
         strategy.load_checkpoint(model, str(args.checkpoint / "policy"), optimizer, scheduler)
         optimizer.zero_grad(set_to_none=True)
 

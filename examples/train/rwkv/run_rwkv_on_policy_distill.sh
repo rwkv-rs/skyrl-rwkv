@@ -59,6 +59,12 @@ export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 # FlashRWKV2 uses get_default_build_root() (XDG_CACHE_HOME), not TORCH_EXTENSIONS_DIR.
 export XDG_CACHE_HOME="$HOME/.cache/skyrl-rwkv"
 export TORCH_EXTENSIONS_DIR="$XDG_CACHE_HOME/torch_extensions"
+# Bound idle Ray workers and host allocator arenas on the eight-GPU node.
+if [[ -z "${RAY_OVERRIDE_RESOURCES:-}" ]]; then
+  export RAY_OVERRIDE_RESOURCES='{"CPU": 32}'
+fi
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 
 if [[ "${1:-}" == --prepare-flashrwkv2 ]]; then
   shift
@@ -98,6 +104,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   trainer.policy.model.lora.dropout=0.0 \
   trainer.policy.model.lora.target_modules="[r_proj,k_proj,v_proj,o_proj,lm_head]" \
   trainer.policy.optimizer_config.lr="$LR" \
+  trainer.policy.optimizer_config.offload_after_step=false \
   trainer.policy.optimizer_config.num_warmup_steps=0 \
   trainer.policy.optimizer_config.weight_decay=0.01 \
   trainer.policy.optimizer_config.max_grad_norm=1.0 \

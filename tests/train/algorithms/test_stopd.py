@@ -390,9 +390,14 @@ def test_disabled_mode_uses_native_generator_and_masks(monkeypatch):
 @pytest.mark.parametrize("phase", ["train", "eval"])
 @pytest.mark.parametrize("warmup_steps", [0, 25])
 @pytest.mark.parametrize("complete_rollouts", [False, True])
-async def test_request_budgets_and_seeds_preserve_eval_and_inputs(monkeypatch, phase, warmup_steps, complete_rollouts):
+@pytest.mark.parametrize("grouped_budgets", [False, True])
+async def test_request_budgets_and_seeds_preserve_eval_and_inputs(
+    monkeypatch, phase, warmup_steps, complete_rollouts, grouped_budgets
+):
     generator = object.__new__(STOPDGenerator)
     generator.complete_rollouts = complete_rollouts
+    generator.grouped_budgets = grouped_budgets
+    generator.generator_cfg = SimpleNamespace(n_samples_per_prompt=2)
     generator.stopd = STOPD(8, 2, warmup_steps, 11, seed=42)
     inputs, _ = prepare_generator_input(
         [
@@ -436,6 +441,8 @@ async def test_request_budgets_and_seeds_preserve_eval_and_inputs(monkeypatch, p
         assert result[0]["sampling"]["seed"] == request_seed(42, 5, 0, 0, "rollout")
         assert all(row["sampling"]["max_tokens"] == row["budget"] for row in result)
         assert {row["budget"] for row in result} == ({8} if warmup_steps or complete_rollouts else {2, 4, 6, 8})
+        if grouped_budgets:
+            assert all(result[i]["budget"] == result[i + 1]["budget"] for i in range(0, 32, 2))
 
 
 @pytest.mark.asyncio

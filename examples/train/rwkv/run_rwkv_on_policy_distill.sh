@@ -31,6 +31,9 @@ if [[ "$USE_TOPD" == true ]]; then
   : "${TOPD_GROUP_SIZE:=8}"
   N_SAMPLES_PER_PROMPT="$TOPD_GROUP_SIZE"
   POLICY_LOSS_TYPE=regular
+  if [[ "$USE_STOPD" == true ]]; then
+    POLICY_LOSS_TYPE=topd_stopd
+  fi
   LOSS_REDUCTION=prompt_mean
   PROXIMAL_TEACHER_ALPHA="${TOPD_ALPHA:-0.2}"
   POLICY_MINI_BATCH_SIZE="${TOPD_MINI_BATCH_SIZE:-32}"

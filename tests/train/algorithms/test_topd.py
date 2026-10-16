@@ -1,7 +1,6 @@
 """TOP-D equations, complete-group STOPD expectation, and native PPO reuse."""
 
 import copy
-import itertools
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -18,10 +17,15 @@ from examples.train.on_policy_distillation.main_on_policy_distill import (
 from examples.train.on_policy_distillation.stopd import STOPD
 from examples.train.on_policy_distillation.topd import (
     compute_topd_advantage,
-    mask_training_input,
+    compute_topd_stopd_advantage,
+    topd_stopd_policy_loss,
 )
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.backends.skyrl_train.utils.ppo_utils import ppo_policy_loss
+from skyrl.backends.skyrl_train.workers.worker_utils import (
+    BaseBatchIterator,
+    SampleBasedBatchIterator,
+)
 from skyrl.train.dataset.preprocess import convert_prompts_responses_to_batch_tensors
 from skyrl.train.trainer import RayPPOTrainer
 
@@ -31,7 +35,7 @@ def config(**overrides):
         {
             "trainer.algorithm.topd.enabled": True,
             "trainer.algorithm.advantage_estimator": "no_op",
-            "trainer.algorithm.policy_loss_type": "regular",
+            "trainer.algorithm.policy_loss_type": "topd_stopd",
             "trainer.algorithm.loss_reduction": "prompt_mean",
             "trainer.algorithm.use_kl_in_reward": True,
             "trainer.algorithm.use_kl_loss": False,
@@ -87,6 +91,11 @@ def batch():
 
 def trainer(stopd=True, **overrides):
     obj = object.__new__(OnPolicyDistillationTrainer)
+    if not stopd:
+        overrides = {
+            "trainer.algorithm.stopd.enabled": False,
+            "trainer.algorithm.policy_loss_type": "regular",
+        } | overrides
     obj.cfg = config(**overrides)
     obj.stopd = STOPD(8, 2, 0, 11, seed=42, require_denominator=False) if stopd else None
     obj.tokenizer = SimpleNamespace(pad_token_id=0)
@@ -123,70 +132,76 @@ def test_constant_single_token_and_padding_groups_are_finite():
     torch.testing.assert_close(returns, torch.tensor([[0.0, 3.0], [0.0, 3.0], [0.0, 0.0]]))
 
 
-def test_prefix_loss_mask_preserves_full_forward_layout_and_fixed_targets():
-    data = batch()
-    data["advantages"], data["returns"], _ = compute_topd_advantage(
-        data["rewards"], data["loss_mask"], [(0, 2), (2, 4)]
-    )
-    original = copy.deepcopy(data)
-    result = mask_training_input(data, [2, 4, 4, 2])
-    for i, kept in enumerate([2, 3, 4, 2]):
-        length = int(data["response_mask"][i].sum())
-        expected = torch.zeros_like(result["loss_mask"][i])
-        expected[-length : result["loss_mask"].shape[1] - length + kept] = 1
-        torch.testing.assert_close(result["loss_mask"][i], expected)
-    for key in (
-        "sequences",
-        "attention_mask",
-        "response_mask",
-        "returns",
-        "action_log_probs",
-        "base_action_log_probs",
-        "rollout_logprobs",
-    ):
-        torch.testing.assert_close(result[key], original[key], rtol=0, atol=0)
-    assert (result["advantages"][~result["loss_mask"].bool()] == 0).all()
-
-
-def test_stopd_expected_clipped_loss_and_gradient_equal_complete_topd():
+@pytest.mark.parametrize("max_len,block", [(8, 2), (8, 3), (7, 7)])
+def test_stopd_expected_clipped_loss_and_gradient_equal_complete_topd(max_len, block):
     obj = trainer()
     full = batch()
     full["advantages"], full["returns"], counts = compute_topd_advantage(
         full["rewards"], full["loss_mask"], [(0, 2), (2, 4)]
     )
-    full.metadata["topd_full_token_counts"] = counts
+    full.metadata["topd_token_counts"] = counts
     delta = torch.linspace(-0.7, 0.7, full["advantages"].numel()).reshape_as(full["advantages"])
     theta = torch.tensor(1.0, requires_grad=True)
     reference = copy.deepcopy(full)
+    obj.stopd = None
     obj._normalize_advantages(reference, [(0, 4)])
+    plain_cfg = copy.deepcopy(obj.cfg.trainer.algorithm)
+    plain_cfg.policy_loss_type = "regular"
     loss, _ = ppo_policy_loss(
         full["action_log_probs"] + theta * delta,
         full["action_log_probs"],
         reference["advantages"],
-        obj.cfg.trainer.algorithm,
+        plain_cfg,
         loss_mask=full["loss_mask"],
     )
     expected_grad = torch.autograd.grad(loss, theta)[0]
     losses, grads = [], []
-    # Exhaustive independent block-budget distribution, including EOS before cut.
-    for budgets in itertools.product([2, 4, 6, 8], repeat=4):
-        sample = copy.deepcopy(full)
-        sample["advantages"] *= obj.stopd.weights(full["loss_mask"])
-        sample["delta"] = delta
-        sample = mask_training_input(sample, budgets)
-        obj._normalize_advantages(sample, [(0, 4)])
-        current = sample["action_log_probs"] + theta * sample["delta"]
-        value, _ = ppo_policy_loss(
-            current,
-            sample["action_log_probs"],
-            sample["advantages"],
+    # Enumerate uniform integer anchors (including a partial last block).
+    # All responses in each prompt share the resulting budget.
+    for anchor in range(max_len):
+        budget = min((anchor // block + 1) * block, max_len)
+        mask = full["loss_mask"].bool() & (full["response_mask"].long().cumsum(-1) <= budget)
+        observed = full["rewards"].masked_fill(~mask, float("nan"))
+        coefficients, _, _ = compute_topd_stopd_advantage(observed, mask, [(0, 2), (2, 4)], max_len, block, True)
+        value, _ = topd_stopd_policy_loss(
+            full["action_log_probs"] + theta * delta,
+            full["action_log_probs"],
+            coefficients / 2,
             obj.cfg.trainer.algorithm,
-            loss_mask=sample["loss_mask"],
+            loss_mask=mask,
         )
         losses.append(value.detach())
         grads.append(torch.autograd.grad(value, theta)[0])
     torch.testing.assert_close(torch.stack(losses).mean(), loss.detach(), atol=2e-7, rtol=1e-5)
     torch.testing.assert_close(torch.stack(grads).mean(), expected_grad, atol=2e-7, rtol=1e-5)
+
+
+def test_stopd_warmup_matches_full_topd_without_randomization():
+    data = batch()
+    mask = data["loss_mask"].bool()
+    groups = [(0, 2), (2, 4)]
+    advantage, returns, counts = compute_topd_advantage(data["rewards"], mask, groups)
+    coefficients, actual_returns, actual_counts = compute_topd_stopd_advantage(
+        data["rewards"], mask, groups, 8, 2, False
+    )
+    for start, end, count in counts:
+        torch.testing.assert_close(coefficients[start:end, :, 0], advantage[start:end].clamp_min(0) / count)
+        torch.testing.assert_close(coefficients[start:end, :, 1], advantage[start:end].clamp_max(0) / count)
+    torch.testing.assert_close(actual_returns, returns)
+    assert actual_counts == counts
+
+
+def test_signed_targets_survive_native_microbatch_and_experience_conversion():
+    obj = trainer()
+    data = obj.compute_advantages_and_returns(batch())
+    data.metadata["response_length"] = data["loss_mask"].shape[1]
+    obj._normalize_advantages(data, [(0, 2), (2, 4)])
+    chunks = list(SampleBasedBatchIterator(data, sample_batch_size=1))
+    assert len(chunks) == 4
+    for index, chunk in enumerate(chunks):
+        experience = BaseBatchIterator.batch_to_experience(chunk)
+        torch.testing.assert_close(experience.advantages, data["advantages"][index : index + 1])
+        assert experience.advantages.shape[-1] == 2
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -205,8 +220,10 @@ def test_native_inner_updates_reuse_fixed_targets_and_advance_stopd_once(monkeyp
     deltas, clip_ratios = [], []
 
     def forward_backward(model, chunk):
-        delta = parameter * chunk["advantages"].sign()
-        value, metrics = ppo_policy_loss(
+        direction = chunk["advantages"].sum(-1) if enabled else chunk["advantages"]
+        delta = parameter * direction.sign()
+        loss_fn = topd_stopd_policy_loss if enabled else ppo_policy_loss
+        value, metrics = loss_fn(
             chunk["action_log_probs"] + delta,
             chunk["action_log_probs"],
             chunk["advantages"],
@@ -323,7 +340,14 @@ def test_topd_import_needs_no_legacy_lagged_denominator(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("stopd", [False, True])
 def test_topd_uses_independent_request_seeds_with_or_without_stopd(monkeypatch, stopd):
-    cfg = config(**{"trainer.algorithm.stopd.enabled": stopd, "trainer.seed": 42, "trainer.algorithm.stopd.seed": 19})
+    cfg = config(
+        **{
+            "trainer.algorithm.stopd.enabled": stopd,
+            "trainer.algorithm.policy_loss_type": "topd_stopd" if stopd else "regular",
+            "trainer.seed": 42,
+            "trainer.algorithm.stopd.seed": 19,
+        }
+    )
     captured = {}
 
     def generator(**kwargs):
@@ -332,6 +356,7 @@ def test_topd_uses_independent_request_seeds_with_or_without_stopd(monkeypatch, 
 
     monkeypatch.setattr("examples.train.on_policy_distillation.main_on_policy_distill.STOPDGenerator", generator)
     result = object.__new__(OnPolicyDistillationExp).get_generator(cfg, None, None)
-    assert result["complete_rollouts"]
+    assert result["complete_rollouts"] == (not stopd)
+    assert result["grouped_budgets"] == stopd
     assert result["stopd_cfg"].seed == (19 if stopd else 42)
     assert cfg.trainer.algorithm.stopd.seed == 19

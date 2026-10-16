@@ -446,6 +446,34 @@ async def test_request_budgets_and_seeds_preserve_eval_and_inputs(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("prompt_length,budget,expected", [(3, 8, 8), (7, 8, 5), (7, 4, 4), (12, 8, None)])
+async def test_stopd_context_cap_preserves_prompt_and_sampling(monkeypatch, prompt_length, budget, expected):
+    generator = object.__new__(STOPDGenerator)
+    generator.context_length = 12
+    generator.generator_cfg = SimpleNamespace(chat_template_kwargs={"rwkv_prompt_template": "bot"})
+    generator.tokenizer = MagicMock()
+    generator.tokenizer.apply_chat_template.return_value = list(range(prompt_length))
+    native = AsyncMock(return_value="result")
+    monkeypatch.setattr(SkyRLGymGenerator, "agent_loop", native)
+    prompt = [{"role": "user", "content": "question"}]
+    call = generator.agent_loop(
+        prompt, "aime", {"_stopd_budget": budget, "_stopd_seed": 42}, 8, 11, sampling_params={"temperature": 1}
+    )
+    if expected is None:
+        with pytest.raises(ValueError, match="consumes"):
+            await call
+        native.assert_not_awaited()
+    else:
+        assert await call == "result"
+        assert native.call_args.args[0] is prompt
+        assert native.call_args.args[3] == expected
+        assert native.call_args.kwargs["sampling_params"] == {"max_tokens": expected, "seed": 42, "temperature": 1}
+        generator.tokenizer.apply_chat_template.assert_called_once_with(
+            prompt, add_generation_prompt=True, tokenize=True, return_dict=False, rwkv_prompt_template="bot"
+        )
+
+
+@pytest.mark.asyncio
 async def test_forced_cut_retains_exact_sampled_tokens_logprobs_and_masks(monkeypatch):
     cfg = config()
     tokenizer = MagicMock()

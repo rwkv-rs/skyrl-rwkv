@@ -155,11 +155,13 @@ class STOPDGenerator(SkyRLGymGenerator):
 
     complete_rollouts = False
     grouped_budgets = False
+    context_length = None
 
     def __init__(self, *args, stopd_cfg, complete_rollouts=False, grouped_budgets=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.complete_rollouts = complete_rollouts
         self.grouped_budgets = grouped_budgets
+        self.context_length = self.generator_cfg.inference_engine.engine_init_kwargs.get("max_model_len")
         self.stopd = STOPD(
             self.generator_cfg.sampling_params.max_generate_length,
             require_denominator=not (complete_rollouts or grouped_budgets),
@@ -199,6 +201,20 @@ class STOPDGenerator(SkyRLGymGenerator):
     ):
         if training_phase != TRAINING_PHASE_EVAL:
             max_tokens = env_extras.pop("_stopd_budget")
+            if self.context_length is not None:
+                prompt_ids = self.tokenizer.apply_chat_template(
+                    prompt,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_dict=False,
+                    **self.generator_cfg.chat_template_kwargs,
+                )
+                remaining = self.context_length - len(prompt_ids)
+                if remaining < 1:
+                    raise ValueError("OPD prompt consumes the configured model context")
+                # Clip the sampled budget, keeping its original distribution and
+                # IPW probabilities for every token that fits the full context.
+                max_tokens = min(max_tokens, remaining)
             sampling_params = {**sampling_params, "max_tokens": max_tokens, "seed": env_extras.pop("_stopd_seed")}
         return await super().agent_loop(
             prompt,

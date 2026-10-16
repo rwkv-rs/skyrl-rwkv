@@ -33,9 +33,10 @@ from examples.train.rwkv.prepare_flashrwkv2 import check
 from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
 from skyrl.backends.skyrl_train.distributed.fsdp_utils import should_use_meta_init
 from skyrl.backends.skyrl_train.utils.ppo_utils import ppo_policy_loss
-from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase
+from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase, FSDPRefWorkerBase
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
 from skyrl.backends.skyrl_train.workers.worker import RefWorkerBase
+from skyrl.train.config import MixedPrecisionConfig
 
 
 def reference_loss_gradient(data, log_probs, config):
@@ -350,9 +351,16 @@ def compare_teacher_precision(args, cfg, rank, world, emit):
     local_rows = rows[rank::world]
     adapter_config = json.loads((args.teacher_adapter / "adapter_config.json").read_text())
     targets = []
-    variants = ("merged_fp16", "rounded_fp16", "merged_bf16", "unmerged_nora")
+    variants = args.precision_variants
     for variant in variants:
-        if variant == "unmerged_nora":
+        worker = None
+        if variant == "native_fp16":
+            cfg.trainer.ref.fsdp_config.mixed_precision = MixedPrecisionConfig(param_dtype="fp16")
+            worker = object.__new__(FSDPRefWorkerBase)
+            worker.cfg = cfg.trainer
+            worker.init_model(cfg.trainer.ref.model.path)
+            model = worker.model.model
+        elif variant == "unmerged_nora":
             model = load_model(adapter_config["base_model_name_or_path"], args.teacher_adapter)
         else:
             model = AutoModelForCausalLM.from_pretrained(
@@ -365,8 +373,10 @@ def compare_teacher_precision(args, cfg, rank, world, emit):
                 with torch.no_grad():
                     for parameter in model.parameters():
                         parameter.copy_(parameter.bfloat16().half())
-        model.to("cuda").eval()
+        if worker is None:
+            model.to("cuda").eval()
         measurements = []
+        wrapper_errors = []
         for row_index, row in enumerate(local_rows):
             prompt, response = row["prompt_token_ids"], row["response_token_ids"]
             offsets = torch.linspace(0, len(response) - 1, min(64, len(response))).long()
@@ -381,6 +391,15 @@ def compare_teacher_precision(args, cfg, rank, world, emit):
             actions = torch.tensor(response)[offsets, None]
             action = logp.gather(-1, actions).squeeze(-1)
             expected = target.gather(-1, actions).squeeze(-1)
+            if worker is not None:
+                with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                    native = worker.model(
+                        ids,
+                        num_actions=len(response),
+                        attention_mask=torch.ones_like(ids),
+                        response_mask=torch.ones((1, len(response)), device="cuda"),
+                    )
+                wrapper_errors.append((native[0].cpu()[offsets] - expected).abs().max().item())
             old = torch.tensor(row["rollout_logprobs"])[offsets]
             alpha = cfg.trainer.algorithm.proximal_teacher_alpha
             reward = torch.logaddexp(action - old + math.log(alpha), torch.full_like(action, math.log1p(-alpha)))
@@ -415,10 +434,11 @@ def compare_teacher_precision(args, cfg, rank, world, emit):
                 "mean_kl": sum(sum(item["kl"]) for item in flat) / delta.numel(),
                 "top1_change_fraction": sum(sum(item["top1_changed"]) for item in flat) / delta.numel(),
                 "mean_absolute_reward_delta": reward_delta.abs().mean().item(),
+                "wrapper_max_action_logprob_error": max(wrapper_errors, default=0.0),
                 "per_sample": flat,
             },
         )
-        del model
+        del model, worker
         gc.collect()
         torch.cuda.empty_cache()
         dist.barrier()
@@ -435,6 +455,12 @@ def main():
         "--mode", choices=("gradient", "control", "score", "kl", "replay", "precision"), default="gradient"
     )
     parser.add_argument("--teacher-adapter", type=Path, help="Original AntiDoom adapter for the precision comparison")
+    parser.add_argument(
+        "--precision-variants",
+        nargs="+",
+        choices=("merged_fp16", "rounded_fp16", "merged_bf16", "unmerged_nora", "native_fp16"),
+        default=["merged_fp16", "rounded_fp16", "merged_bf16", "unmerged_nora"],
+    )
     parser.add_argument("--scored-input", type=Path, help="Saved native TOP-D input before advantage scaling")
     parser.add_argument("--comparison-checkpoints", type=Path, nargs="*", default=[])
     parser.add_argument("--comparison-scales", type=float, nargs="+", default=[1.0])
@@ -442,6 +468,8 @@ def main():
     args = parser.parse_args()
     if args.mode == "precision" and args.teacher_adapter is None:
         parser.error("precision requires --teacher-adapter")
+    if args.mode == "precision" and args.precision_variants[0] != "merged_fp16":
+        parser.error("precision comparisons must start with merged_fp16")
     rank = int(os.environ["LOCAL_RANK"])
     world = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)

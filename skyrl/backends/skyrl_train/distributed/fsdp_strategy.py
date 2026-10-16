@@ -210,11 +210,11 @@ class FSDPStrategy(DistributedStrategy):
             reduce_dtype = torch.float32
 
         assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
-        # Recurrent RWKV chunks carry FP32 WKV states between decoder layers.
-        # Their hidden states already follow the BF16 compute parameters.
-        rwkv_infctx = is_wrapped and model.is_rwkv and model.rwkv_chunk_size > 0
+        # RWKV inference and recurrent chunks carry FP32 WKV states between
+        # decoder layers. Hidden states already follow the compute dtype.
+        rwkv_recurrent = is_wrapped and model.is_rwkv and (model.rwkv_chunk_size > 0 or model.rwkv_inference_mode)
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=not rwkv_infctx
+            param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=not rwkv_recurrent
         )
 
         cpu_offload = CPUOffloadPolicy(pin_memory=True) if self.fsdp_config.cpu_offload else None

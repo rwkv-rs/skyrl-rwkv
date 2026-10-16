@@ -333,7 +333,7 @@ def main():
     # With reshard_after_forward=False, a scoring forward exposes temporary
     # BF16 parameters on modules. The optimizer retains the FP32 leaf DTensors
     # receiving reduced gradients and updates; use those stable identities.
-    parameters = [p for group in optimizer.param_groups for p in group["params"]]
+    parameters = [p for group in optimizer.param_groups for p in group["params"] if p.requires_grad]
     parameter_names = {id(p): name for name, p in model.named_parameters()}
     names = [parameter_names[id(p)] for p in parameters]
     data["action_log_probs"] = forward(worker, data)

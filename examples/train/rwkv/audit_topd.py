@@ -335,6 +335,95 @@ def compare_conditional_kl(args, cfg, rank, world, emit):
         )
 
 
+def compare_teacher_precision(args, cfg, rank, world, emit):
+    """Separate teacher weight rounding from compute precision on fixed states."""
+    from transformers import AutoModelForCausalLM
+
+    from examples.train.rwkv.antidoom import load_model
+
+    rows = []
+    with args.rollouts.open() as handle:
+        for line in handle:
+            rows.append(json.loads(line))
+            if len(rows) == args.samples:
+                break
+    local_rows = rows[rank::world]
+    adapter_config = json.loads((args.teacher_adapter / "adapter_config.json").read_text())
+    targets = []
+    variants = ("merged_fp16", "rounded_fp16", "merged_bf16", "unmerged_nora")
+    for variant in variants:
+        if variant == "unmerged_nora":
+            model = load_model(adapter_config["base_model_name_or_path"], args.teacher_adapter)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                cfg.trainer.ref.model.path,
+                dtype=torch.bfloat16 if variant == "merged_bf16" else torch.float16,
+                wkv_mode="fp32io16",
+            )
+            if variant == "rounded_fp16":
+                # Keep the FP16 execution path, changing only stored weight values.
+                with torch.no_grad():
+                    for parameter in model.parameters():
+                        parameter.copy_(parameter.bfloat16().half())
+        model.to("cuda").eval()
+        measurements = []
+        for row_index, row in enumerate(local_rows):
+            prompt, response = row["prompt_token_ids"], row["response_token_ids"]
+            offsets = torch.linspace(0, len(response) - 1, min(64, len(response))).long()
+            positions = (offsets + len(prompt) - 1).unsqueeze(0).cuda()
+            ids = torch.tensor([prompt + response], device="cuda")
+            with torch.no_grad(), torch.autocast("cuda", enabled=False):
+                logp = model(input_ids=ids, use_cache=False, logits_to_keep=positions).logits[0]
+                logp = logp.float().log_softmax(-1).cpu()
+            if variant == "merged_fp16":
+                targets.append(logp)
+            target = targets[row_index]
+            actions = torch.tensor(response)[offsets, None]
+            action = logp.gather(-1, actions).squeeze(-1)
+            expected = target.gather(-1, actions).squeeze(-1)
+            old = torch.tensor(row["rollout_logprobs"])[offsets]
+            alpha = cfg.trainer.algorithm.proximal_teacher_alpha
+            reward = torch.logaddexp(action - old + math.log(alpha), torch.full_like(action, math.log1p(-alpha)))
+            expected_reward = torch.logaddexp(
+                expected - old + math.log(alpha), torch.full_like(expected, math.log1p(-alpha))
+            )
+            measurements.append(
+                {
+                    "trajectory_id": row["trajectory_id"],
+                    "domain": row["env_extras"]["data_source"],
+                    "response_length": len(response),
+                    "positions": offsets.tolist(),
+                    "action_logprobs": action.tolist(),
+                    "action_logprob_delta": (action - expected).tolist(),
+                    "reward_delta": (reward - expected_reward).tolist(),
+                    "kl": (target.exp() * (target - logp)).sum(-1).tolist(),
+                    "top1_changed": (target.argmax(-1) != logp.argmax(-1)).tolist(),
+                }
+            )
+        gathered = [None] * world
+        dist.all_gather_object(gathered, measurements)
+        flat = [sample for shard in gathered for sample in shard]
+        delta = torch.tensor([v for item in flat for v in item["action_logprob_delta"]])
+        reward_delta = torch.tensor([v for item in flat for v in item["reward_delta"]])
+        emit(
+            variant,
+            {
+                "states": delta.numel(),
+                "mean_absolute_action_logprob_delta": delta.abs().mean().item(),
+                "action_logprob_delta_quantiles": delta.abs().quantile(torch.tensor([0.5, 0.9, 0.99, 1.0])).tolist(),
+                "mean_action_logprob_delta": delta.mean().item(),
+                "mean_kl": sum(sum(item["kl"]) for item in flat) / delta.numel(),
+                "top1_change_fraction": sum(sum(item["top1_changed"]) for item in flat) / delta.numel(),
+                "mean_absolute_reward_delta": reward_delta.abs().mean().item(),
+                "per_sample": flat,
+            },
+        )
+        del model
+        gc.collect()
+        torch.cuda.empty_cache()
+        dist.barrier()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
@@ -342,12 +431,17 @@ def main():
     parser.add_argument("--rollouts", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=256)
-    parser.add_argument("--mode", choices=("gradient", "control", "score", "kl", "replay"), default="gradient")
+    parser.add_argument(
+        "--mode", choices=("gradient", "control", "score", "kl", "replay", "precision"), default="gradient"
+    )
+    parser.add_argument("--teacher-adapter", type=Path, help="Original AntiDoom adapter for the precision comparison")
     parser.add_argument("--scored-input", type=Path, help="Saved native TOP-D input before advantage scaling")
     parser.add_argument("--comparison-checkpoints", type=Path, nargs="*", default=[])
     parser.add_argument("--comparison-scales", type=float, nargs="+", default=[1.0])
     parser.add_argument("--learning-rates", type=float, nargs="+", default=[])
     args = parser.parse_args()
+    if args.mode == "precision" and args.teacher_adapter is None:
+        parser.error("precision requires --teacher-adapter")
     rank = int(os.environ["LOCAL_RANK"])
     world = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)
@@ -370,8 +464,9 @@ def main():
             (args.output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps({key: value}), flush=True)
 
-    if args.mode == "kl":
-        compare_conditional_kl(args, cfg, rank, world, emit)
+    if args.mode in ("kl", "precision"):
+        compare = compare_conditional_kl if args.mode == "kl" else compare_teacher_precision
+        compare(args, cfg, rank, world, emit)
         emit("complete", True)
         dist.barrier()
         dist.destroy_process_group()

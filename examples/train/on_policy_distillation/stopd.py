@@ -56,10 +56,10 @@ def token_weights(mask, max_len, block):
 class STOPD:
     """State for the current step's fixed denominator and the next step's estimate."""
 
-    def __init__(self, max_len, block=128, warmup_steps=25, initial_denominator=None, seed=0):
+    def __init__(self, max_len, block=128, warmup_steps=25, initial_denominator=None, seed=0, require_denominator=True):
         if not 1 <= block <= max_len:
             raise ValueError("STOPD requires 1 <= block <= max response length")
-        if warmup_steps == 0 and initial_denominator is None:
+        if require_denominator and warmup_steps == 0 and initial_denominator is None:
             raise ValueError("STOPD without warmup requires initial_denominator")
         self.max_len = max_len
         self.block = block
@@ -67,6 +67,7 @@ class STOPD:
         self.seed = seed
         self.step = 0
         self.denominator = initial_denominator
+        self.require_denominator = require_denominator
 
     @property
     def truncating(self):
@@ -108,7 +109,7 @@ class STOPD:
             "n_hat": estimate,
             "max_weight": weights.max().item(),
         }
-        if self.truncating:
+        if self.truncating and self.denominator is not None:
             stats["denominator"] = self.denominator
             stats["n_hat_over_denominator"] = estimate / self.denominator
         if self.truncating or self.step + 1 == self.warmup_steps:
@@ -133,8 +134,10 @@ class STOPD:
         for key in ("max_len", "block", "warmup_steps", "seed"):
             if state[key] != getattr(self, key):
                 raise ValueError(f"STOPD checkpoint {key} does not match the current config")
-        if state["step"] >= self.warmup_steps and (
-            state["denominator"] is None or not math.isfinite(state["denominator"]) or state["denominator"] <= 0
+        if (
+            state["step"] >= self.warmup_steps
+            and (self.require_denominator or state["denominator"] is not None)
+            and (state["denominator"] is None or not math.isfinite(state["denominator"]) or state["denominator"] <= 0)
         ):
             raise ValueError("STOPD checkpoint requires a finite positive denominator")
         self.step = state["step"]

@@ -136,35 +136,45 @@ count **prompts**: 512 prompts with group size 8 produce 4096 responses and
 hardware. `UPDATE_EPOCHS_PER_BATCH` controls additional reuse. Keep the prompt
 batch size unchanged when restoring an existing dataloader checkpoint.
 
-**STOPD compatibility:** full TOP-D needs unobserved future rewards and full
-group moments. Therefore, when both options are enabled, generation and the
-teacher/behavior-policy scoring pass cover complete responses up to the
-unchanged training length limit. After calculating the complete TOP-D targets,
-independent STOPD budgets select response prefixes for the loss. Full sequence
-tensors, attention masks, and response tensors retain their original layout
-through every inner update. Retained advantages
-receive STOPD's inverse inclusion probabilities. Loss denominators remain the
-**complete** prompt-group token counts, rather than random prefix counts or
-the legacy OPD lagged token count. For a fixed policy and rollout batch, the
-expected clipped loss and gradient over budgets equal complete TOP-D.
+**STOPD compatibility:** enabling both options selects the example's
+`topd_stopd` custom policy loss. Responses to the same prompt share a random
+STOPD budget, while token sampling seeds remain independent. Generation,
+teacher scoring, and training stop at the observed prefix. Evaluation still
+uses its full context budget. Simply applying token IPW to prefix-normalized
+TOP-D advantages would bias the nonlinear group statistics and future returns.
 
-This preserves full TOP-D's target computation and the training kernel's
-forward layout. The combined mode does not provide STOPD's compute savings;
-TOP-D still reuses the collected data across inner optimizer updates. Reusing
-the same sampled prefixes in later PPO updates follows ordinary sample reuse;
-the fixed-policy expectation identity is not an unbiasedness guarantee for an
-adaptive sequence of optimizer updates. With TOP-D disabled, existing STOPD
-still truncates generation and uses its original lagged denominator.
+The combination instead uses a finite randomized telescoping sum, an extension
+of the two algorithms based on [Rhee & Glynn's randomization method](https://web.stanford.edu/~glynn/papers/2015/RheeG15.html).
+Let `F_j` be the complete clipped TOP-D group objective at horizon
+`min(j * block, max_len)`, recomputing Eq. (8), group moments, and the group's
+token count at that horizon. If `J` is the observed horizon and
+`q_j = (max_len - (j - 1) * block) / max_len`, the estimator is
+`F_1 + sum_{j=2..J} (F_j - F_{j-1}) / q_j`.
+All required terms are computable from the observed prefix. Its expectation
+over stopping budgets is `F_M`, including EOS and a partial final block.
+Warmup uses the ordinary full TOP-D objective.
+
+Signed telescoping coefficients stay outside PPO clipping. Two fixed target
+channels accumulate positive and negative advantages separately, preserving
+the clipped objective without storing one tensor per horizon. Native
+mini-batches and inner epochs reuse these targets and behavior logprobs.
+Tests exhaustively compare expected losses and gradients with full TOP-D,
+including off-policy ratios on both sides of the clipping interval. This
+fixed-policy identity does not guarantee equal optimizer trajectories or
+variance: randomized estimates can have higher variance, and BF16 kernels
+can introduce sequence-shape-dependent rounding. Measure actual throughput
+and gradient behavior when choosing a production configuration. With TOP-D
+disabled, STOPD keeps its original token IPW and lagged normalization.
 
 Native checkpoints restore the model, optimizer, scheduler, RNG, and data cursor;
 the existing STOPD sidecar also restores its step and budget seed. TOP-D adds
 no persistent statistics: each new batch recomputes group moments. An existing
 OPD/STOPD checkpoint can enter TOP-D without resetting the student or data
-position. TOP-D uses complete group token counts and needs no legacy lagged
+position. TOP-D normalizes within each group objective and needs no legacy lagged
 denominator when importing a checkpoint without STOPD state.
 Epoch-end resumes finish the saved iterator before entering the next epoch,
 preserving the next shuffle as well as mid-epoch data order.
-`topd/full_tokens`, `topd/training_tokens`, group advantage statistics,
+`topd/observed_tokens`, `topd/observed_return_mean`, target coefficient statistics,
 and `topd/optimizer_steps_per_batch` expose actual training work in the tracker.
 Keep training and evaluation lengths separate; this recipe retains the RWKV
 training response limit of 8192 and LightEval's total context budget of 25600.
@@ -214,9 +224,11 @@ launcher). Complete evaluation records remain in the producer output.
 OPD replaces environment rewards with dense teacher/student log-ratio rewards;
 environment task reward is not part of its optimization objective. Track
 `opd/reward_mean`, `opd/reward_abs_mean`, and `opd/reverse_kl_mean` for
-token-normalized distillation diagnostics. With STOPD, these use the same
+token-normalized distillation diagnostics. With STOPD alone, these use the same
 inverse-probability weights and lagged denominator as the loss, excluding
-padding. The reverse-KL diagnostic is a signed Monte Carlo estimate and can
+padding. With TOP-D, these report means of the observed tokens; truncated
+prefix diagnostics are not estimates of the full-response token mean.
+The reverse-KL diagnostic is a signed Monte Carlo estimate and can
 be negative on an individual batch. Use the producer's task scores to assess
 capability, rather than interpreting environment rewards or sequence reward
 sums as evaluation accuracy.

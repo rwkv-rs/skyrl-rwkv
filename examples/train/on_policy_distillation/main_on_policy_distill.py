@@ -11,12 +11,18 @@ import ray
 import torch
 
 from examples.train.on_policy_distillation.stopd import STOPD, STOPDConfig, request_seed
-from examples.train.on_policy_distillation.topd import TOPDConfig, compute_topd_advantage, mask_training_input
+from examples.train.on_policy_distillation.topd import (
+    TOPDConfig,
+    compute_topd_advantage,
+    compute_topd_stopd_advantage,
+    topd_stopd_policy_loss,
+)
 from skyrl.backends.skyrl_train.inference_servers.utils import resolve_policy_model_name
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.backends.skyrl_train.utils.io import io
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
     register_advantage_estimator,
+    register_policy_loss,
 )
 from skyrl.train.config import AlgorithmConfig, BaseConfig, SkyRLTrainConfig, make_config
 from skyrl.train.entrypoints.main_base import BasePPOExp, validate_cfg
@@ -62,7 +68,7 @@ def validate_stopd_cfg(cfg):
     if algorithm.topd.enabled:
         if (
             algorithm.advantage_estimator != "no_op"
-            or algorithm.policy_loss_type != "regular"
+            or algorithm.policy_loss_type != ("topd_stopd" if algorithm.stopd.enabled else "regular")
             or algorithm.loss_reduction != "prompt_mean"
             or not algorithm.use_kl_in_reward
             or algorithm.use_kl_loss
@@ -71,7 +77,8 @@ def validate_stopd_cfg(cfg):
             or generator.n_samples_per_prompt < 2
         ):
             raise ValueError(
-                "TOP-D requires no_op, regular PPO, prompt_mean, dense rewards, and >= 2 responses per prompt"
+                "TOP-D requires no_op, regular PPO (topd_stopd with STOPD), prompt_mean, dense rewards, "
+                "and >= 2 responses per prompt"
             )
         if (
             generator.max_turns != 1
@@ -130,13 +137,15 @@ class STOPDGenerator(SkyRLGymGenerator):
     """Use native trajectory generation with independent per-request token budgets."""
 
     complete_rollouts = False
+    grouped_budgets = False
 
-    def __init__(self, *args, stopd_cfg, complete_rollouts=False, **kwargs):
+    def __init__(self, *args, stopd_cfg, complete_rollouts=False, grouped_budgets=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.complete_rollouts = complete_rollouts
+        self.grouped_budgets = grouped_budgets
         self.stopd = STOPD(
             self.generator_cfg.sampling_params.max_generate_length,
-            require_denominator=not complete_rollouts,
+            require_denominator=not (complete_rollouts or grouped_budgets),
             **{key: value for key, value in vars(stopd_cfg).items() if key != "enabled"},
         )
 
@@ -145,11 +154,14 @@ class STOPDGenerator(SkyRLGymGenerator):
         if metadata.training_phase == TRAINING_PHASE_EVAL:
             return await super().generate(input_batch, disable_tqdm=disable_tqdm)
         self.stopd.step = metadata.global_step - 1
-        budgets = (
-            [self.stopd.max_len] * len(input_batch["prompts"])
-            if self.complete_rollouts
-            else self.stopd.budgets(len(input_batch["prompts"]))
-        )
+        count = len(input_batch["prompts"])
+        if self.complete_rollouts:
+            budgets = [self.stopd.max_len] * count
+        elif self.grouped_budgets:
+            group_size = self.generator_cfg.n_samples_per_prompt
+            budgets = [budget for budget in self.stopd.budgets(count // group_size) for _ in range(group_size)]
+        else:
+            budgets = self.stopd.budgets(count)
         input_batch = {**input_batch, "env_extras": copy.deepcopy(input_batch["env_extras"])}
         for index, (extras, budget) in enumerate(zip(input_batch["env_extras"], budgets, strict=True)):
             extras["_stopd_budget"] = budget
@@ -301,32 +313,27 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
     def compute_advantages_and_returns(self, data):
         if self.cfg.trainer.algorithm.topd.enabled:
             mask = self._stopd_mask(data)
-            advantages, returns, counts = compute_topd_advantage(
-                data["rewards"],
-                mask,
-                data.metadata["policy_prompt_boundaries"],
-                self.cfg.trainer.algorithm.topd.epsilon,
-            )
+            arguments = (data["rewards"], mask, data.metadata["policy_prompt_boundaries"])
+            epsilon = self.cfg.trainer.algorithm.topd.epsilon
+            if self.stopd is not None:
+                advantages, returns, counts = compute_topd_stopd_advantage(
+                    *arguments, self.stopd.max_len, self.stopd.block, self.stopd.truncating, epsilon
+                )
+            else:
+                advantages, returns, counts = compute_topd_advantage(*arguments, epsilon)
             data["advantages"], data["returns"] = advantages, returns
-            data.metadata["topd_full_token_counts"] = counts
+            data.metadata["topd_token_counts"] = counts
             self.all_metrics.update(
                 {
-                    "topd/full_tokens": int(mask.sum()),
-                    "topd/return_mean": returns[mask].mean().item(),
-                    "topd/advantage_mean": advantages[mask].mean().item(),
-                    "topd/advantage_abs_mean": advantages[mask].abs().mean().item(),
+                    "topd/observed_tokens": int(mask.sum()),
+                    "topd/observed_return_mean": returns[mask].mean().item(),
+                    "topd/coefficient_abs_mean": advantages[mask].abs().mean().item(),
                     "topd/optimizer_steps_per_batch": len(data.metadata["policy_mini_batch_boundaries"])
                     * self.cfg.trainer.update_epochs_per_batch,
                 }
             )
             if self.cfg.trainer.dump_data_batch:
-                self.dump_data(data, file_name=f"global_step_{self.global_step}_full_topd_input")
-            if self.stopd is not None and self.stopd.truncating:
-                # Complete-group moments stay fixed before drawing loss prefixes.
-                # Conditional on this rollout, E[I(t <= B) / P(B >= t)] = 1.
-                data["advantages"] *= self.stopd.weights(mask)
-                data = mask_training_input(data, self.stopd.budgets(len(mask)))
-            self.all_metrics["topd/training_tokens"] = int(self._stopd_mask(data).sum())
+                self.dump_data(data, file_name=f"global_step_{self.global_step}_topd_input")
             return data
         data = super().compute_advantages_and_returns(data)
         if self.stopd is not None and self.stopd.truncating:
@@ -341,13 +348,14 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
     def _normalize_advantages(self, data, mini_batch_boundaries, prompt_boundaries=None):
         if not self.cfg.trainer.algorithm.topd.enabled:
             return super()._normalize_advantages(data, mini_batch_boundaries, prompt_boundaries)
-        # Eq. (7): mean over prompts of token means within each complete group.
-        # A random prefix token count must never enter the loss denominator.
+        # Eq. (7): token means per group, then a mean over mini-batch prompts.
+        # The telescoping coefficients already include each level's token mean.
         normalized = torch.zeros_like(data["advantages"])
         for start, end in mini_batch_boundaries:
-            groups = [(a, b, n) for a, b, n in data.metadata["topd_full_token_counts"] if start <= a < end]
+            groups = [(a, b, n) for a, b, n in data.metadata["topd_token_counts"] if start <= a < end]
             for a, b, count in groups:
-                normalized[a:b] = data["advantages"][a:b] / (len(groups) * max(count, 1))
+                denominator = len(groups) * (max(count, 1) if self.stopd is None else 1)
+                normalized[a:b] = data["advantages"][a:b] / denominator
         data["advantages"] = normalized
         return data
 
@@ -355,7 +363,7 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
         status = super().train_critic_and_policy(data)
         if self.stopd is not None:
             metrics = self.stopd.end_step(self._stopd_mask(data))
-            metrics["training_prefix_only"] = int(self.cfg.trainer.algorithm.topd.enabled)
+            metrics["grouped_budgets"] = int(self.cfg.trainer.algorithm.topd.enabled)
             self.all_metrics.update({f"stopd/{key}": value for key, value in metrics.items()})
         return status
 
@@ -466,7 +474,8 @@ class OnPolicyDistillationExp(BasePPOExp):
             tokenizer=tokenizer,
             policy_model_name=resolve_policy_model_name(cfg),
             stopd_cfg=stopd_cfg,
-            complete_rollouts=algorithm.topd.enabled,
+            complete_rollouts=algorithm.topd.enabled and not algorithm.stopd.enabled,
+            grouped_budgets=algorithm.topd.enabled and algorithm.stopd.enabled,
         )
 
     def get_trainer(self, *args, **kwargs):
@@ -483,6 +492,7 @@ def main() -> None:
     # Registry actors may import this module while unpickling the estimator.
     # Register from the entrypoint so that import never calls back into them.
     register_advantage_estimator("no_op")(compute_no_op_advantage)
+    register_policy_loss("topd_stopd")(topd_stopd_policy_loss)
     cfg = OnPolicyDistillationConfig.from_cli_overrides(sys.argv[1:])
     # validate the arguments
     validate_cfg(cfg)

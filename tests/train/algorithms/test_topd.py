@@ -281,6 +281,33 @@ def test_stopd_warmup_matches_full_topd_without_randomization():
     assert actual_counts == counts
 
 
+@pytest.mark.parametrize("displacement", [0.0, 0.1, 0.7])
+def test_explicit_prefix_objective_matches_signed_loss_gradient(displacement):
+    from examples.train.rwkv.audit_topd import reference_loss_gradient
+
+    obj = trainer()
+    data = obj.apply_reward_kl_penalty(batch())
+    data = obj.compute_advantages_and_returns(data)
+    obj._normalize_advantages(data, [(0, 4)])
+    delta = torch.linspace(-displacement, displacement, data["action_log_probs"].numel()).reshape_as(
+        data["action_log_probs"]
+    )
+    current = (data["action_log_probs"] + delta).requires_grad_()
+    reference_loss, reference_gradient = reference_loss_gradient(data, current, obj.cfg)
+    actual_loss, _ = topd_stopd_policy_loss(
+        current,
+        data["action_log_probs"],
+        data["advantages"],
+        obj.cfg.trainer.algorithm,
+        loss_mask=data["loss_mask"],
+    )
+    actual_gradient = torch.autograd.grad(actual_loss, current)[0]
+    torch.testing.assert_close(
+        actual_loss.detach().double(), torch.tensor(reference_loss, dtype=torch.float64), atol=2e-7, rtol=1e-5
+    )
+    torch.testing.assert_close(actual_gradient, reference_gradient, atol=2e-7, rtol=1e-5)
+
+
 def test_signed_targets_survive_native_microbatch_and_experience_conversion():
     obj = trainer()
     data = obj.compute_advantages_and_returns(batch())

@@ -92,17 +92,75 @@ Eq. (5), replaces the immediate log-ratio reward with
 `logaddexp` for numerical stability and reuses the cached teacher and student
 token logprobs, requiring no additional model forward pass or checkpoint state.
 
-This option implements TOP-D's immediate reward smoothing. It composes with
-STOPD's token IPW correction. The paper's full algorithm also uses future
-returns, group normalization, and clipped updates over multiple mini-batches;
-those require separate treatment of unobserved suffixes under truncation.
-The paper's reported full-algorithm accuracy gains therefore do not describe
-this combination. Measure its quality through the experiment's evaluations.
+This option alone implements immediate reward smoothing and composes with
+STOPD's rollout truncation. Enable the complete algorithm separately below.
 
 Use `--proximal-teacher-alpha 0.2` with `benchmark_stopd.py` to apply the same
 reward transformation to both full and truncated rollout arms and the resumed
 production run. The benchmark records the coefficient and verifies actual
 transformed rewards and IPW advantages before continuing training.
+
+## Optional complete TOP-D
+
+Enable `trainer.algorithm.topd.enabled=true` together with `no_op` advantages,
+the native `regular` PPO loss, `prompt_mean` loss reduction, and at least two
+responses per prompt. The example computes Eq. (8)'s immediate reward plus the
+mean strictly future reward (zero future reward for the final token). It then
+normalizes returns using the population mean and standard deviation over all
+valid tokens of all responses to the same prompt. Padding is excluded. The
+standard deviation has an additive `trainer.algorithm.topd.epsilon=1e-6`.
+
+Eq. (7)'s loss averages token losses within each prompt group, then averages
+across prompts in each mini-batch. Teacher logprobs, behavior-policy logprobs,
+returns, and advantages are computed once per rollout batch and remain fixed
+through native PPO mini-batches and `trainer.update_epochs_per_batch` epochs.
+Only student logprobs are recomputed after optimizer updates. Evaluation,
+NoRA, FlashRWKV2, and full-weight synchronization retain their native paths.
+
+The RWKV launcher exposes a complete recipe matching the paper's group size,
+mini-batch size, clipping defaults, and proximal-teacher coefficient:
+
+```bash
+USE_TOPD=true USE_STOPD=true \
+  bash examples/train/rwkv/run_rwkv_on_policy_distill.sh \
+  trainer.resume_mode=from_path \
+  trainer.resume_path=<latest_complete_checkpoint>
+```
+
+Launcher defaults are `TOPD_GROUP_SIZE=8`, `TOPD_MINI_BATCH_SIZE=32`,
+`TOPD_ALPHA=0.2`, and one epoch over the collected batch. SkyRL batch sizes
+count **prompts**: 512 prompts with group size 8 produce 4096 responses and
+16 optimizer updates. Adjust the group size and mini-batch size for available
+hardware. `UPDATE_EPOCHS_PER_BATCH` controls additional reuse. Keep the prompt
+batch size unchanged when restoring an existing dataloader checkpoint.
+
+**STOPD compatibility:** full TOP-D needs unobserved future rewards and full
+group moments. Therefore, when both options are enabled, generation and the
+teacher/behavior-policy scoring pass cover complete responses up to the
+unchanged training length limit. After calculating the complete TOP-D targets,
+independent STOPD budgets select response prefixes for training. The native
+collator repacks these shorter sequences; all response tensors keep the same
+token alignment and no terminal token is inserted at a cut. Retained advantages
+receive STOPD's inverse inclusion probabilities. Loss denominators remain the
+**complete** prompt-group token counts, rather than random prefix counts or
+the legacy OPD lagged token count. For a fixed policy and rollout batch, the
+expected clipped loss and gradient over budgets equal complete TOP-D.
+
+This preserves full TOP-D's target computation while reducing backward-pass
+work. It does not provide STOPD's rollout or teacher-forward speedup. Reusing
+the same sampled prefixes in later PPO updates follows ordinary sample reuse;
+the fixed-policy expectation identity is not an unbiasedness guarantee for an
+adaptive sequence of optimizer updates. With TOP-D disabled, existing STOPD
+still truncates generation and uses its original lagged denominator.
+
+Native checkpoints restore the model, optimizer, scheduler, RNG, and data cursor;
+the existing STOPD sidecar also restores its step and budget seed. TOP-D adds
+no persistent statistics: each new batch recomputes group moments. An existing
+OPD/STOPD checkpoint can enter TOP-D without resetting the student or data
+position. `topd/full_tokens`, `topd/training_tokens`, group advantage statistics,
+and `topd/optimizer_steps_per_batch` expose actual training work in the tracker.
+Keep training and evaluation lengths separate; this recipe retains the RWKV
+training response limit of 8192 and LightEval's total context budget of 25600.
 
 ## RWKV evaluation and metrics
 

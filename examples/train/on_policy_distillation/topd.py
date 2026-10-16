@@ -6,10 +6,12 @@ It only needs observed prefixes, including for future returns and group moments.
 """
 
 from dataclasses import dataclass
+import math
 
 import torch
 
 from skyrl.train.config import BaseConfig
+from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.backends.skyrl_train.utils.ppo_utils import reduce_loss
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean, safe_exp_delta
 
@@ -20,10 +22,66 @@ class TOPDConfig(BaseConfig):
     """Enable future returns, token group normalization, and native PPO updates."""
     epsilon: float = 1e-6
     """Numerical stabilizer added to the population standard deviation."""
+    balance_batch: bool = False
+    """Group similar lengths and balance padded microbatch work within each PPO mini-batch."""
 
     def __post_init__(self):
         if not 0 < self.epsilon < float("inf"):
             raise ValueError("TOP-D epsilon must be finite and positive")
+
+
+def balance_training_input(data, dp_size, micro_batch_size):
+    """Preserve prompt groups and mini-batch membership while reducing padding.
+
+    Prototype: RWKV SFT's LengthGroupedSampler and native MeshDispatch chunks.
+    Sort whole prompt groups, form equal-size units aligned to both groups and
+    microbatches, then greedily place costly units on the least-loaded DP rank.
+    Every rank keeps the same number of rows and native collective calls.
+    """
+    lengths = data["attention_mask"].sum(-1).tolist()
+    groups = data.metadata["policy_prompt_boundaries"]
+    group_size = groups[0][1] - groups[0][0]
+    unit_size = math.lcm(group_size, micro_batch_size)
+    order = list(range(len(data)))
+    before, after, before_makespan, after_makespan = 0, 0, 0, 0
+
+    def cost(indices):
+        return sum(
+            len(indices[i : i + micro_batch_size]) * max(lengths[j] for j in indices[i : i + micro_batch_size])
+            for i in range(0, len(indices), micro_batch_size)
+        )
+
+    for start, end in data.metadata["policy_mini_batch_boundaries"]:
+        prompt_groups = [list(range(a, b)) for a, b in groups if start <= a < end]
+        prompt_groups.sort(key=lambda group: max(lengths[i] for i in group))
+        sorted_indices = [i for group in prompt_groups for i in group]
+        units = [sorted_indices[i : i + unit_size] for i in range(0, len(sorted_indices), unit_size)]
+        units.sort(key=cost, reverse=True)
+        rank_rows = (end - start) // dp_size
+        slots = rank_rows // unit_size
+        assigned = [[] for _ in range(dp_size)]
+        loads = [0] * dp_size
+        for unit in units:
+            rank = min((r for r in range(dp_size) if len(assigned[r]) < slots), key=lambda r: loads[r])
+            assigned[rank].append(unit)
+            loads[rank] += cost(unit)
+        order[start:end] = [i for rank in assigned for unit in rank for i in unit]
+        original_costs = [cost(list(range(a, a + rank_rows))) for a in range(start, end, rank_rows)]
+        before += sum(original_costs)
+        after += sum(loads)
+        before_makespan += max(original_costs)
+        after_makespan += max(loads)
+    indices = torch.tensor(order, dtype=torch.long, device=data["sequences"].device)
+    result = TrainingInputBatch({key: value[indices] if value is not None else None for key, value in data.items()})
+    result.metadata = dict(data.metadata)
+    result.metadata["uids"] = [data.metadata["uids"][i] for i in order]
+    result.metadata["batch_permutation"] = order
+    return result, {
+        "perf/dense_tokens_before_balance": before,
+        "perf/dense_tokens_after_balance": after,
+        "perf/policy_rank_max_tokens_before_balance": before_makespan,
+        "perf/policy_rank_max_tokens_after_balance": after_makespan,
+    }
 
 
 @torch.no_grad()

@@ -629,6 +629,10 @@ RWKV Rapid-Sampling uses `raw_logprobs`. The launcher selects it explicitly;
 the inference setup requires an unmodified training distribution so these equal
 the sampling logprobs used by OPD. Evaluation logprobs do not enter the loss.
 Each engine has a 2-GiB recurrent-state cache budget and up to 128 active requests.
+The launcher advertises 32 Ray CPU resources and defaults to two OpenMP threads
+and two glibc allocator arenas per process. Existing environment values override
+these defaults. Adam state stays on GPU (`offload_after_step=false`), using
+available GPU memory to reduce host memory pressure during colocated training.
 
 The default run covers one complete epoch. Evaluation runs before training and
 every 50 steps; resumable checkpoints and HF exports are saved every 50 steps.

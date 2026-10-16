@@ -358,6 +358,7 @@ def compare_teacher_precision(args, cfg, rank, world, emit):
             cfg.trainer.ref.fsdp_config.mixed_precision = MixedPrecisionConfig(param_dtype="fp16")
             worker = object.__new__(FSDPRefWorkerBase)
             worker.cfg = cfg.trainer
+            worker.sequence_parallel_size = cfg.trainer.ref.sequence_parallel_size
             worker.init_model(cfg.trainer.ref.model.path)
             model = worker.model.model
         elif variant == "unmerged_nora":

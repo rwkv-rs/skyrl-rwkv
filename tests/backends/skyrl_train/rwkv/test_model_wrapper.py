@@ -751,6 +751,38 @@ def test_rwkv_fully_async_requires_cache_reset_before_fsdp_prepare(monkeypatch, 
         strategy.prepare.assert_not_called()
 
 
+@pytest.mark.parametrize("model_type", ["rwkv", "llama"])
+@pytest.mark.parametrize("param_dtype", [None, "bf16", "fp16"])
+def test_reference_inference_mode_only_for_explicit_fp16_rwkv(monkeypatch, model_type, param_dtype):
+    from unittest.mock import MagicMock
+
+    from skyrl.backends.skyrl_train.workers.fsdp import fsdp_worker as module
+    from skyrl.train.config import MixedPrecisionConfig, SkyRLTrainConfig
+
+    cfg = SkyRLTrainConfig().trainer
+    if param_dtype is not None:
+        cfg.ref.fsdp_config.mixed_precision = MixedPrecisionConfig(param_dtype=param_dtype)
+    wrapper = HFModelWrapper(ToyCausalLM(model_type))
+    strategy = MagicMock()
+    strategy.prepare.return_value = wrapper
+    monkeypatch.setattr(module, "FSDPStrategy", lambda **kwargs: strategy)
+    monkeypatch.setattr(
+        module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: SimpleNamespace(model_type=model_type, tie_word_embeddings=False),
+    )
+    monkeypatch.setattr(module, "should_use_meta_init", lambda **kwargs: False)
+    factory = MagicMock(return_value=wrapper)
+    monkeypatch.setattr(module, "HFModelWrapper", factory)
+    worker = object.__new__(module.FSDPRefWorkerBase)
+    worker.cfg = cfg
+    worker._seq_parallel_monkey_patch = MagicMock()
+    worker._set_expandable_segments = MagicMock()
+    worker.init_model("checkpoint")
+    assert factory.call_args.kwargs["rwkv_inference_mode"] == (model_type == "rwkv" and param_dtype == "fp16")
+    assert not worker.model.training
+
+
 @pytest.mark.parametrize(
     "override,message",
     [

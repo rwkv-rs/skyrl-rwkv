@@ -12,7 +12,7 @@ import math
 import torch
 
 from skyrl.train.config import BaseConfig
-from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch, pad_training_input_batch
 from skyrl.backends.skyrl_train.utils.ppo_utils import ppo_policy_loss, reduce_loss
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean, safe_exp_delta
 
@@ -39,11 +39,29 @@ def balance_training_input(data, dp_size, micro_batch_size):
     microbatches, then greedily place costly units on the least-loaded DP rank.
     Every rank keeps the same number of rows and native collective calls.
     """
-    lengths = data["attention_mask"].sum(-1).tolist()
     groups = data.metadata["policy_prompt_boundaries"]
+    boundaries = data.metadata["policy_mini_batch_boundaries"]
     group_size = groups[0][1] - groups[0][0]
     unit_size = math.lcm(group_size, micro_batch_size)
-    order = list(range(len(data)))
+    real_rows = boundaries[-1][1]
+    padding_sizes = [(-(end - start)) % (dp_size * unit_size) for start, end in boundaries]
+    padding_size = sum(padding_sizes)
+    if padding_size:
+        # Reuse native zero-loss padding, but place complete microbatches on
+        # each DP rank. A one-token input avoids computing copied long prompts.
+        source = TrainingInputBatch(
+            {key: value[:real_rows] if value is not None else None for key, value in data.items()}
+        )
+        source.metadata = dict(data.metadata)
+        source.metadata["uids"] = data.metadata["uids"][:real_rows]
+        data = pad_training_input_batch(source, padding_size)
+        data["sequences"][real_rows:] = 0
+        data["attention_mask"][real_rows:] = 0
+        data["attention_mask"][real_rows:, -1] = 1
+        data["response_mask"][real_rows:] = 0
+    lengths = data["attention_mask"].sum(-1).tolist()
+    order, balanced_boundaries = [], []
+    padding_start = real_rows
     before, after, before_makespan, after_makespan = 0, 0, 0, 0
 
     def cost(indices):
@@ -52,34 +70,15 @@ def balance_training_input(data, dp_size, micro_batch_size):
             for i in range(0, len(indices), micro_batch_size)
         )
 
-    for start, end in data.metadata["policy_mini_batch_boundaries"]:
+    for (start, end), size in zip(boundaries, padding_sizes, strict=True):
         prompt_groups = [list(range(a, b)) for a, b in groups if start <= a < end]
         prompt_groups.sort(key=lambda group: max(lengths[i] for i in group))
         sorted_indices = [i for group in prompt_groups for i in group]
-        if (end - start) % (dp_size * unit_size):
-            # Native dispatch pads uneven DP slices after advantages have been
-            # normalized over real prompts. Keep groups together here and sort
-            # their microbatch neighbors without introducing synthetic prompts.
-            assigned = [[] for _ in range(dp_size)]
-            loads = [0] * dp_size
-            slots = math.ceil(len(prompt_groups) / dp_size)
-            for group in reversed(prompt_groups):
-                rank = min((r for r in range(dp_size) if len(assigned[r]) < slots), key=lambda r: loads[r])
-                assigned[rank].append(group)
-                loads[rank] += cost(group)
-            sorted_indices = [i for rank in assigned for group in rank for i in group]
-            rank_rows = math.ceil((end - start) / dp_size)
-            original_costs = [cost(list(range(a, min(a + rank_rows, end)))) for a in range(start, end, rank_rows)]
-            new_costs = [cost(sorted_indices[a : a + rank_rows]) for a in range(0, end - start, rank_rows)]
-            order[start:end] = sorted_indices
-            before += sum(original_costs)
-            after += sum(new_costs)
-            before_makespan += max(original_costs)
-            after_makespan += max(new_costs)
-            continue
+        sorted_indices.extend(range(padding_start, padding_start + size))
+        padding_start += size
         units = [sorted_indices[i : i + unit_size] for i in range(0, len(sorted_indices), unit_size)]
         units.sort(key=cost, reverse=True)
-        rank_rows = (end - start) // dp_size
+        rank_rows = len(sorted_indices) // dp_size
         slots = rank_rows // unit_size
         assigned = [[] for _ in range(dp_size)]
         loads = [0] * dp_size
@@ -87,8 +86,13 @@ def balance_training_input(data, dp_size, micro_batch_size):
             rank = min((r for r in range(dp_size) if len(assigned[r]) < slots), key=lambda r: loads[r])
             assigned[rank].append(unit)
             loads[rank] += cost(unit)
-        order[start:end] = [i for rank in assigned for unit in rank for i in unit]
-        original_costs = [cost(list(range(a, a + rank_rows))) for a in range(start, end, rank_rows)]
+        balanced_start = len(order)
+        order.extend(i for rank in assigned for unit in rank for i in unit)
+        balanced_boundaries.append((balanced_start, len(order)))
+        original_rank_rows = math.ceil((end - start) / dp_size)
+        original_costs = [
+            cost(list(range(a, min(a + original_rank_rows, end)))) for a in range(start, end, original_rank_rows)
+        ]
         before += sum(original_costs)
         after += sum(loads)
         before_makespan += max(original_costs)
@@ -98,11 +102,20 @@ def balance_training_input(data, dp_size, micro_batch_size):
     result.metadata = dict(data.metadata)
     result.metadata["uids"] = [data.metadata["uids"][i] for i in order]
     result.metadata["batch_permutation"] = order
+    result.metadata["policy_mini_batch_boundaries"] = balanced_boundaries
+    group_lengths = {start: end - start for start, end in groups}
+    result.metadata["policy_prompt_boundaries"] = [
+        (row, row + group_lengths[index]) for row, index in enumerate(order) if index in group_lengths
+    ]
+    # Synthetic rows are interspersed; their zero loss/response masks exclude
+    # them without treating them as additional prompts or trailing real rows.
+    result.metadata["pad_size"] = 0
     return result, {
         "perf/dense_tokens_before_balance": before,
         "perf/dense_tokens_after_balance": after,
         "perf/policy_rank_max_tokens_before_balance": before_makespan,
         "perf/policy_rank_max_tokens_after_balance": after_makespan,
+        "perf/dp_padding_sequences": padding_size,
     }
 
 

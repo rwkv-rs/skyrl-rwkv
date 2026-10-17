@@ -21,7 +21,10 @@ from examples.train.on_policy_distillation.topd import (
     compute_topd_stopd_advantage,
     topd_stopd_policy_loss,
 )
-from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from skyrl.backends.skyrl_train.training_batch import (
+    TrainingInputBatch,
+    pad_training_input_batch,
+)
 from skyrl.backends.skyrl_train.utils.ppo_utils import ppo_policy_loss
 from skyrl.backends.skyrl_train.workers.worker_utils import (
     BaseBatchIterator,
@@ -147,7 +150,7 @@ def test_returns_and_group_moments_match_independent_scalar_equations():
 
 @pytest.mark.parametrize("dp_size", [4, 7])
 def test_balance_preserves_prompt_mini_batches_signed_targets_and_gradients(dp_size):
-    lengths = [80, 79, 3, 2, 70, 68, 4, 3, 60, 59, 5, 4, 50, 49, 6, 5] * 4
+    lengths = [80, 79, 3, 2, 70, 68, 4, 3, 60, 59, 5, 4, 50, 49, 6, 5] * 8
     rows = len(lengths)
     tensors = convert_prompts_responses_to_batch_tensors(
         0,
@@ -164,27 +167,38 @@ def test_balance_preserves_prompt_mini_batches_signed_targets_and_gradients(dp_s
     data.metadata = {
         "uids": [str(i // 2) for i in range(rows)],
         "policy_prompt_boundaries": groups,
-        "policy_mini_batch_boundaries": [(0, 32), (32, 64)],
+        "policy_mini_batch_boundaries": [(i, i + 32) for i in range(0, rows, 32)],
     }
+    data = pad_training_input_batch(data, (-rows) % dp_size)
     original_uids = data.metadata["uids"].copy()
     balanced, metrics = balance_training_input(data, dp_size=dp_size, micro_batch_size=4)
     order = balanced.metadata["batch_permutation"]
-    assert sorted(order) == list(range(rows))
+    real_positions = [i for i, source in enumerate(order) if source < rows]
+    real_order = [order[i] for i in real_positions]
+    assert sorted(real_order) == list(range(rows))
     assert data.metadata["uids"] == original_uids
     assert metrics["perf/dense_tokens_after_balance"] < metrics["perf/dense_tokens_before_balance"]
     assert metrics["perf/policy_rank_max_tokens_after_balance"] <= metrics["perf/policy_rank_max_tokens_before_balance"]
-    for start, end in data.metadata["policy_mini_batch_boundaries"]:
-        assert set(order[start:end]) == set(range(start, end))
-    for start, end in groups:
+    for (start, end), (a, b) in zip(
+        data.metadata["policy_mini_batch_boundaries"], balanced.metadata["policy_mini_batch_boundaries"], strict=True
+    ):
+        assert set(i for i in order[a:b] if i < rows) == set(range(start, end))
+        assert (b - a) % (dp_size * 4) == 0
+    for start, end in balanced.metadata["policy_prompt_boundaries"]:
         assert len(set(balanced.metadata["uids"][start:end])) == 1
     for key, value in data.items():
-        torch.testing.assert_close(balanced[key], value[order], rtol=0, atol=0)
+        torch.testing.assert_close(balanced[key][real_positions], value[real_order], rtol=0, atol=0)
+    padding = torch.tensor([i >= rows for i in order])
+    assert not balanced["loss_mask"][padding].any()
+    assert not balanced["response_mask"][padding].any()
+    assert (balanced["attention_mask"][padding].sum(-1) == 1).all()
+    assert balanced.metadata["pad_size"] == 0
     targets = []
     theta = torch.tensor(0.8, requires_grad=True)
     losses, grads = [], []
     for current in [data, balanced]:
         coefficients, _, _ = compute_topd_stopd_advantage(
-            current["rewards"], current["loss_mask"], groups, 128, 16, True
+            current["rewards"], current["loss_mask"], current.metadata["policy_prompt_boundaries"], 128, 16, True
         )
         targets.append(coefficients)
         loss, _ = topd_stopd_policy_loss(
@@ -196,9 +210,47 @@ def test_balance_preserves_prompt_mini_batches_signed_targets_and_gradients(dp_s
         )
         losses.append(loss)
         grads.append(torch.autograd.grad(loss, theta)[0])
-    torch.testing.assert_close(targets[1], targets[0][order], rtol=0, atol=0)
+    torch.testing.assert_close(targets[1][real_positions], targets[0][real_order], rtol=0, atol=0)
+    assert not targets[1][padding].any()
     torch.testing.assert_close(losses[0], losses[1])
     torch.testing.assert_close(grads[0], grads[1])
+
+    # Retain the production schedule: four mini-batches, two epochs, one
+    # global clip per Adam update. Padding is absent from every group divisor.
+    updates = []
+    for source in (data, balanced):
+        obj = trainer()
+        obj.cfg.trainer.algorithm.async_opd = True
+        current = copy.deepcopy(source)
+        coefficients, _, counts = compute_topd_stopd_advantage(
+            current["rewards"], current["loss_mask"], current.metadata["policy_prompt_boundaries"], 128, 16, True
+        )
+        current["advantages"] = coefficients
+        current.metadata["topd_token_counts"] = counts
+        obj._normalize_advantages(current, current.metadata["policy_mini_batch_boundaries"])
+        parameter = torch.nn.Parameter(torch.tensor(0.8))
+        optimizer = torch.optim.AdamW([parameter], lr=0.01)
+        gradients = []
+        for _ in range(2):
+            for start, end in current.metadata["policy_mini_batch_boundaries"]:
+                optimizer.zero_grad()
+                features = current["features"][start:end]
+                loss, _ = topd_stopd_policy_loss(
+                    parameter * features,
+                    torch.zeros_like(features),
+                    current["advantages"][start:end],
+                    obj.cfg.trainer.algorithm,
+                    current["loss_mask"][start:end],
+                    rollout_logprobs=torch.full_like(features, -0.4),
+                )
+                loss.backward()
+                gradients.append(parameter.grad.clone())
+                torch.nn.utils.clip_grad_norm_([parameter], 1.0)
+                optimizer.step()
+        assert optimizer.state[parameter]["step"] == 8
+        updates.append((torch.stack(gradients), parameter.detach(), optimizer.state[parameter]["exp_avg"]))
+    for actual, expected in zip(*updates, strict=True):
+        torch.testing.assert_close(actual, expected, atol=2e-7, rtol=2e-6)
 
 
 def test_balance_rejects_mismatched_microbatch_grid():

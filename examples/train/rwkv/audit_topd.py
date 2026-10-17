@@ -491,7 +491,8 @@ def main():
     check()
     cfg = OnPolicyDistillationConfig.from_cli_overrides(json.loads(args.config.read_text()))
     cfg.trainer.algorithm.async_opd = args.async_opd
-    assert args.samples % (world * cfg.trainer.micro_train_batch_size_per_gpu) == 0
+    if args.mode in ("kl", "precision", "control"):
+        assert args.samples % (world * cfg.trainer.micro_train_batch_size_per_gpu) == 0
     assert cfg.generator.n_samples_per_prompt == 2
     cfg.trainer.train_batch_size = args.samples // 2
     if args.mode != "targets":
@@ -554,13 +555,15 @@ def main():
             parser.error(f"{args.mode} requires --scored-input")
         with args.scored_input.open("rb") as handle:
             data = pickle.load(handle)
-        assert len(data) == args.samples
-    per_rank = args.samples // world
+        assert sum(end - start for start, end in data.metadata["policy_prompt_boundaries"]) == args.samples
+    assert len(data) % (world * cfg.trainer.micro_train_batch_size_per_gpu) == 0
+    per_rank = len(data) // world
     emit(
         "batch",
         {
             "tokens": int(data["attention_mask"].sum()),
             "response_tokens": int(data["response_mask"].sum()),
+            "padded_samples": len(data),
             "balance": trainer.all_metrics,
         },
     )
@@ -568,7 +571,7 @@ def main():
     def forward(worker, batch):
         output = worker.forward(copy.deepcopy(batch[rank * per_rank : (rank + 1) * per_rank]))
         local = torch.tensor([r["logprobs"] for r in output.loss_fn_outputs], device="cuda")
-        result = torch.empty((args.samples, local.shape[1]), dtype=local.dtype, device="cuda")
+        result = torch.empty((len(batch), local.shape[1]), dtype=local.dtype, device="cuda")
         dist.all_gather_into_tensor(result, local.contiguous())
         return result.cpu()
 
@@ -683,9 +686,9 @@ def main():
         old_kl = data["action_log_probs"] - data["base_action_log_probs"]
         change = delta.exp() * (after - data["base_action_log_probs"] - 1) + 1 - old_kl
         permutation = data.metadata.get("batch_permutation", range(len(data)))
-        domains = [rows[i]["env_extras"]["data_source"] for i in permutation]
+        domains = [rows[i]["env_extras"]["data_source"] if i < len(rows) else None for i in permutation]
         domain_metrics = {}
-        for domain in sorted(set(domains)):
+        for domain in sorted({domain for domain in domains if domain is not None}):
             selected = mask & torch.tensor([d == domain for d in domains]).unsqueeze(1)
             domain_metrics[domain] = {
                 "tokens": int(selected.sum()),

@@ -1438,10 +1438,17 @@ class RayPPOTrainer:
             # the packing — and resulting logprobs/values — match what forward_backward recomputes.
             all_chunk_refs = self.dispatch.stage_data(model, data_fwd_pass, mini_batch_boundaries)
             combined_outputs: List[Dict[str, Any]] = []
-            for chunk_refs in all_chunk_refs:
+            for (start, end), chunk_refs in zip(mini_batch_boundaries, all_chunk_refs, strict=True):
                 mb_output = self.dispatch.forward_from_staged(model, chunk_refs)
-                combined_outputs.extend(mb_output.loss_fn_outputs)
-            return loss_fn_outputs_to_tensor(combined_outputs, key=key)
+                # stage_data pads each mini-batch independently for DP. Remove
+                # those synthetic rows before concatenation, or every following
+                # mini-batch's scores shift relative to its sampled tokens.
+                combined_outputs.extend(mb_output.loss_fn_outputs[: end - start])
+            result = loss_fn_outputs_to_tensor(combined_outputs, key=key)
+            # The input may also have trailing full-batch padding. Keep its
+            # tensor shape without inserting padding between real mini-batches.
+            padding = result.new_zeros((len(data_fwd_pass) - len(result), *result.shape[1:]))
+            return torch.cat((result, padding), dim=0)
 
         output = self.dispatch.forward(model, data_fwd_pass)
         return loss_fn_outputs_to_tensor(output.loss_fn_outputs, key=key)

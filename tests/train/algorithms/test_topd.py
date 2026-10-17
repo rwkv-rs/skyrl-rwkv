@@ -598,3 +598,115 @@ def test_async_topd_stopd_configuration_preserves_logical_optimizer_schedule(mod
     )
     validate_batch_sizes(cfg)
     assert cfg.trainer.update_epochs_per_batch * cfg.trainer.train_batch_size // cfg.trainer.policy_mini_batch_size == 8
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("objective", ["topd_stopd", "grpo"])
+async def test_native_group_streaming_matches_complete_topd_stopd_optimizer(objective):
+    from examples.train.on_policy_distillation.main_on_policy_distill import (
+        FullyAsyncOnPolicyDistillationTrainer,
+    )
+    from skyrl.backends.skyrl_train.utils.ppo_utils import AdaptiveKLController
+    from skyrl.train.fully_async_trainer import (
+        FullyAsyncRayPPOTrainer,
+        GeneratedOutputGroup,
+    )
+    from skyrl.train.generators.utils import concatenate_generator_outputs
+
+    cfg = config(
+        **{
+            "trainer.policy_mini_batch_size": 2,
+            "trainer.update_epochs_per_batch": 1,
+            "trainer.micro_train_batch_size_per_gpu": 1,
+            "trainer.micro_forward_batch_size_per_gpu": 1,
+            "trainer.fully_async.enabled": True,
+            "trainer.fully_async.mode": "zero_stale",
+            "trainer.fully_async.max_staleness_steps": 0,
+            "trainer.fully_async.streaming_batch_size": 1,
+        }
+    )
+    if objective == "grpo":
+        cfg.trainer.algorithm.topd.enabled = False
+        cfg.trainer.algorithm.stopd.enabled = False
+        cfg.trainer.algorithm.advantage_estimator = "grpo"
+        cfg.trainer.algorithm.policy_loss_type = "regular"
+    loss_function = topd_stopd_policy_loss if objective == "topd_stopd" else ppo_policy_loss
+    trainer_class = FullyAsyncOnPolicyDistillationTrainer if objective == "topd_stopd" else FullyAsyncRayPPOTrainer
+    groups = []
+    for i, uid in enumerate(["a", "b"]):
+        responses = [[10 + i, 11, 12, 0], [13 + i, 0]]
+        output = {
+            "prompt_token_ids": [[1, 2], [1, 2]],
+            "response_ids": responses,
+            "rewards": [[0.0] * len(row) for row in responses],
+            "loss_masks": [[1] * len(row) for row in responses],
+            "rollout_logprobs": [[-0.6] * len(row) for row in responses],
+            "rollout_metrics": {},
+            "stop_reasons": ["stop", "stop"],
+        }
+        groups.append(GeneratedOutputGroup(output, uid, 1))
+    results = []
+    for streaming in [False, True]:
+        obj = object.__new__(trainer_class)
+        obj.cfg, obj.global_step, obj.mini_batch_size = cfg, 1, 2
+        obj.stopd = STOPD(8, 2, 0, 11, require_denominator=False)
+        obj.tokenizer = SimpleNamespace(pad_token_id=0)
+        obj.all_metrics, obj.all_timings = {}, {}
+        obj.reward_kl_controller = AdaptiveKLController(init_kl_coef=0.1, target=0.1, horizon=100)
+        obj.postprocess_generator_output = lambda output, uids: (output, uids)
+        parameter = torch.nn.Parameter(torch.tensor(0.13))
+        optimizer = torch.optim.AdamW([parameter], lr=1e-3)
+
+        def features(data):
+            return data["sequences"][:, -data["loss_mask"].shape[1] :].float().sin()
+
+        def score(data):
+            data["action_log_probs"] = torch.full_like(data["loss_mask"], -0.5, dtype=torch.float32)
+            data["base_action_log_probs"] = data["action_log_probs"] + features(data) * 0.2
+            data["values"] = None
+            return data
+
+        def backward(model, data, **kwargs):
+            current = data["action_log_probs"] + parameter * features(data)
+            loss, _ = loss_function(
+                current,
+                data["action_log_probs"],
+                data["advantages"],
+                cfg.trainer.algorithm,
+                data["loss_mask"],
+                data["rollout_logprobs"],
+            )
+            loss.backward()
+            return SimpleNamespace(metrics={"policy_loss": loss.item()})
+
+        def step(model, gradient_scale=1.0):
+            parameter.grad.mul_(gradient_scale)
+            norm = torch.nn.utils.clip_grad_norm_([parameter], 0.05).item()
+            optimizer.step()
+            return norm
+
+        obj.dispatch = SimpleNamespace(
+            dp_size=lambda _: 1, get_lcm_dp_size=lambda: 1, forward_backward=backward, optim_step=step
+        )
+        obj.fwd_logprobs_values_reward = score
+        full_output = concatenate_generator_outputs([g.generator_output for g in groups])
+        full = obj.convert_to_training_input(full_output, ["a", "a", "b", "b"])
+        if streaming:
+            obj._begin_streaming_step()
+            for group in reversed(groups):
+                obj._stream_training_groups([group])
+            await obj._run_training(full)
+            if objective == "topd_stopd":
+                assert obj.stopd.step == 1
+        else:
+            full = score(full)
+            full = obj.apply_reward_kl_penalty(full)
+            full = obj.compute_advantages_and_returns(full)
+            obj._normalize_advantages(full, [(0, 4)], full.metadata["policy_prompt_boundaries"])
+            backward("policy", full)
+            step("policy")
+        results.append(
+            (parameter.detach().clone(), parameter.grad.clone(), optimizer.state[parameter]["exp_avg"].clone())
+        )
+    for actual, expected in zip(*results):
+        torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-7)

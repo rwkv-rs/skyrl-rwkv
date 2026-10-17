@@ -346,6 +346,11 @@ class _AsyncDataloader:
         async with self._lock:
             if not self._reshuffle_each_epoch:
                 self._train_dataloader.load_state_dict(self._train_dataloader_initial_state)
+            else:
+                # Native drop_last consumes the sampler's remainder before
+                # the next epoch. Drain that same tail to advance its RNG.
+                for _ in self._iter:
+                    pass
             self._iter = enumerate(self._train_dataloader)
             if self._reshuffle_each_epoch:
                 self._train_dataloader_initial_state = self._train_dataloader.state_dict()
@@ -520,6 +525,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             or cfg.trainer.train_batch_size % size
             or cfg.trainer.critic.model.path is not None
             or cfg.trainer.algorithm.advantage_batch_normalize
+            or cfg.trainer.algorithm.zero_variance_filter
             or cfg.generator.step_wise_trajectories
         ):
             raise ValueError(
@@ -529,6 +535,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             raise ValueError("Gradient streaming requires GRPO group advantages or OPD token advantages")
         if cfg.trainer.algorithm.loss_reduction == "token_mean" and not self._streaming_supports_token_mean:
             raise ValueError("Streaming token_mean requires OPD; use sequence_mean or prompt_mean for GRPO")
+        if self._streaming_token_normalization() and (
+            cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_entropy_loss
+        ):
+            raise ValueError(
+                "Streaming OPD token normalization requires the distillation objective without auxiliary losses"
+            )
         dp = cfg.trainer.placement.policy_num_nodes * cfg.trainer.placement.policy_num_gpus_per_node
         dp = math.lcm(dp, cfg.trainer.placement.ref_num_nodes * cfg.trainer.placement.ref_num_gpus_per_node)
         if size * cfg.generator.n_samples_per_prompt % (dp * cfg.trainer.micro_train_batch_size_per_gpu):
@@ -558,7 +570,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             )
         )
         if self.cfg.trainer.algorithm.use_kl_in_reward:
+            controller = copy.deepcopy(self.reward_kl_controller)
             data = self.apply_reward_kl_penalty(data)
+            # The adaptive controller advances on the complete logical batch
+            # in _run_training; ready groups must all use its original value.
+            self.reward_kl_controller = controller
         data = self.compute_advantages_and_returns(data)
         data = self._normalize_advantages(
             data, data.metadata["policy_mini_batch_boundaries"], data.metadata["policy_prompt_boundaries"]
@@ -1129,11 +1145,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # calculate kl divergence and create experiences
         if self.cfg.trainer.algorithm.use_kl_in_reward:
             with Timer("apply_reward_kl_penalty", self.all_timings):
-                training_input = self.apply_reward_kl_penalty(training_input)
+                training_input = await asyncio.to_thread(self.apply_reward_kl_penalty, training_input)
 
         # calculate advantages and returns / along with tensorboard logging
         with Timer("compute_advantages_and_returns", self.all_timings):
-            training_input = self.compute_advantages_and_returns(training_input)
+            training_input = await asyncio.to_thread(self.compute_advantages_and_returns, training_input)
             # remove some unwanted keys
             for key in ["rewards"]:
                 training_input.pop(key)
@@ -1142,7 +1158,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         if self.cfg.trainer.dump_data_batch:
             # dump data to file
             with Timer("dump_data_batch"):
-                self.dump_data(training_input, file_name=f"global_step_{self.global_step}_training_input")
+                await asyncio.to_thread(
+                    self.dump_data, training_input, file_name=f"global_step_{self.global_step}_training_input"
+                )
 
         # train policy/critic model
         with Timer("train_critic_and_policy", self.all_timings):

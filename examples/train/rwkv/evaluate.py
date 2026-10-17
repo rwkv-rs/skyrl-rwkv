@@ -14,6 +14,44 @@ import sys
 from pathlib import Path
 
 
+def create_eval_server_pool(cfg, worker_locations):
+    """Create native vLLM servers on offloaded trainer GPUs, as in ServerGroup."""
+    import ray
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    from skyrl.backends.skyrl_train.inference_servers.common import SERVER_PORT_STRIDE
+    from skyrl.backends.skyrl_train.inference_servers.engine_utils import build_engine_runtime_env
+    from skyrl.backends.skyrl_train.inference_servers.server_pool import ServerActorPool
+    from skyrl.backends.skyrl_train.inference_servers.utils import build_vllm_cli_args
+    from skyrl.backends.skyrl_train.inference_servers.vllm_server_actor import VLLMServerActor
+
+    args = build_vllm_cli_args(cfg)
+    args.tensor_parallel_size = args.pipeline_parallel_size = args.data_parallel_size = 1
+    args.enable_sleep_mode = False
+    actors = []
+    for index, (node_id, gpu_id) in enumerate(worker_locations):
+        actor = ray.remote(VLLMServerActor).options(
+            num_gpus=0,
+            num_cpus=0.2,
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
+            runtime_env=build_engine_runtime_env(
+                use_expandable_segments=cfg.generator.inference_engine.use_expandable_segments
+            ),
+        )
+        actors.append(
+            actor.remote(
+                args,
+                start_port=18000 + index * SERVER_PORT_STRIDE,
+                server_idx=index,
+                distributed_executor_backend="mp",
+                mp_cuda_visible_devices=str(gpu_id),
+                colocated_training=True,
+                enable_ray_prometheus_stats=cfg.generator.inference_engine.enable_ray_prometheus_stats,
+            )
+        )
+    return ServerActorPool(actors)
+
+
 def set_generation_budgets(docs, model, tokenizer, context_length, strip_template):
     """Use the producer's exact messages and the inference tokenizer/template."""
     for doc in docs:

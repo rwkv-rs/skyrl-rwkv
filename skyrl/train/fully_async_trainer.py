@@ -19,7 +19,7 @@ import os
 import sys
 import time
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Set, Tuple
@@ -169,6 +169,7 @@ class _AsyncStalenessManager:
         # Control logics.
         self._stat = _RolloutStat()
         self._cond = asyncio.Condition()
+        self._paused = False
 
         # The current version that is being worked on, i.e. FullyAsyncRayPPOTrainer.global_step.
         # `self._current_global_step - 1` is the number of steps the model has finished training.
@@ -206,6 +207,8 @@ class _AsyncStalenessManager:
             )
 
     def _compute_capacity_unlocked(self) -> int:
+        if self._paused:
+            return 0
         # NOTE(Charlie): do not need a self._current_global_step + 1 here unlike AReal because our
         # `_current_global_step` is "the version being worked on", not already finished steps.
         consumer_capacity = (self.max_staleness_steps + self._current_global_step) * self.mini_batch_size
@@ -231,6 +234,24 @@ class _AsyncStalenessManager:
         """Wait for a fixed admitted batch to close before publishing new weights."""
         async with self._cond:
             await self._cond.wait_for(lambda: self._stat.accepted >= count)
+
+    @asynccontextmanager
+    async def pause_generation(self, failure: BackgroundFailure):
+        """Close admission and drain running groups, retaining completed rollouts."""
+
+        async def wait_until_idle():
+            async with self._cond:
+                await self._cond.wait_for(lambda: self._stat.running == 0)
+
+        async with self._cond:
+            self._paused = True
+        try:
+            await failure.guard(wait_until_idle())
+            yield
+        finally:
+            async with self._cond:
+                self._paused = False
+                self._cond.notify_all()
 
     async def on_rollout_accepted(self) -> None:
         async with self._cond:
@@ -510,6 +531,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         self._generation_completion_order = 0
         self._generation_consumption_order = 0
         self._generation_submission_lock = asyncio.Lock()
+        self._generation_failure = BackgroundFailure()
         self._pending_generation_batches = {}
         if cfg.trainer.fully_async.streaming_batch_size:
             self._validate_gradient_streaming()
@@ -714,7 +736,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                 generation_output_group_buffer = asyncio.Queue[GeneratedOutputGroup](maxsize=self._gen_buffer_maxsize)
                 self._pending_generation_batches.clear()
                 # First generation-worker exception; consumers waiting on the buffer raise it.
-                generation_failure = BackgroundFailure()
+                generation_failure = self._generation_failure = BackgroundFailure()
 
                 # Maintain self.num_parallel_generation_workers concurrent group-generation workers
                 generator_tasks = [

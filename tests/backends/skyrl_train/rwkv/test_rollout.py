@@ -336,7 +336,10 @@ def test_math_rollout_preserves_coordinate_commas(tmp_path, tokenizer):
     assert samples["wrong"]["sample_index"] == 1
 
 
-def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(tmp_path, tokenizer):
+@pytest.mark.parametrize("samples_per_prompt", [1, 64])
+def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(
+    tmp_path, tokenizer, samples_per_prompt
+):
     from aiohttp import web
 
     for index in range(4):
@@ -392,6 +395,8 @@ def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(
                     "--max-num-seqs",
                     "1",
                     "--save-rollouts",
+                    "--samples-per-prompt",
+                    str(samples_per_prompt),
                     "--sampling",
                     "rollout",
                     "--score-workers",
@@ -405,6 +410,10 @@ def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(
             dataset_row(tmp_path, "Knowledge", "Knowledge_4", "q4", "42", part="part2.jsonl")
             args.resume = True
             await rollout.run(args)
+            args.samples_per_prompt = samples_per_prompt + 1
+            with pytest.raises(ValueError, match="changed rollouts_per_question"):
+                await rollout.run(args)
+            args.samples_per_prompt = samples_per_prompt
             args.max_tokens = 10
             with pytest.raises(ValueError, match="changed max_tokens"):
                 await rollout.run(args)
@@ -438,26 +447,26 @@ def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(
     assert summary["config"]["status"] == "completed"
     assert summary["config"]["queues"]["inflight"] == [0, 0]
     assert summary["Knowledge"]["num_questions"] == 5
-    assert summary["Knowledge"]["correct_rollouts"] == 320
-    assert summary["Knowledge"]["correct_count_histogram"] == {"64": 5}
+    assert summary["Knowledge"]["correct_rollouts"] == 5 * samples_per_prompt
+    assert summary["Knowledge"]["correct_count_histogram"] == {str(samples_per_prompt): 5}
     assert summary["config"]["resumed_questions"] == 4
     assert summary["config"]["progress"]["scored_questions"] == 5
-    assert sum(requests.values()) == 320 and all(requests[index] > 0 for index in range(2))
+    assert sum(requests.values()) == 5 * samples_per_prompt and all(requests[index] > 0 for index in range(2))
     assert len(tokenizer.prompts) == 5
     records = [json.loads(line) for line in (output / "correct_counts_by_question.jsonl").read_text().splitlines()]
     assert len(records) == 5
     assert {record["uuid"] for record in records} == {f"Knowledge_{index}" for index in range(5)}
-    assert all(record["counts"] == {"correct": 64} for record in records)
+    assert all(record["counts"] == {"correct": samples_per_prompt} for record in records)
     trajectories = [
         json.loads(line) for path in (output / "rollouts").glob("*/*.jsonl") for line in path.read_text().splitlines()
     ]
-    assert len(trajectories) == 320
-    assert len({(record["uuid"], record["sample_index"]) for record in trajectories}) == 320
+    assert len(trajectories) == 5 * samples_per_prompt
+    assert len({(record["uuid"], record["sample_index"]) for record in trajectories}) == 5 * samples_per_prompt
     assert all(record["response_ids"] == list(b"Final answer: 42") + [0] for record in trajectories)
     assert all(record["reward"] == 1.0 and not record["truncated"] for record in trajectories)
     assert not list((output / "rollouts").glob("*/*.pending"))
     manifest = build_value_data.build_data(output, tmp_path / "value", validation_fraction=0.5, seed=0, max_length=64)
-    assert sum(manifest["counts"][f"{split}_rollouts"] for split in ("train", "validation")) == 320
+    assert sum(manifest["counts"][f"{split}_rollouts"] for split in ("train", "validation")) == 5 * samples_per_prompt
 
 
 @pytest.fixture

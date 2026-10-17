@@ -279,6 +279,28 @@ def test_runtime_env_forwards_te_block_scale_mode(monkeypatch):
     assert env_vars["NVTE_FP8_BLOCK_SCALING_FP32_SCALES"] == "1"
 
 
+@pytest.mark.parametrize("configured", [False, True])
+def test_runtime_env_preserves_wandb_resume_destination(monkeypatch, configured):
+    destination = {
+        "WANDB_RUN_ID": "existing-run",
+        "WANDB_RESUME": "must",
+        "WANDB_ENTITY": "existing-team",
+        "WANDB_PROJECT": "existing-project",
+        "WANDB_MODE": "online",
+        "WANDB_DIR": "/existing/run-directory",
+    }
+    for key, value in destination.items():
+        if configured:
+            monkeypatch.setenv(key, value)
+        else:
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+
+    env_vars = prepare_runtime_environment(example_dummy_config())
+
+    assert {key: env_vars[key] for key in destination if key in env_vars} == (destination if configured else {})
+
+
 def test_runtime_env_supports_fsdp_without_megatron_configs(monkeypatch):
     monkeypatch.delenv("NVTE_FP8_BLOCK_SCALING_FP32_SCALES", raising=False)
     monkeypatch.delenv("NVTE_FP8_BLOCK_AMAX_EPSILON", raising=False)

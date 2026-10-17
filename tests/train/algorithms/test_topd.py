@@ -163,6 +163,7 @@ def test_balance_preserves_prompt_mini_batches_signed_targets_and_gradients(dp_s
         dict(zip(["sequences", "attention_mask", "response_mask", "rewards", "loss_mask"], tensors[:5]))
     )
     data["features"] = torch.linspace(-0.7, 0.7, data["rewards"].numel()).reshape_as(data["rewards"])
+    data["rollout_logprobs"] = torch.full_like(data["rewards"], -50)
     groups = [(i, i + 2) for i in range(0, rows, 2)]
     data.metadata = {
         "uids": [str(i // 2) for i in range(rows)],
@@ -191,6 +192,22 @@ def test_balance_preserves_prompt_mini_batches_signed_targets_and_gradients(dp_s
     padding = torch.tensor([i >= rows for i in order])
     assert not balanced["loss_mask"][padding].any()
     assert not balanced["response_mask"][padding].any()
+    assert not balanced["rollout_logprobs"][padding].any()
+    assert not balanced["rewards"][padding].any()
+    if padding.any():
+        dummy = torch.zeros_like(balanced["rollout_logprobs"][padding], dtype=torch.float16, requires_grad=True)
+        algorithm = config().trainer.algorithm
+        algorithm.async_opd = True
+        loss, _ = topd_stopd_policy_loss(
+            dummy,
+            torch.zeros_like(dummy),
+            torch.zeros((*dummy.shape, 2), dtype=dummy.dtype),
+            algorithm,
+            balanced["loss_mask"][padding],
+            balanced["rollout_logprobs"][padding].half(),
+        )
+        assert loss.item() == 0
+        assert not torch.autograd.grad(loss, dummy)[0].any()
     assert (balanced["attention_mask"][padding].sum(-1) == 1).all()
     assert balanced.metadata["pad_size"] == 0
     targets = []

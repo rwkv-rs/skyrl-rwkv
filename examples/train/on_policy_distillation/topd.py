@@ -58,7 +58,9 @@ def balance_training_input(data, dp_size, micro_batch_size):
         data["sequences"][real_rows:] = 0
         data["attention_mask"][real_rows:] = 0
         data["attention_mask"][real_rows:, -1] = 1
-        data["response_mask"][real_rows:] = 0
+        for key in ("response_mask", "rewards", "rollout_logprobs"):
+            if data.get(key) is not None:
+                data[key][real_rows:] = 0
     lengths = data["attention_mask"].sum(-1).tolist()
     order, balanced_boundaries = [], []
     padding_start = real_rows

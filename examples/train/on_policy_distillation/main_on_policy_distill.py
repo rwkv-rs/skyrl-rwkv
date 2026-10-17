@@ -9,6 +9,7 @@ from pathlib import Path
 
 import ray
 import torch
+from loguru import logger
 
 from examples.train.on_policy_distillation.stopd import STOPD, STOPDConfig, request_seed
 from examples.train.on_policy_distillation.topd import (
@@ -295,10 +296,11 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
             self.all_metrics.update(metrics)
         return data
 
-    async def eval(self, vllm_metrics_scraper=None):
+    async def eval(self, vllm_metrics_scraper=None, *, inference_engine_client=None):
         config = self.cfg.trainer.algorithm.lighteval
         if config.project is None:
             return await super().eval(vllm_metrics_scraper=vllm_metrics_scraper)
+        client = inference_engine_client or self.inference_engine_client
         output = Path(self.cfg.trainer.export_path) / "lighteval" / f"global_step_{self.global_step}"
         output.mkdir(parents=True, exist_ok=True)
         command = [
@@ -313,9 +315,9 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
             "--project",
             config.project,
             "--url",
-            self.inference_engine_client.proxy_url,
+            client.proxy_url,
             "--model",
-            self.inference_engine_client.model_name,
+            client.model_name,
             "--tokenizer",
             self.cfg.trainer.policy.model.path,
             "--output",
@@ -329,9 +331,7 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
             "--context-length",
             str(config.context_length),
             "--concurrency",
-            str(
-                self.cfg.generator.inference_engine.num_engines * self.cfg.generator.inference_engine.max_num_seqs + 32
-            ),
+            str(len(client.server_urls) * self.cfg.generator.inference_engine.max_num_seqs + 32),
         ]
         # Keep the producer's pinned math dependency private to the evaluation
         # subprocess, using this project's interpreter and virtual environment.
@@ -614,6 +614,42 @@ class FullyAsyncOnPolicyDistillationTrainer(FullyAsyncRayPPOTrainer, OnPolicyDis
 
     _streaming_supports_token_mean = True
     _preserve_epoch_shuffle = True
+
+    async def eval(self, vllm_metrics_scraper=None):
+        if self.cfg.trainer.algorithm.lighteval.project is None:
+            return await super().eval(vllm_metrics_scraper=vllm_metrics_scraper)
+
+        from examples.train.rwkv.evaluate import create_eval_server_pool
+        from skyrl.backends.skyrl_train.inference_servers.setup import build_new_inference_client
+
+        async with self._staleness_manager.pause_generation(self._generation_failure):
+            await asyncio.to_thread(self.save_models)
+            cfg = copy.deepcopy(self.cfg)
+            cfg.trainer.policy.model.path = str(
+                Path(cfg.trainer.export_path) / f"global_step_{self.global_step}" / "policy"
+            )
+            cfg.generator.inference_engine.served_model_name = self.inference_engine_client.model_name
+            locations = self.dispatch.get_worker_gpu_locations("policy")
+            with self.dispatch.offload_for_evaluation():
+                pool = create_eval_server_pool(cfg, locations)
+                try:
+                    await asyncio.to_thread(pool.start)
+                    cfg.generator.inference_engine.external_proxy_url = None
+                    cfg.generator.inference_engine.external_server_urls = (
+                        self.inference_engine_client.server_urls + pool.get_server_urls()
+                    )
+                    client, setup = await asyncio.to_thread(build_new_inference_client, cfg, self.tokenizer)
+                    try:
+                        logger.info(f"LightEval using {len(client.server_urls)} engines with training paused")
+                        metrics = await super().eval(
+                            vllm_metrics_scraper=vllm_metrics_scraper, inference_engine_client=client
+                        )
+                        metrics["eval/lighteval/num_engines"] = len(client.server_urls)
+                        return metrics
+                    finally:
+                        await asyncio.to_thread(setup.router.shutdown)
+                finally:
+                    await asyncio.to_thread(pool.shutdown)
 
     def _streaming_token_normalization(self):
         return not self.cfg.trainer.algorithm.topd.enabled and (self.stopd is None or not self.stopd.truncating)

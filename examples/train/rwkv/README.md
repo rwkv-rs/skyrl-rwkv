@@ -1477,6 +1477,16 @@ workers, and NoRA-to-full-weight synchronization. Set `NUM_POLICY_GPUS` and
 `NUM_INFERENCE_GPUS` to partition the same device budget; the teacher shares
 learner devices. RWKV clears its recurrent cache when weights change.
 
+OPD's native `lighteval-rwkv` evaluation temporarily uses both device sets.
+Training updates and new training rollout admission pause while running
+requests drain. Trainer models and optimizer states move to CPU, and native
+vLLM servers on the learner GPUs load the current merged student export.
+The existing rollout servers and these temporary servers share one evaluation
+router. After evaluation, the temporary servers exit, trainer residency is
+restored, and training continues with its buffered rollouts. The 7+1 training
+layout therefore evaluates on all eight GPUs; `eval/lighteval/num_engines`
+records the evaluation pool size.
+
 | Mode | Rollout/update scheduling | TOP-D + STOPD |
 | --- | --- | --- |
 | `one_step_off` | Fixed logical batches; overlap the next rollout batch with the current batch's updates; publish weights after that rollout batch closes | Supported |

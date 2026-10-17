@@ -368,18 +368,20 @@ def test_should_keep_group_token_level_rewards():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("workers", [0, 2])
 @pytest.mark.parametrize("epoch", [0, 1])
-async def test_import_synchronous_checkpoint_preserves_remaining_shuffle(workers, epoch):
+@pytest.mark.parametrize("num_rows", [24, 27])
+async def test_import_synchronous_checkpoint_preserves_remaining_shuffle(workers, epoch, num_rows):
     import copy
 
     import torch
 
-    rows = [{"uid": str(i)} for i in range(24)]
+    rows = [{"uid": str(i)} for i in range(num_rows)]
 
     def loader(batch_size):
         return StatefulDataLoader(
             rows,
             batch_size=batch_size,
             shuffle=True,
+            drop_last=batch_size != 1,
             num_workers=workers,
             generator=torch.Generator().manual_seed(42),
             collate_fn=list,

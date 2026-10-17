@@ -322,6 +322,7 @@ bash examples/train/rwkv/run_rwkv_flashreinforce.sh \
   trainer.critic.model.path="$CRITIC_DIR" \
   trainer.critic.model_config_kwargs.wkv_mode=fp32io16 \
   trainer.critic_mini_batch_size=64 \
+  generator.inference_engine.engine_init_kwargs.logprobs_mode=raw_logprobs \
   generator.use_conversation_multi_turn=true \
   > /tmp/results_rwkv_sao.log 2>&1
 ```

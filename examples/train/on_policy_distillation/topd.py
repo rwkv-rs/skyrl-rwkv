@@ -12,7 +12,7 @@ import torch
 
 from skyrl.train.config import BaseConfig
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
-from skyrl.backends.skyrl_train.utils.ppo_utils import reduce_loss
+from skyrl.backends.skyrl_train.utils.ppo_utils import ppo_policy_loss, reduce_loss
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean, safe_exp_delta
 
 
@@ -55,6 +55,27 @@ def balance_training_input(data, dp_size, micro_batch_size):
         prompt_groups = [list(range(a, b)) for a, b in groups if start <= a < end]
         prompt_groups.sort(key=lambda group: max(lengths[i] for i in group))
         sorted_indices = [i for group in prompt_groups for i in group]
+        if (end - start) % (dp_size * unit_size):
+            # Native dispatch pads uneven DP slices after advantages have been
+            # normalized over real prompts. Keep groups together here and sort
+            # their microbatch neighbors without introducing synthetic prompts.
+            assigned = [[] for _ in range(dp_size)]
+            loads = [0] * dp_size
+            slots = math.ceil(len(prompt_groups) / dp_size)
+            for group in reversed(prompt_groups):
+                rank = min((r for r in range(dp_size) if len(assigned[r]) < slots), key=lambda r: loads[r])
+                assigned[rank].append(group)
+                loads[rank] += cost(group)
+            sorted_indices = [i for rank in assigned for group in rank for i in group]
+            rank_rows = math.ceil((end - start) / dp_size)
+            original_costs = [cost(list(range(a, min(a + rank_rows, end)))) for a in range(start, end, rank_rows)]
+            new_costs = [cost(sorted_indices[a : a + rank_rows]) for a in range(0, end - start, rank_rows)]
+            order[start:end] = sorted_indices
+            before += sum(original_costs)
+            after += sum(new_costs)
+            before_makespan += max(original_costs)
+            after_makespan += max(new_costs)
+            continue
         units = [sorted_indices[i : i + unit_size] for i in range(0, len(sorted_indices), unit_size)]
         units.sort(key=cost, reverse=True)
         rank_rows = (end - start) // dp_size
@@ -153,9 +174,16 @@ def compute_topd_stopd_advantage(rewards, loss_mask, prompt_boundaries, max_len,
 
 def topd_stopd_policy_loss(log_probs, old_log_probs, advantages, config, loss_mask=None, rollout_logprobs=None):
     """PPO on signed telescoping levels, with normalization fixed by the trainer."""
+    if getattr(config, "async_opd", False):
+        old_log_probs = rollout_logprobs
     ratio = safe_exp_delta(log_probs - old_log_probs, clip=20.0, out_dtype=log_probs.dtype)
     clipped = ratio.clamp(1 - config.eps_clip_low, 1 + config.eps_clip_high)
     objective = torch.minimum(ratio, clipped) * advantages[..., 0] + torch.maximum(ratio, clipped) * advantages[..., 1]
     loss = reduce_loss(-objective, loss_mask)
     clip_ratio = masked_mean((ratio != clipped).float(), loss_mask).detach().item()
     return loss, {"clip_ratio": clip_ratio}
+
+
+def async_topd_policy_loss(log_probs, old_log_probs, advantages, config, loss_mask=None, rollout_logprobs=None):
+    """TOP-D's clipped surrogate anchored to the recorded behavior policy."""
+    return ppo_policy_loss(log_probs, rollout_logprobs, advantages, config, loss_mask, rollout_logprobs)

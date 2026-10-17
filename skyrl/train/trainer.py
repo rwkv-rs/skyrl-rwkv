@@ -944,7 +944,9 @@ class RayPPOTrainer:
         self.dispatch.init_weight_sync_state(self.inference_engine_client)
         logger.info("Initialized weight sync state for policy model and inference engines.")
 
-    def convert_to_training_input(self, generator_output: GeneratorOutput, uids: List[str]) -> TrainingInputBatch:
+    def convert_to_training_input(
+        self, generator_output: GeneratorOutput, uids: List[str], *, train_batch_size: Optional[int] = None
+    ) -> TrainingInputBatch:
         """Converts lists to a padded batch of tensors for training
 
         Args:
@@ -1037,11 +1039,15 @@ class RayPPOTrainer:
 
         # 4. Compute mini-batch boundaries for train_critic_and_policy(). It excludes the ones
         # we will add in pad_training_input_batch().
-        train_batch_size = self.cfg.trainer.train_batch_size
+        policy_mini_batch_size = self.cfg.trainer.policy_mini_batch_size
+        if train_batch_size is None:
+            train_batch_size = self.cfg.trainer.train_batch_size
+        else:
+            policy_mini_batch_size = train_batch_size
         n_samples_per_prompt = self.cfg.generator.n_samples_per_prompt
         is_stepwise = self.cfg.generator.step_wise_trajectories
         training_input.metadata["policy_mini_batch_boundaries"] = compute_prompt_mini_batch_boundaries(
-            uids, self.cfg.trainer.policy_mini_batch_size, train_batch_size, is_stepwise, n_samples_per_prompt
+            uids, policy_mini_batch_size, train_batch_size, is_stepwise, n_samples_per_prompt
         )
         # Per-prompt boundaries (used by the `prompt_mean` loss reduction). Policy-only,
         # since advantage normalization only applies to the policy.

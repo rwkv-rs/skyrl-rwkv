@@ -1224,6 +1224,16 @@ class FullyAsyncConfig(BaseConfig):
 
     enabled: bool = False
     """Indicates whether fully async training is enabled"""
+    mode: str = "fully_async"
+    """Execution protocol: ``fully_async`` consumes completed groups and permits in-flight
+    weight updates; ``one_step_off`` preserves logical batches and publishes only after
+    the next rollout batch closes; ``zero_stale`` closes the current batch before updating.
+    The latter two protocols preserve sampled STOPD budgets independently of completion order.
+    """
+    streaming_batch_size: int = 0
+    """Groups per ready learner batch in ``zero_stale`` mode; 0 waits for the complete batch.
+    Streaming accumulates gradients before one optimizer step at the logical batch barrier.
+    """
     max_staleness_steps: int = 4
     """Maximum off-policy steps allowed. If a trajectory group is scheduled at step *i* and trained at step *j*,
     then ``j - i <= max_staleness_steps``. Larger values increase throughput but also off-policy-ness."""
@@ -1264,6 +1274,15 @@ class FullyAsyncConfig(BaseConfig):
     simulate_weight_sync_seconds: float = 0.0
     """Wall-clock seconds generation stays paused to stand in for the (skipped) weight broadcast.
     0.0 = pause then immediately resume."""
+
+    def __post_init__(self):
+        if self.mode not in ("fully_async", "one_step_off", "zero_stale"):
+            raise ValueError("fully_async.mode must be fully_async, one_step_off, or zero_stale")
+        expected_staleness = {"one_step_off": 1, "zero_stale": 0}.get(self.mode)
+        if expected_staleness is not None and self.max_staleness_steps != expected_staleness:
+            raise ValueError(f"{self.mode} requires max_staleness_steps={expected_staleness}")
+        if self.streaming_batch_size < 0 or (self.streaming_batch_size and self.mode != "zero_stale"):
+            raise ValueError("streaming_batch_size must be nonnegative and requires zero_stale mode")
 
 
 # ---------------------------------------------------------------------------

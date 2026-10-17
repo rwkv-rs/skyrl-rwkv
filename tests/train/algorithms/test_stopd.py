@@ -400,6 +400,7 @@ async def test_request_budgets_and_seeds_preserve_eval_and_inputs(
 ):
     generator = object.__new__(STOPDGenerator)
     generator.complete_rollouts = complete_rollouts
+    generator.async_generation = False
     generator.grouped_budgets = grouped_budgets
     generator.generator_cfg = SimpleNamespace(n_samples_per_prompt=2)
     generator.stopd = STOPD(8, 2, warmup_steps, 11, seed=42)
@@ -532,6 +533,7 @@ def test_resume_restores_dataloader_and_stopd_state(tmp_path, monkeypatch):
     monkeypatch.setattr(RayPPOTrainer, "load_checkpoints", lambda self: (50, str(tmp_path)))
     trainer = object.__new__(OnPolicyDistillationTrainer)
     trainer.stopd = STOPD(8, 2, 0, 999)
+    trainer.cfg = config()
     trainer.train_dataloader = MagicMock()
     assert trainer.load_checkpoints() == (50, str(tmp_path))
     trainer.train_dataloader.load_state_dict.assert_called_once_with({"position": 50})
@@ -543,6 +545,7 @@ def test_import_vanilla_checkpoint_requires_its_preceding_token_count(tmp_path, 
     monkeypatch.setattr(RayPPOTrainer, "load_checkpoints", lambda self: (50, str(tmp_path)))
     trainer = object.__new__(OnPolicyDistillationTrainer)
     trainer.stopd = STOPD(8, 2, 25)
+    trainer.cfg = config()
     trainer.train_dataloader = MagicMock()
     with pytest.raises(ValueError, match="initial_denominator"):
         trainer.load_checkpoints()
@@ -584,6 +587,7 @@ def test_invalid_dataloader_resume_is_not_silently_ignored(tmp_path, monkeypatch
     monkeypatch.setattr(RayPPOTrainer, "load_checkpoints", lambda self: (50, str(tmp_path)))
     trainer = object.__new__(OnPolicyDistillationTrainer)
     trainer.stopd = STOPD(8, 2, 25, 11)
+    trainer.cfg = config()
     trainer.train_dataloader = MagicMock()
     trainer.train_dataloader.load_state_dict.side_effect = ValueError("invalid sampler state")
     with pytest.raises(ValueError, match="invalid sampler state"):
@@ -681,3 +685,35 @@ def test_actual_training_input_preserves_generated_prefix_and_ipw(tmp_path, corr
             "response_tokens": 7,
             "ipw_advantages_exact": True,
         }
+
+
+@pytest.mark.asyncio
+async def test_async_stopd_budgets_and_sampling_seeds_follow_uids(monkeypatch):
+    generator = object.__new__(STOPDGenerator)
+    generator.complete_rollouts = False
+    generator.grouped_budgets = True
+    generator.async_generation = True
+    generator.generator_cfg = SimpleNamespace(n_samples_per_prompt=2)
+    generator.stopd = STOPD(8192, 128, 0, 11, seed=42)
+
+    async def capture(self, inputs, disable_tqdm=False):
+        return inputs["env_extras"]
+
+    monkeypatch.setattr(SkyRLGymGenerator, "generate", capture)
+    prompts = [
+        {"prompt": [{"role": "user", "content": "question"}], "uid": str(i), "env_class": "aime", "env_extras": {}}
+        for i in range(24)
+    ]
+
+    def inputs(rows):
+        return prepare_generator_input(rows, 2, {"max_tokens": 8192}, "aime", "train", 23)[0]
+
+    together = await generator.generate(inputs(prompts))
+    separate = []
+    for row in prompts:
+        separate.extend(await generator.generate(inputs([row])))
+    assert together == separate
+    budgets = [row["_stopd_budget"] for row in together]
+    assert all(budgets[i] == budgets[i + 1] for i in range(0, len(budgets), 2))
+    assert len(set(budgets)) > 8
+    assert all(together[i] != together[i + 1] for i in range(0, len(together), 2))

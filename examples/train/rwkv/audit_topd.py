@@ -63,6 +63,7 @@ def reference_loss_gradient(data, log_probs, config):
             log_probs[i, index].double().detach().requires_grad_() for i, index in zip(range(start, end), indices)
         ]
         old = [data["action_log_probs"][i, index].double() for i, index in zip(range(start, end), indices)]
+        behavior = [data["rollout_logprobs"][i, index].double() for i, index in zip(range(start, end), indices)]
         teacher = [data["base_action_log_probs"][i, index].double() for i, index in zip(range(start, end), indices)]
         rewards = [
             torch.logaddexp(t - o + math.log(alpha), torch.full_like(o, math.log1p(-alpha)))
@@ -83,7 +84,8 @@ def reference_loss_gradient(data, log_probs, config):
             mean = pooled.mean()
             standard_deviation = ((pooled - mean).square().mean()).sqrt()
             level_loss = torch.zeros((), dtype=torch.float64)
-            for now, before, value in zip(current, old, values):
+            anchor = behavior if config.trainer.algorithm.async_opd else old
+            for now, before, value in zip(current, anchor, values):
                 advantage = (value - mean) / (standard_deviation + epsilon)
                 ratio = (now[:horizon] - before[:horizon]).clamp(-20, 20).exp()
                 bounded = ratio.clamp(1 - clip_low, 1 + clip_high)
@@ -467,6 +469,15 @@ def main():
     parser.add_argument("--comparison-checkpoints", type=Path, nargs="*", default=[])
     parser.add_argument("--comparison-scales", type=float, nargs="+", default=[1.0])
     parser.add_argument("--learning-rates", type=float, nargs="+", default=[])
+    parser.add_argument(
+        "--async-opd", action="store_true", help="Anchor TOP-D/STOPD PPO ratios to saved behavior logprobs"
+    )
+    parser.add_argument(
+        "--streaming-microbatches",
+        type=int,
+        default=0,
+        help="Accumulate this many microbatches per ready chunk before one optimizer update",
+    )
     args = parser.parse_args()
     if args.mode == "precision" and args.teacher_adapter is None:
         parser.error("precision requires --teacher-adapter")
@@ -479,6 +490,7 @@ def main():
     dist.init_process_group("nccl")
     check()
     cfg = OnPolicyDistillationConfig.from_cli_overrides(json.loads(args.config.read_text()))
+    cfg.trainer.algorithm.async_opd = args.async_opd
     assert args.samples % (world * cfg.trainer.micro_train_batch_size_per_gpu) == 0
     assert cfg.generator.n_samples_per_prompt == 2
     cfg.trainer.train_batch_size = args.samples // 2
@@ -753,7 +765,12 @@ def main():
         ref_loss, ref_derivative = reference_loss_gradient(data, data["action_log_probs"], cfg)
         current = data["action_log_probs"].detach().requires_grad_()
         loss, _ = topd_stopd_policy_loss(
-            current, data["action_log_probs"], data["advantages"], cfg.trainer.algorithm, loss_mask=data["loss_mask"]
+            current,
+            data["action_log_probs"],
+            data["advantages"],
+            cfg.trainer.algorithm,
+            loss_mask=data["loss_mask"],
+            rollout_logprobs=data["rollout_logprobs"],
         )
         derivative = torch.autograd.grad(loss, current)[0]
         emit(
@@ -770,9 +787,11 @@ def main():
     def backward(batch, loss_fn):
         optimizer.zero_grad(set_to_none=True)
         worker.policy_loss_fn = loss_fn
-        status = worker.forward_backward(
-            copy.deepcopy(batch[rank * per_rank : (rank + 1) * per_rank]), return_per_token_outputs=False
-        )
+        shard = copy.deepcopy(batch[rank * per_rank : (rank + 1) * per_rank])
+        size = args.streaming_microbatches * cfg.trainer.micro_train_batch_size_per_gpu
+        chunks = shard.chunk(size) if size and loss_fn == topd_stopd_policy_loss else [shard]
+        for chunk in chunks:
+            status = worker.forward_backward(chunk, return_per_token_outputs=False)
         missing = [name for name, p in zip(names, parameters) if p.grad is None]
         nonfinite = [
             name
@@ -793,7 +812,12 @@ def main():
     after = forward(worker, data)
     if rank == 0:
         native_objective, _ = topd_stopd_policy_loss(
-            after, data["action_log_probs"], data["advantages"], cfg.trainer.algorithm, loss_mask=data["loss_mask"]
+            after,
+            data["action_log_probs"],
+            data["advantages"],
+            cfg.trainer.algorithm,
+            loss_mask=data["loss_mask"],
+            rollout_logprobs=data["rollout_logprobs"],
         )
         exact_after, _ = reference_loss_gradient(data, after, cfg)
         direction = compare_tensors(

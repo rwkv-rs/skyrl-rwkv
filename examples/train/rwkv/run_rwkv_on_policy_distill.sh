@@ -20,6 +20,26 @@ fi
 : "${TRAIN_FILE:=$DATA_DIR/train.parquet}"
 : "${TEST_FILE:=$HOME/data/dapo/aime-2024-cleaned.parquet}"
 : "${NUM_GPUS:=8}"
+
+# Optional native async rollout/learner placement. Fixed modes keep whole logical batches.
+: "${ASYNC_MODE:=disabled}"
+: "${ASYNC_STREAMING_BATCH_SIZE:=0}"
+: "${MINI_BATCH_SIZE:=512}"
+ASYNC_ENABLED=false
+COLOCATE_ALL=true
+ASYNC_STALENESS=1
+if [[ "$ASYNC_MODE" != disabled ]]; then
+  ASYNC_ENABLED=true
+  COLOCATE_ALL=false
+  : "${NUM_POLICY_GPUS:=$((NUM_GPUS - 1))}"
+  : "${NUM_INFERENCE_GPUS:=1}"
+  if [[ "$ASYNC_MODE" == zero_stale ]]; then
+    ASYNC_STALENESS=0
+  fi
+fi
+: "${NUM_POLICY_GPUS:=$NUM_GPUS}"
+: "${NUM_INFERENCE_GPUS:=$NUM_GPUS}"
+: "${ASYNC_GENERATION_WORKERS:=$MINI_BATCH_SIZE}"
 : "${USE_NORA:=true}"
 : "${USE_STOPD:=false}"
 : "${USE_TOPD:=false}"
@@ -42,11 +62,19 @@ if [[ "$USE_TOPD" == true ]]; then
   PROXIMAL_TEACHER_ALPHA="${TOPD_ALPHA:-0.2}"
   POLICY_MINI_BATCH_SIZE="${TOPD_MINI_BATCH_SIZE:-32}"
 fi
+ASYNC_OPD=false
+if [[ "$ASYNC_ENABLED" == true && "$ASYNC_MODE" != zero_stale ]]; then
+  ASYNC_OPD=true
+  if [[ "$USE_TOPD" == true ]]; then
+    if [[ "$USE_STOPD" != true ]]; then POLICY_LOSS_TYPE=async_topd; fi
+  else
+    POLICY_LOSS_TYPE=async_opd
+  fi
+fi
 : "${LIGHTEVAL_PROJECT:=$HOME/Projects/MachineLearning/lighteval-rwkv}"
 : "${LORA_RANK:=256}"
 : "${LORA_ALPHA:=$LORA_RANK}"
 : "${LORA_TARGET_MODULES:=[r_proj,k_proj,v_proj,o_proj,mlp.key,mlp.value,lm_head]}"
-: "${MINI_BATCH_SIZE:=512}"
 : "${MICRO_BATCH_SIZE:=4}"
 : "${MICRO_FORWARD_BATCH_SIZE:=4}"
 : "${LR:=2e-6}"
@@ -85,6 +113,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   data.train_data="['$TRAIN_FILE']" \
   data.val_data="['$TEST_FILE']" \
   trainer.algorithm.advantage_estimator=no_op \
+  trainer.algorithm.async_opd="$ASYNC_OPD" \
   trainer.algorithm.policy_loss_type="$POLICY_LOSS_TYPE" \
   trainer.algorithm.loss_reduction="$LOSS_REDUCTION" \
   trainer.algorithm.use_kl_in_reward=true \
@@ -121,13 +150,19 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   trainer.policy.fsdp_config.fsdp_size=1 \
   trainer.policy.fsdp_config.reshard_after_forward=false \
   trainer.policy.fsdp_config.sync_gradients_each_microbatch=false \
-  trainer.ref.fsdp_config.fsdp_size="$NUM_GPUS" \
+  trainer.ref.fsdp_config.fsdp_size="$NUM_POLICY_GPUS" \
   trainer.ref.fsdp_config.reshard_after_forward=false \
   trainer.ref.fsdp_config.mixed_precision.param_dtype="$TEACHER_DTYPE" \
   trainer.update_ref_every_epoch=false \
-  trainer.placement.colocate_all=true \
-  trainer.placement.policy_num_gpus_per_node="$NUM_GPUS" \
-  trainer.placement.ref_num_gpus_per_node="$NUM_GPUS" \
+  trainer.fully_async.enabled="$ASYNC_ENABLED" \
+  trainer.fully_async.mode="${ASYNC_MODE/disabled/fully_async}" \
+  trainer.fully_async.max_staleness_steps="$ASYNC_STALENESS" \
+  trainer.fully_async.num_parallel_generation_workers="$ASYNC_GENERATION_WORKERS" \
+  trainer.fully_async.streaming_batch_size="$ASYNC_STREAMING_BATCH_SIZE" \
+  trainer.fully_async.clear_kv_cache_on_weight_sync=true \
+  trainer.placement.colocate_all="$COLOCATE_ALL" \
+  trainer.placement.policy_num_gpus_per_node="$NUM_POLICY_GPUS" \
+  trainer.placement.ref_num_gpus_per_node="$NUM_POLICY_GPUS" \
   trainer.epochs=1 \
   trainer.max_training_steps=null \
   trainer.update_epochs_per_batch="$UPDATE_EPOCHS_PER_BATCH" \
@@ -160,7 +195,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   generator.inference_engine.engine_init_kwargs.max_model_len=25600 \
   generator.inference_engine.engine_init_kwargs.compilation_config='{"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}' \
   generator.inference_engine.run_engines_locally=true \
-  generator.inference_engine.num_engines="$NUM_GPUS" \
+  generator.inference_engine.num_engines="$NUM_INFERENCE_GPUS" \
   generator.inference_engine.tensor_parallel_size=1 \
   generator.inference_engine.weight_sync_backend=nccl \
   generator.inference_engine.enforce_eager=false \
@@ -171,6 +206,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   generator.eval_n_samples_per_prompt=32 \
   generator.chat_template_kwargs="{rwkv_prompt_template: bot, rwkv_generation_prompt: open_think}" \
   generator.sampling_params.max_generate_length="$MAX_GENERATE_LENGTH" \
+  generator.sampling_params.logprobs=1 \
   generator.sampling_params.temperature=1.0 \
   generator.sampling_params.top_p=1.0 \
   generator.sampling_params.top_k=-1 \

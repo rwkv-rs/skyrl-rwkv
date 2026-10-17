@@ -443,6 +443,73 @@ async def test_fixed_batches_ignore_completion_order_and_stream_before_closure()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("mode,staleness", [("one_step_off", 1), ("zero_stale", 0)])
+async def test_fixed_submission_preserves_sampler_order_across_capacity_waits(monkeypatch, mode, staleness):
+    trainer = object.__new__(FullyAsyncRayPPOTrainer)
+    trainer.cfg = example_dummy_config()
+    trainer.cfg.trainer.fully_async.streaming_batch_size = 0
+    trainer.async_mode = mode
+    trainer.global_step = 1
+    trainer.mini_batch_size = 4
+    trainer._generation_submission_lock = asyncio.Lock()
+    trainer._generation_completion_order = 0
+    trainer._generation_consumption_order = 0
+    trainer._pending_generation_batches = {}
+    trainer.all_timings = {}
+    trainer._phase_gauge = MagicMock()
+    trainer.inference_engine_client = SimpleNamespace(weight_version=1)
+    loader = StatefulDataLoader([{"uid": str(i)} for i in range(12)], batch_size=1, collate_fn=list)
+    trainer.async_train_dataloader = _AsyncDataloader(loader, 4)
+    manager = trainer._staleness_manager = _AsyncStalenessManager(3, 4, staleness)
+
+    monkeypatch.setattr(
+        "skyrl.train.fully_async_trainer.prepare_generator_input",
+        lambda rows, *args: (
+            {"batch_metadata": SimpleNamespace(global_step=1), "prompts": [rows[0]["uid"]]},
+            [rows[0]["uid"]],
+        ),
+    )
+
+    async def generate(inputs, disable_tqdm=True):
+        await asyncio.sleep(0)
+        return {}
+
+    trainer.generator = SimpleNamespace(generate=generate)
+    first_waiting, release_first = asyncio.Event(), asyncio.Event()
+    reserve = manager.acquire_submission_slot
+
+    async def delayed_first_reservation():
+        if not first_waiting.is_set():
+            first_waiting.set()
+            await release_first.wait()
+        return await reserve()
+
+    monkeypatch.setattr(manager, "acquire_submission_slot", delayed_first_reservation)
+    buffer, failure = asyncio.Queue(), BackgroundFailure()
+    tasks = [asyncio.create_task(trainer._run_generate_for_a_group_loop(buffer, failure)) for _ in range(3)]
+    try:
+        await asyncio.wait_for(first_waiting.wait(), 2)
+        # Other producers can reach admission while the first sampler row waits.
+        await asyncio.sleep(0)
+        release_first.set()
+        for step in range(1, 4):
+            trainer.global_step = step
+            groups, dropped, exhausted = await asyncio.wait_for(trainer._collect_fixed_batch(buffer, failure), 2)
+            assert [group.uid for group in groups] == [str(i) for i in range((step - 1) * 4, step * 4)]
+            assert not dropped and not exhausted
+            await trainer.async_train_dataloader.mark_consumed_uids(group.uid for group in groups)
+            await manager.notify_capacity_change(step + 1)
+        # Exhaustion must not reserve a slot or wait for another policy update.
+        await asyncio.wait_for(asyncio.gather(*tasks), 2)
+        assert manager._stat.submitted == manager._stat.accepted == 12
+        assert manager._stat.running == 0
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_weight_publication_barrier_waits_for_entire_admitted_batch():
     manager = _AsyncStalenessManager(4, 2, 1)
     assert [await manager.acquire_submission_slot() for _ in range(4)] == list(range(4))

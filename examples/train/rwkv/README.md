@@ -279,7 +279,7 @@ The default `prepare_opd.py` behavior remains the OPD dataset preparation.
 Use `generator.batched=false` and `generator.use_conversation_multi_turn=true`.
 Environment metadata selects `open_think` for Math and `fake_think` for the other
 domains while preserving the generated token IDs. For a 25600-token training
-context and 8192 generated tokens, set `data.max_prompt_length=17408`.
+context and 8192 generated tokens, set `trainer.max_prompt_length=17408`.
 
 Initialize the actor from the rollout checkpoint and the critic from the merged
 offline `best/` export. To continue critic training with NoRA, set
@@ -326,8 +326,9 @@ bash examples/train/rwkv/run_rwkv_flashreinforce.sh \
   > /tmp/results_rwkv_sao.log 2>&1
 ```
 
-After checking a few synchronous steps, use native fully async scheduling with
-`trainer.fully_async.enabled=true`, `trainer.placement.colocate_all=false`,
+After checking a few synchronous steps, select
+`TRAINING_ENTRYPOINT=examples.train.fully_async.main_fully_async` and use native
+fully async scheduling with `trainer.fully_async.enabled=true`, `trainer.placement.colocate_all=false`,
 appropriate policy/critic/inference GPU counts, and
 `trainer.fully_async.num_parallel_generation_workers=256`. Account for all three
 model placements when sizing a non-colocated run. The estimator is shared by the

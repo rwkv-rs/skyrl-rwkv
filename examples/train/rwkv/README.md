@@ -1478,6 +1478,7 @@ seven learner/teacher devices and one rollout device:
 
 ```bash
 ASYNC_MODE=one_step_off NUM_POLICY_GPUS=7 NUM_INFERENCE_GPUS=1 \
+MAX_GENERATE_LENGTH=16384 LR=2.5e-7 TOPD_BALANCE_BATCH=true \
 USE_TOPD=true USE_STOPD=true TOPD_GROUP_SIZE=2 MINI_BATCH_SIZE=512 \
 TOPD_MINI_BATCH_SIZE=128 UPDATE_EPOCHS_PER_BATCH=2 \
 uv run --isolated bash examples/train/rwkv/run_rwkv_on_policy_distill.sh \
@@ -1491,6 +1492,8 @@ normalization and future returns with a behavior-anchored clipped surrogate;
 STOPD's signed telescoping coefficients remain outside clipping. The local
 reverse-KL gradient identity for plain AsyncOPD does not apply to TOP-D's
 separate objective or remove stale-prefix distribution differences.
+Native `fully_async` uses one policy mini-batch per logical batch, so set
+`policy_mini_batch_size=train_batch_size` for that mode.
 
 Following [ThunderSyncRL](https://arxiv.org/abs/2610.05935), `zero_stale` can
 set `ASYNC_STREAMING_BATCH_SIZE` to a positive number of complete prompt groups.

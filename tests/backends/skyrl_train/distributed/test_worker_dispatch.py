@@ -36,6 +36,37 @@ class ForwardBackwardTimeoutError(StepTimeoutError):
     pass
 
 
+@pytest.mark.parametrize("colocate_all", [False, True])
+def test_evaluation_offload_restores_only_previously_resident_state(colocate_all):
+    from skyrl.backends.skyrl_train.workers.worker_dispatch import (
+        GPUState,
+        WorkerDispatch,
+    )
+
+    dispatch = WorkerDispatch.__new__(WorkerDispatch)
+    dispatch.colocate_all = colocate_all
+    dispatch._actor_groups = {name: MagicMock() for name in ("policy", "ref", "critic")}
+    dispatch._gpu_state = {
+        "policy": GPUState(True, True),
+        "ref": GPUState(False, False),
+        "critic": GPUState(True, False),
+    }
+    before = dict(dispatch._gpu_state)
+    with pytest.raises(ValueError, match="evaluation failed"):
+        with dispatch.offload_for_evaluation():
+            assert all(not state.model_on_gpu and not state.optimizer_on_gpu for state in dispatch._gpu_state.values())
+            raise ValueError("evaluation failed")
+    assert dispatch._gpu_state == before
+    dispatch._actor_groups["policy"].backload_to_gpu.assert_called_once_with(
+        backload_model=True, backload_optimizer=True
+    )
+    dispatch._actor_groups["critic"].backload_to_gpu.assert_called_once_with(
+        backload_model=True, backload_optimizer=False
+    )
+    dispatch._actor_groups["ref"].offload_to_cpu.assert_not_called()
+    dispatch._actor_groups["ref"].backload_to_gpu.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_forward_backward_times_out_on_cpu():
     from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch

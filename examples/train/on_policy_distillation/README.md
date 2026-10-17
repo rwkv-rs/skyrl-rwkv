@@ -203,8 +203,15 @@ The RWKV launcher evaluates the synchronized student with the existing
 `lighteval-rwkv` producer, following `run_rwkv_sft.sh`. Its task registry,
 CoT prompts, boxed-answer extraction, and math verifier own the evaluation.
 The default task remains AIME 2024 with 32 independent completions per question
-(`avg@32`). All eight existing vLLM engines serve the producer through SkyRL's
-OpenAI router. Evaluation uses temperature 0.96, top-p 0.76, top-k 32,
+(`avg@32`). All eight GPUs serve the producer through SkyRL's OpenAI router.
+For asynchronous training, evaluation closes rollout admission, waits for
+in-flight training requests, and offloads trainer models and optimizer states.
+Temporary native vLLM servers load the current merged HF export on the learner
+GPUs and join the existing rollout servers. Evaluation then releases those
+temporary servers, restores trainer residency, and resumes admission; buffered
+training rollouts retain their order and policy versions. With seven learner
+GPUs and one rollout GPU, this gives eight independent evaluation engines.
+Evaluation uses temperature 0.96, top-p 0.76, top-k 32,
 presence penalty 1.0, frequency penalty 0.1, penalty decay 0.988, and the
 `bot` / `open_think` prompt settings supplied by the producer.
 The single-turn RWKV launcher uses the native router's `round_robin` policy,

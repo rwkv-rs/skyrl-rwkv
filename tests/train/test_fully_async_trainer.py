@@ -101,6 +101,41 @@ def _make_async_dataloader(num_prompts: int, mini_batch_size: int) -> _AsyncData
 
 
 @pytest.mark.asyncio
+async def test_evaluation_pause_drains_running_groups_and_retains_their_order():
+    manager = _AsyncStalenessManager(4, 4, 1)
+    assert await manager.acquire_submission_slot() == 0
+    pause = manager.pause_generation(BackgroundFailure())
+    enter = asyncio.create_task(pause.__aenter__())
+    await asyncio.sleep(0)
+    queued = asyncio.create_task(manager.acquire_submission_slot())
+    await asyncio.sleep(0)
+    assert not enter.done()
+    assert not queued.done()
+    await manager.on_rollout_accepted()
+    await asyncio.wait_for(enter, timeout=2)
+    assert manager._stat.accepted == 1
+    assert manager._stat.running == 0
+    assert not queued.done()
+    await pause.__aexit__(None, None, None)
+    assert await asyncio.wait_for(queued, timeout=2) == 1
+    assert manager._stat.accepted == 1
+
+
+@pytest.mark.asyncio
+async def test_evaluation_pause_propagates_generator_failure_without_hanging():
+    manager = _AsyncStalenessManager(4, 4, 1)
+    await manager.acquire_submission_slot()
+    failure = BackgroundFailure()
+    pause = manager.pause_generation(failure)
+    enter = asyncio.create_task(pause.__aenter__())
+    await asyncio.sleep(0)
+    failure.record(ValueError("generation failed"), "generator")
+    with pytest.raises(ValueError, match="generation failed"):
+        await asyncio.wait_for(enter, timeout=2)
+    assert not manager._paused
+
+
+@pytest.mark.asyncio
 async def test_staleness_manager_filter_restores_capacity():
     """Dropping an accepted group via on_rollout_filtered must give producer capacity back.
 

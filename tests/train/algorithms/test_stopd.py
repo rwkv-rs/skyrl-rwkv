@@ -2,6 +2,7 @@
 
 import copy
 import itertools
+from contextlib import contextmanager
 from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -10,6 +11,7 @@ import pytest
 import torch
 
 from examples.train.on_policy_distillation.main_on_policy_distill import (
+    FullyAsyncOnPolicyDistillationTrainer,
     OnPolicyDistillationConfig,
     OnPolicyDistillationExp,
     OnPolicyDistillationTrainer,
@@ -34,9 +36,11 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     importance_sampling_loss,
 )
 from skyrl.train.dataset.preprocess import convert_prompts_responses_to_batch_tensors
+from skyrl.train.fully_async_trainer import _AsyncStalenessManager
 from skyrl.train.generators.skyrl_gym_generator import SkyRLGymGenerator
 from skyrl.train.generators.utils import prepare_generator_input
 from skyrl.train.trainer import RayPPOTrainer
+from skyrl.train.utils.async_utils import BackgroundFailure
 from skyrl_gym.envs.base_text_env import BaseTextEnvStepOutput
 
 
@@ -115,7 +119,9 @@ async def test_lighteval_uses_live_pool_without_changing_training_or_stopd(monke
     trainer.cfg.trainer.num_logger_eval_samples = 1
     trainer.global_step = 100
     trainer.tracker = MagicMock()
-    trainer.inference_engine_client = SimpleNamespace(proxy_url="http://localhost:8000", model_name="rwkv7-test")
+    trainer.inference_engine_client = SimpleNamespace(
+        proxy_url="http://localhost:8000", server_urls=["http://localhost:8001"], model_name="rwkv7-test"
+    )
     before = asdict(trainer.cfg)
     output = tmp_path / "lighteval/global_step_100"
 
@@ -165,6 +171,84 @@ async def test_lighteval_uses_live_pool_without_changing_training_or_stopd(monke
     assert process.call_args.kwargs["env"]["HF_HUB_OFFLINE"] == "1"
     assert process.call_args.kwargs["env"]["HF_DATASETS_OFFLINE"] == "1"
     assert asdict(trainer.cfg) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_stage", [None, "startup", "evaluation"])
+async def test_async_lighteval_lends_training_gpus_and_restores_them(monkeypatch, tmp_path, failure_stage):
+    trainer = object.__new__(FullyAsyncOnPolicyDistillationTrainer)
+    trainer.cfg = config(**{"trainer.algorithm.lighteval.project": "/producer"})
+    trainer.cfg.trainer.export_path = str(tmp_path)
+    trainer.global_step = 100
+    trainer.tokenizer = object()
+    trainer.inference_engine_client = SimpleNamespace(server_urls=["http://sampler"], model_name="rwkv7-test")
+    trainer._staleness_manager = _AsyncStalenessManager(4, 4, 1)
+    trainer._generation_failure = BackgroundFailure()
+    trainer.dispatch = MagicMock()
+    trainer.dispatch.get_worker_gpu_locations.return_value = [("node", gpu) for gpu in range(7)]
+    events = []
+
+    def export():
+        assert trainer._staleness_manager._paused
+        events.append("export")
+
+    @contextmanager
+    def offload():
+        events.append("offload")
+        try:
+            yield
+        finally:
+            events.append("restore")
+
+    trainer.save_models = export
+    trainer.dispatch.offload_for_evaluation = offload
+    pool = MagicMock()
+    pool.get_server_urls.return_value = [f"http://learner{gpu}" for gpu in range(7)]
+
+    def start():
+        events.append("start")
+        if failure_stage == "startup":
+            raise RuntimeError("startup failed")
+
+    pool.start.side_effect = start
+    pool.shutdown.side_effect = lambda: events.append("shutdown")
+    create_pool = MagicMock(return_value=pool)
+    monkeypatch.setattr("examples.train.rwkv.evaluate.create_eval_server_pool", create_pool)
+    router = MagicMock()
+    router.shutdown.side_effect = lambda: events.append("router_shutdown")
+    client = SimpleNamespace(server_urls=["http://sampler"] + pool.get_server_urls())
+
+    def build_client(cfg, tokenizer):
+        assert cfg.generator.inference_engine.external_server_urls == client.server_urls
+        assert cfg.trainer.policy.model.path == str(tmp_path / "global_step_100/policy")
+        assert cfg.generator.inference_engine.served_model_name == "rwkv7-test"
+        assert tokenizer is trainer.tokenizer
+        return client, SimpleNamespace(router=router)
+
+    monkeypatch.setattr("skyrl.backends.skyrl_train.inference_servers.setup.build_new_inference_client", build_client)
+
+    async def evaluate(*args, inference_engine_client, **kwargs):
+        assert trainer._staleness_manager._paused
+        assert inference_engine_client is client
+        assert events == ["export", "offload", "start"]
+        events.append("evaluate")
+        if failure_stage == "evaluation":
+            raise RuntimeError("evaluation failed")
+        return {"eval/lighteval/aime24/avg@32": 0.5}
+
+    monkeypatch.setattr(OnPolicyDistillationTrainer, "eval", evaluate)
+    before = asdict(trainer.cfg)
+    if failure_stage:
+        with pytest.raises(RuntimeError, match=failure_stage):
+            await trainer.eval()
+    else:
+        assert await trainer.eval() == {"eval/lighteval/aime24/avg@32": 0.5, "eval/lighteval/num_engines": 8}
+    assert events[-2:] == ["shutdown", "restore"]
+    if failure_stage != "startup":
+        assert events[-3] == "router_shutdown"
+    assert not trainer._staleness_manager._paused
+    assert asdict(trainer.cfg) == before
+    assert create_pool.call_args.args[1] == [("node", gpu) for gpu in range(7)]
 
 
 @pytest.mark.parametrize("alpha", [0.1, 0.2, 1.0])

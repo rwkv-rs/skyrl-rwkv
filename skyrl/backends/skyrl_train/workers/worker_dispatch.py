@@ -9,7 +9,8 @@ The trainer interacts with the worker dispatch if all models are always on GPU.
 """
 
 import time
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -238,6 +239,26 @@ class WorkerDispatch:
         """Mark all models as offloaded (call after build_models when colocate_all)."""
         for model in self._actor_groups:
             self.mark_as_offloaded(model)
+
+    @contextmanager
+    def offload_for_evaluation(self):
+        """Lend trainer GPUs to evaluation, then restore their model/optimizer state."""
+        states = {name: replace(state) for name, state in self._gpu_state.items()}
+        try:
+            for name, state in states.items():
+                if state.model_on_gpu or state.optimizer_on_gpu:
+                    self._offload_inactive_model(name)
+            yield
+        finally:
+            for name, state in states.items():
+                current = self._gpu_state[name]
+                backload_model = state.model_on_gpu and not current.model_on_gpu
+                backload_optimizer = state.optimizer_on_gpu and not current.optimizer_on_gpu
+                if backload_model or backload_optimizer:
+                    self._actor_groups[name].backload_to_gpu(
+                        backload_model=backload_model, backload_optimizer=backload_optimizer
+                    )
+                self._gpu_state[name] = state
 
     def mark_as_offloaded(self, model: str) -> None:
         """Mark a specific model as offloaded without changing others."""
@@ -680,6 +701,13 @@ class WorkerDispatch:
             )
             all_node_ids.extend(node_ids)
         return list(set(all_node_ids))
+
+    def get_worker_gpu_locations(self, model: str) -> List[Tuple[str, int]]:
+        """Return each worker's node and physical GPU for colocated inference."""
+        group = self._actor_groups[model]
+        nodes = deadline.ray_get(group.async_run_ray_method("pass_through", "get_ray_node_id"), "get_ray_node_id")
+        gpus = deadline.ray_get(group.async_run_ray_method("pass_through", "get_gpu_id"), "get_gpu_id")
+        return list(dict.fromkeys((node, int(gpu)) for node, gpu in zip(nodes, gpus, strict=True)))
 
     # ----------------------------------
     # Weight sync methods

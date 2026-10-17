@@ -13,6 +13,11 @@ register(
 )
 
 register(
+    id="ultradata",
+    entry_point="skyrl_gym.envs.ultradata.env:UltraDataEnv",
+)
+
+register(
     id="gsm8k_multi_turn",
     entry_point="skyrl_gym.envs.gsm8k.multi_turn_env:GSM8kMultiTurnEnv",
 )

@@ -406,6 +406,7 @@ class BaseFunctionRegistry:
 
 class AdvantageEstimator(StrEnum):
     GAE = "gae"
+    GAE_ADAPTIVE = "gae_adaptive"
     GRPO = "grpo"
     RLOO = "rloo"
     REINFORCE_PP = "reinforce++"
@@ -436,6 +437,7 @@ class AdvantageEstimatorRegistry(BaseFunctionRegistry):
         ae_types = {
             "grpo": [AdvantageEstimator.GRPO, compute_grpo_outcome_advantage],
             "gae": [AdvantageEstimator.GAE, compute_gae_advantage_return],
+            "gae_adaptive": [AdvantageEstimator.GAE_ADAPTIVE, compute_gae_adaptive_advantage_return],
             "rloo": [AdvantageEstimator.RLOO, compute_rloo_outcome_advantage],
             "reinforce++": [AdvantageEstimator.REINFORCE_PP, compute_reinforce_plus_plus_outcome_advantage],
             "maxrl": [AdvantageEstimator.MAXRL, compute_maxrl_advantage],
@@ -848,6 +850,8 @@ def rollout_is_policy_loss(
     config: AlgorithmConfig,
     loss_mask: Optional[torch.Tensor] = None,
     rollout_logprobs: Optional[torch.Tensor] = None,
+    score_centering_train_logprobs: Optional[torch.Tensor] = None,
+    score_centering_sampler_logprobs: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, dict[str, float]]:
     """Calibrated importance-weighted policy gradient using rollout log-probs.
 
@@ -869,10 +873,30 @@ def rollout_is_policy_loss(
     in_range = (ratio > 1 - config.eps_clip_low) & (ratio < 1 + config.eps_clip_high)
     calibrated_ratio = torch.where(in_range, ratio, torch.zeros_like(ratio))
 
-    loss = -(calibrated_ratio.detach() * advantages * log_probs)
+    if config.rollout_is.score_centering:
+        if score_centering_train_logprobs is None or score_centering_sampler_logprobs is None:
+            raise ValueError("rollout_is.score_centering requires trainer and sampler top-k logprobs")
+
+        def weight_fn(ratio: torch.Tensor) -> torch.Tensor:
+            in_range = (ratio > 1 - config.eps_clip_low) & (ratio < 1 + config.eps_clip_high)
+            return torch.where(in_range, ratio, torch.zeros_like(ratio))
+
+        loss = score_centering_token_loss_from_support(
+            score_centering_train_logprobs,
+            score_centering_sampler_logprobs,
+            log_probs,
+            rollout_logprobs,
+            advantages,
+            weight_fn=weight_fn,
+            eps=config.rollout_is.score_centering_eps,
+        )
+    else:
+        loss = -(calibrated_ratio.detach() * advantages * log_probs)
     clip_ratio = masked_mean((~in_range).float(), loss_mask).mean().detach().item()
 
     loss_metrics: dict[str, float] = {"clip_ratio": clip_ratio}
+    if config.rollout_is.score_centering:
+        loss_metrics["rollout_is/score_centering"] = 1.0
     loss, loss_mask, off_policy_metrics = apply_off_policy_correction(
         loss, old_log_probs, rollout_logprobs, loss_mask, config.off_policy_correction
     )
@@ -1637,6 +1661,49 @@ def compute_gae_advantage_return(
 
         returns = advantages + values
         advantages = masked_whiten(advantages, response_mask)
+    return advantages, returns
+
+
+@register_advantage_estimator(AdvantageEstimator.GAE_ADAPTIVE)
+def compute_gae_adaptive_advantage_return(
+    token_level_rewards: torch.Tensor,
+    values: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_mask: torch.Tensor,
+    gamma: float,
+    lambd: float,
+    config: AlgorithmConfig,
+    **kwargs,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute raw policy advantages and separate critic returns on action tokens.
+
+    Follows miles-values' loss-mask-aware GAE: observations remain in the model
+    context but do not advance either trace or supply next-state values. Policy
+    lambda uses the action length; critic targets use their own fixed lambda.
+    Normalization is handled by the trainer's existing advantage controls.
+    """
+    with torch.no_grad():
+        active = response_mask.bool() & loss_mask.bool()
+        lengths = active.sum(-1).clamp_min(1).double()
+        gae_config = config.gae_adaptive
+        if gae_config.mode == "adaptive":
+            policy_lambd = (1 - 1 / (gae_config.alpha * lengths)).clamp_min(0)
+        else:
+            policy_lambd = torch.full_like(lengths, lambd)
+        trace_lambdas = torch.stack([policy_lambd, torch.full_like(lengths, gae_config.critic_lambd)])
+        # Accumulate long traces in float64 and keep training targets in float32.
+        lastgaelam = torch.zeros_like(trace_lambdas)
+        nextvalues = torch.zeros_like(lengths)
+        advantages = torch.zeros_like(token_level_rewards, dtype=torch.float32)
+        returns = torch.zeros_like(token_level_rewards, dtype=torch.float32)
+        for t in reversed(range(values.shape[-1])):
+            action = active[:, t]
+            current_values = values[:, t].double()
+            delta = token_level_rewards[:, t].double() + gamma * nextvalues - current_values
+            lastgaelam = torch.where(action, delta + gamma * trace_lambdas * lastgaelam, lastgaelam)
+            advantages[:, t] = torch.where(action, lastgaelam[0], 0)
+            returns[:, t] = torch.where(action, lastgaelam[1] + current_values, 0)
+            nextvalues = torch.where(action, current_values, nextvalues)
     return advantages, returns
 
 

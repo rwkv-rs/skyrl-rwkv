@@ -3,11 +3,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from peft import LoraConfig, PeftModel
 
 from skyrl.backends.skyrl_train.workers.model_wrapper import (
     _get_critic_model,
     get_llm_for_sequence_regression,
 )
+from skyrl.train import main_value
 from skyrl.train.dataset.value_dataset import (
     RewardDataCollator,
     ValueDataset,
@@ -155,7 +157,8 @@ def test_rwkv_critic_rejects_incompatible_packing(kwargs):
         make_critic(**kwargs)
 
 
-def test_rwkv_critic_checkpoint_round_trip_uses_native_bf16(tmp_path):
+@pytest.fixture
+def rwkv_checkpoint(tmp_path):
     from transformers import RwkvConfig, RwkvForCausalLM
 
     config = RwkvConfig(
@@ -171,6 +174,11 @@ def test_rwkv_critic_checkpoint_round_trip_uses_native_bf16(tmp_path):
     )
     source = tmp_path / "source"
     RwkvForCausalLM(config).save_pretrained(source)
+    return source
+
+
+def test_rwkv_critic_checkpoint_round_trip_uses_native_bf16(tmp_path, rwkv_checkpoint):
+    source = rwkv_checkpoint
     critic = get_llm_for_sequence_regression(str(source), "critic", bf16=False, use_flash_attention_2=True)
     assert all(parameter.dtype == torch.bfloat16 for parameter in critic.parameters())
     assert critic.config._attn_implementation == "eager"
@@ -183,6 +191,166 @@ def test_rwkv_critic_checkpoint_round_trip_uses_native_bf16(tmp_path):
     assert not restored.config.use_cache
     for key, value in critic.state_dict().items():
         torch.testing.assert_close(restored.state_dict()[key], value, rtol=0, atol=0)
+
+
+@pytest.mark.skipif("use_nora" not in LoraConfig.__dataclass_fields__, reason="requires Joluck/NoRA")
+@pytest.mark.parametrize("rank", [8, 16])
+def test_rwkv_nora_critic_updates_and_exports_full_head(tmp_path, rwkv_checkpoint, monkeypatch, rank):
+    from transformers import RwkvModel
+
+    from skyrl.backends.skyrl_train.distributed import fsdp_strategy
+    from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
+    from skyrl.train.config import FSDPConfig, ModelConfig, SkyRLLoraConfig
+
+    def causal_forward(self, input_ids, use_cache):
+        """Exercise real NoRA projections on CPU without the CUDA recurrence."""
+        hidden = self.embed_tokens(input_ids).cumsum(1)
+        for layer in self.layers:
+            hidden = hidden + layer.linear_attn.o_proj(torch.tanh(layer.linear_attn.v_proj(hidden)))
+        return {"last_hidden_state": hidden}
+
+    monkeypatch.setattr(RwkvModel, "forward", causal_forward)
+    model = get_llm_for_sequence_regression(
+        str(rwkv_checkpoint),
+        "critic",
+        use_nora=True,
+        lora_rank=rank,
+        lora_alpha=rank,
+        target_modules=["v_proj", "o_proj"],
+    )
+    head = model.get_base_model().value_head
+    assert head.weight.dtype == torch.float32
+    assert head.weight.requires_grad
+    assert model.peft_config["default"].use_nora
+    assert model.peft_config["default"].modules_to_save == ["value_head"]
+    frozen_before = {name: value.clone() for name, value in model.named_parameters() if not value.requires_grad}
+    trainable_before = {name: value.clone() for name, value in model.named_parameters() if value.requires_grad}
+    assert all("lora_" in name or ".value_head.modules_to_save." in name for name in trainable_before)
+    assert all(module.training for module in model.modules())
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=0.01, weight_decay=0)
+    batch = RewardDataCollator(0)([{"input_ids": [1, 2, 3, 4], "loss_mask": [0, 1, 0, 1], "returns": [0, 1, 1, 1]}])
+    for _ in range(3):
+        predictions, labels, mask = main_value.critic_forward(model, batch, "cpu")
+        error, count = value_loss(predictions, labels, mask)
+        (error / count).backward()
+        assert torch.isfinite(head.weight.grad).all()
+        assert head.weight.grad.abs().sum() > 0
+        assert any(p.grad is not None and p.grad.abs().sum() > 0 for n, p in model.named_parameters() if "lora_B" in n)
+        optimizer.step()
+        optimizer.zero_grad()
+    for name, value in model.named_parameters():
+        if name in frozen_before:
+            torch.testing.assert_close(value, frozen_before[name], rtol=0, atol=0)
+        else:
+            assert not torch.equal(value, trainable_before[name]), name
+    expected = main_value.critic_forward(model.eval(), batch, "cpu")[0].detach()
+    strategy = FSDPStrategy(
+        FSDPConfig(),
+        model_config=ModelConfig(lora=SkyRLLoraConfig(rank=rank, use_nora=True)),
+    )
+    monkeypatch.setattr(strategy, "is_rank_0", lambda: True)
+    monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
+    monkeypatch.setattr(fsdp_strategy, "fsdp2_get_full_state_dict", lambda model, **kwargs: model.state_dict())
+    adapter_path = tmp_path / "checkpoint"
+    strategy._save_lora_adapters(model, str(adapter_path))
+    adapter = adapter_path / "lora_adapter"
+    restored_base = get_llm_for_sequence_regression(str(rwkv_checkpoint), "critic")
+    restored_base.value_head.float()
+    restored = PeftModel.from_pretrained(restored_base, str(adapter)).eval()
+    torch.testing.assert_close(main_value.critic_forward(restored, batch, "cpu")[0], expected, rtol=0, atol=0)
+    before_export = {name: value.clone() for name, value in model.state_dict().items()}
+    output = tmp_path / "merged"
+    strategy.save_hf_model(model, str(output), output_dtype=torch.bfloat16)
+    restored = get_llm_for_sequence_regression(str(output), "critic").eval()
+    assert not any("lora_" in name or "modules_to_save" in name for name in restored.state_dict())
+    assert all(value.dtype == torch.bfloat16 for value in restored.parameters())
+    torch.testing.assert_close(restored.value_head.weight, head.weight.to(torch.bfloat16), rtol=0, atol=0)
+    torch.testing.assert_close(
+        main_value.critic_forward(restored, batch, "cpu")[0].float(), expected, rtol=0.03, atol=0.01
+    )
+    for name, value in model.state_dict().items():
+        torch.testing.assert_close(value, before_export[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("rank", [8, 16, 32, 64])
+def test_value_pretraining_cli_nora_rank_sweep(monkeypatch, rank):
+    calls = []
+    monkeypatch.setattr(main_value, "train", calls.append)
+    main_value.main(
+        [
+            "--model",
+            "rwkv7-test",
+            "--train-data",
+            "train.jsonl",
+            "--val-data",
+            "validation.jsonl",
+            "--output-dir",
+            f"rank-{rank}",
+            "--use-nora",
+            "--rank",
+            str(rank),
+        ]
+    )
+    args = calls[0]
+    assert args.use_nora and args.rank == rank
+    assert args.lora_alpha == rank
+    assert args.target_modules == ["r_proj", "k_proj", "v_proj", "o_proj"]
+
+
+@pytest.mark.parametrize("option,value", [("--rank", "0"), ("--lora-alpha", "-1"), ("--fsdp-size", "0")])
+def test_value_pretraining_cli_rejects_invalid_adapter_options(option, value):
+    with pytest.raises(SystemExit, match="2"):
+        main_value.main(
+            [
+                "--model",
+                "rwkv7-test",
+                "--train-data",
+                "train.jsonl",
+                "--val-data",
+                "validation.jsonl",
+                "--output-dir",
+                "value",
+                "--use-nora",
+                option,
+                value,
+            ]
+        )
+
+
+def test_rwkv_value_pretraining_preserves_native_config(tmp_path, monkeypatch):
+    path = write_dataset(tmp_path, [{"input_ids": [1, 2, 3], "loss_mask": [0, 1, 1], "reward": 1.0}])
+    model = make_critic()
+    model.config.pad_token_id = None
+    loads = []
+
+    def load_model(*args, **kwargs):
+        loads.append(kwargs)
+        return model
+
+    def prepare(pair):
+        assert pair[0] is model
+        assert model.config.pad_token_id is None
+        raise RuntimeError("model setup complete")
+
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(torch.cuda, "set_device", lambda _: None)
+    monkeypatch.setattr(torch.distributed, "init_process_group", lambda _: None)
+    monkeypatch.setattr(torch.distributed, "destroy_process_group", lambda: None)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(main_value, "get_tokenizer", lambda _: SimpleNamespace(pad_token_id=0))
+    monkeypatch.setattr(main_value, "get_llm_for_sequence_regression", load_model)
+    monkeypatch.setattr(
+        main_value,
+        "FSDPStrategy",
+        lambda *args, **kwargs: SimpleNamespace(setup_distributed=lambda: None, prepare=prepare),
+    )
+    with pytest.raises(RuntimeError, match="model setup complete"):
+        main_value.main(
+            ["--model", "rwkv7-test", "--train-data", path, "--val-data", path, "--output-dir", "value", "--use-nora"]
+        )
+    assert loads[0]["use_nora"]
+    assert loads[0]["lora_rank"] == loads[0]["lora_alpha"] == 8
 
 
 def test_value_loss_is_global_token_normalized_across_microbatches():

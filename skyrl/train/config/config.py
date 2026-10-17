@@ -8,6 +8,7 @@ can be constructed from a Hydra DictConfig via SkyRLTrainConfig.from_dict_config
 import copy
 import dataclasses
 import json
+import math
 import os
 import typing
 from abc import ABC
@@ -17,6 +18,7 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Type, TypeVar,
 
 import yaml
 from omegaconf import DictConfig, OmegaConf
+
 from skyrl_gym.envs.search.env import SearchEnvConfig
 from skyrl_gym.envs.sql.env import Text2SQLEnvConfig
 
@@ -836,6 +838,44 @@ class FlashReinforceConfig(BaseConfig):
 
 
 @dataclass
+class GAEAdaptiveConfig(BaseConfig):
+    """Skip-observation GAE with separate policy and critic trace parameters."""
+
+    mode: str = "adaptive"
+    """Use ``"adaptive"`` policy lambda or ``"fixed"`` with ``algorithm.lambd``."""
+    alpha: float = 1.5
+    """Compute policy lambda as ``max(0, 1 - 1 / (alpha * action_length))``."""
+    critic_lambd: float = 1.0
+    """Lambda for critic return targets, independent of policy lambda."""
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"adaptive", "fixed"}:
+            raise ValueError("gae_adaptive.mode must be 'adaptive' or 'fixed'")
+        if not math.isfinite(self.alpha) or self.alpha <= 0:
+            raise ValueError("gae_adaptive.alpha must be finite and positive")
+        if not 0 <= self.critic_lambd <= 1:
+            raise ValueError("gae_adaptive.critic_lambd must be between zero and one")
+
+
+@dataclass
+class RolloutISConfig(BaseConfig):
+    """Optional Score-Centering for the double-sided rollout importance weight."""
+
+    score_centering: bool = False
+    """Center the DIS-weighted score using the captured sampler support."""
+    score_centering_top_k: int = 128
+    """Number of sampler candidates recorded independently of sampling top-k."""
+    score_centering_eps: float = 1e-6
+    """Probability-mass floor used by the top-k/tail correction."""
+
+    def __post_init__(self) -> None:
+        if self.score_centering_top_k <= 1:
+            raise ValueError("rollout_is.score_centering_top_k must be greater than one")
+        if not math.isfinite(self.score_centering_eps) or self.score_centering_eps <= 0:
+            raise ValueError("rollout_is.score_centering_eps must be finite and positive")
+
+
+@dataclass
 class BPOConfig(BaseConfig):
     """Bellman Policy Optimization parameters for terminal-reward group rollouts."""
 
@@ -969,7 +1009,7 @@ class OffPolicyCorrectionConfig(BaseConfig):
 @dataclass
 class AlgorithmConfig(BaseConfig):
     advantage_estimator: str = "grpo"
-    """``"grpo"``, ``"gae"``, ``"rloo"``, ``"reinforce++"``, ``"flashreinforce"``, ``"bpo"``, or custom via ``AdvantageEstimatorRegistry``."""
+    """``"grpo"``, ``"gae"``, ``"gae_adaptive"``, ``"rloo"``, ``"reinforce++"``, ``"flashreinforce"``, ``"bpo"``, or custom via ``AdvantageEstimatorRegistry``."""
     kl_ctrl: KLCtrlConfig = field(default_factory=KLCtrlConfig)
     """Only used when ``use_kl_in_reward=True`` (not applied when ``use_kl_loss=True``).
     Uses ``kl_loss_coef`` as the initial KL coefficient."""
@@ -1051,7 +1091,9 @@ class AlgorithmConfig(BaseConfig):
     effectively identical are still treated as zero-variance; this is a no-op for integer rewards (e.g.
     0/1) where the spread is either 0 or >= 1. Set to 0.0 for exact equality."""
     lambd: float = 1.0
-    """Lambda parameter for GAE."""
+    """Lambda for GAE and for the policy in fixed-mode adaptive GAE."""
+    gae_adaptive: GAEAdaptiveConfig = field(default_factory=GAEAdaptiveConfig)
+    """Only used when ``advantage_estimator="gae_adaptive"``."""
     gamma: float = 1.0
     """Gamma (discount) parameter for GAE."""
     eps_clip_low: float = 0.2
@@ -1074,6 +1116,8 @@ class AlgorithmConfig(BaseConfig):
     """Only used when ``policy_loss_type="sapo"``."""
     flashreinforce: FlashReinforceConfig = field(default_factory=FlashReinforceConfig)
     """Only used when ``policy_loss_type="flashreinforce"``."""
+    rollout_is: RolloutISConfig = field(default_factory=RolloutISConfig)
+    """Only used when ``policy_loss_type="rollout_is"``."""
     bpo: BPOConfig = field(default_factory=BPOConfig)
     """Only used when ``policy_loss_type="bpo"``."""
     value_clip: float = 0.2
@@ -1998,6 +2042,25 @@ class SkyRLTrainConfig(BaseConfig):
             self.trainer.algorithm.temperature = self.generator.sampling_params.temperature
 
         flashreinforce = self.trainer.algorithm.flashreinforce
+        rollout_is = self.trainer.algorithm.rollout_is
+        if rollout_is.score_centering:
+            if self.trainer.algorithm.policy_loss_type != "rollout_is":
+                raise ValueError("rollout_is.score_centering requires policy_loss_type=rollout_is")
+            if self.trainer.strategy != "fsdp":
+                raise ValueError("rollout_is.score_centering currently requires trainer.strategy=fsdp")
+            if not self.generator.use_conversation_multi_turn:
+                raise ValueError("rollout_is.score_centering requires generator.use_conversation_multi_turn=True")
+            if self.generator.sampling_params.logprobs is None:
+                raise ValueError("rollout_is.score_centering requires generator.sampling_params.logprobs")
+            if (
+                self.generator.sampling_params.temperature != 1.0
+                or self.generator.sampling_params.top_p != 1.0
+                or self.generator.sampling_params.top_k != -1
+            ):
+                raise ValueError("rollout_is.score_centering requires temperature=1, top_p=1, top_k=-1")
+            self.generator.inference_engine.enable_return_sample_support_set = True
+            self.generator.inference_engine.sample_support_top_k = rollout_is.score_centering_top_k
+            self.generator.inference_engine.sample_support_logprobs_mode = "raw_logprobs"
         if flashreinforce.score_centering:
             if self.trainer.algorithm.policy_loss_type not in ("flashreinforce", "flash_reinforce"):
                 raise ValueError("flashreinforce.score_centering requires policy_loss_type=flashreinforce")
@@ -2033,7 +2096,7 @@ class SkyRLTrainConfig(BaseConfig):
                     "use_conversation_multi_turn=False appends a synthetic loss-active EOS without captured support"
                 )
 
-            if flashreinforce.score_centering:
+            if flashreinforce.score_centering or rollout_is.score_centering:
                 raise ValueError("sample-support replay cannot be combined with raw Score-Centering")
             if self.generator.sampling_params.top_k <= 1:
                 raise ValueError("sample-support replay requires generator.sampling_params.top_k > 1")

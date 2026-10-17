@@ -1193,9 +1193,12 @@ class RayPPOTrainer:
                     for i, mask in enumerate(generator_output["loss_masks"])
                 ]
             # Response-level rewards: rewards is List[float], convert to per-token rewards
-            for reward, response in zip(rewards, responses):
+            for reward, response, loss_mask in zip(rewards, responses, generator_output["loss_masks"]):
                 per_token_reward = [0.0] * len(response)
-                per_token_reward[-1] = float(reward)
+                reward_index = -1
+                if self.cfg.trainer.algorithm.advantage_estimator == "gae_adaptive" and any(loss_mask):
+                    reward_index = max(i for i, active in enumerate(loss_mask) if active)
+                per_token_reward[reward_index] = float(reward)
                 per_token_rewards.append(per_token_reward)
 
         n_samples_per_prompt = self.cfg.generator.n_samples_per_prompt
@@ -1292,7 +1295,8 @@ class RayPPOTrainer:
         else:
             advantage_kwargs = (
                 {"loss_mask": data["loss_mask"]}
-                if self.cfg.trainer.algorithm.advantage_estimator in ("flashreinforce", "flash_reinforce", "bpo")
+                if self.cfg.trainer.algorithm.advantage_estimator
+                in ("flashreinforce", "flash_reinforce", "bpo", "gae_adaptive")
                 else {}
             )
             if flash_advantage:

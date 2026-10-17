@@ -47,6 +47,84 @@ def _make_validated_test_config():
     return cfg
 
 
+def test_gae_adaptive_cli_and_rollout_is_score_centering_capture():
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "trainer.algorithm.advantage_estimator=gae_adaptive",
+            "trainer.algorithm.gae_adaptive.alpha=2.0",
+            "trainer.algorithm.gae_adaptive.critic_lambd=0.9",
+            "trainer.algorithm.policy_loss_type=rollout_is",
+            "trainer.algorithm.rollout_is.score_centering=true",
+            "trainer.algorithm.rollout_is.score_centering_top_k=32",
+            "generator.use_conversation_multi_turn=true",
+            "generator.sampling_params.temperature=1.0",
+            "generator.sampling_params.top_p=1.0",
+            "generator.sampling_params.top_k=-1",
+            "generator.sampling_params.logprobs=1",
+        ]
+    )
+    assert cfg.trainer.algorithm.gae_adaptive.alpha == 2.0
+    assert cfg.trainer.algorithm.gae_adaptive.critic_lambd == 0.9
+    assert cfg.generator.inference_engine.enable_return_sample_support_set
+    assert cfg.generator.inference_engine.sample_support_top_k == 32
+    assert cfg.generator.inference_engine.sample_support_logprobs_mode == "raw_logprobs"
+    assert cfg.generator.sampling_params.top_k == -1
+    default = SkyRLTrainConfig()
+    assert default.trainer.algorithm.advantage_estimator == "grpo"
+    assert not default.generator.inference_engine.enable_return_sample_support_set
+
+
+@pytest.mark.parametrize(
+    "override, message",
+    [
+        ("trainer.algorithm.gae_adaptive.alpha=0", "alpha"),
+        ("trainer.algorithm.gae_adaptive.alpha=.nan", "alpha"),
+        ("trainer.algorithm.gae_adaptive.mode=other", "mode"),
+        ("trainer.algorithm.gae_adaptive.critic_lambd=1.1", "critic_lambd"),
+        ("trainer.algorithm.rollout_is.score_centering_top_k=1", "top_k"),
+    ],
+)
+def test_gae_adaptive_and_rollout_is_config_bounds(override, message):
+    with pytest.raises(ValueError, match=message):
+        SkyRLTrainConfig.from_cli_overrides([override])
+
+
+@pytest.mark.parametrize(
+    "override, message",
+    [
+        ("trainer.algorithm.policy_loss_type=regular", "policy_loss_type"),
+        ("trainer.strategy=megatron", "strategy=fsdp"),
+        ("generator.use_conversation_multi_turn=false", "use_conversation_multi_turn"),
+        ("generator.sampling_params.temperature=0.8", "temperature=1"),
+        ("generator.sampling_params.top_p=0.9", "top_p=1"),
+        ("generator.sampling_params.top_k=32", "top_k=-1"),
+        ("trainer.algorithm.enable_sample_support_replay=true", "cannot be combined"),
+    ],
+)
+def test_rollout_is_score_centering_rejects_incompatible_sampling(override, message):
+    overrides = [
+        "trainer.algorithm.policy_loss_type=rollout_is",
+        "trainer.algorithm.rollout_is.score_centering=true",
+        "generator.use_conversation_multi_turn=true",
+        "generator.sampling_params.temperature=1.0",
+        "generator.sampling_params.top_p=1.0",
+        "generator.sampling_params.top_k=-1",
+        "generator.sampling_params.logprobs=1",
+        override,
+    ]
+    with pytest.raises(ValueError, match=message):
+        SkyRLTrainConfig.from_cli_overrides(overrides)
+
+
+def test_gae_adaptive_validation_requires_critic():
+    cfg = _make_validated_test_config()
+    cfg.trainer.algorithm.advantage_estimator = "gae_adaptive"
+    with pytest.raises(AssertionError, match="critic.model.path"):
+        validate_cfg(cfg)
+    cfg.trainer.critic.model.path = "dummy-critic"
+    validate_cfg(cfg)
+
+
 # Helper dataclasses for testing
 @dataclass
 class _SimpleConfig(BaseConfig):

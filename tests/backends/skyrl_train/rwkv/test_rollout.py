@@ -62,6 +62,76 @@ def test_text_match_uses_final_answer_and_option_mapping():
     assert rollout.text_score("Final answer: b", "The polynomial hierarchy collapses", query)
 
 
+@pytest.mark.parametrize(
+    "domain,answer,gold,finish",
+    [
+        ("Math", r">reasoning </think> \boxed{42}", "42", "stop"),
+        ("Math", r">reasoning </think> \boxed{43}", "42", "stop"),
+        ("Math", r">reasoning </think> \boxed{42}", "42", "length"),
+        ("Knowledge", "Final answer: b", "second option", "stop"),
+        ("Long_Context", "Final answer: 5", "5", "stop"),
+        ("Long_Context", "Final answer: 5", "5", "length"),
+        ("Code", "print(3)", {"inputs": [""], "outputs": ["3\n"]}, "stop"),
+    ],
+)
+def test_ultradata_native_rewards_match_rollout(tmp_path, tokenizer, monkeypatch, domain, answer, gold, finish):
+    import skyrl_gym
+    from skyrl_gym.envs.ultradata import env as ultradata
+
+    query = "Question?\na: first option\nb: second option"
+    dataset_row(tmp_path, domain, f"{domain}_1", query, gold)
+    row = next(rollout.rows(tmp_path, 0, tokenizer, 1000, 8))
+    if domain == "Code":
+
+        def scorer(raw, tests):
+            return raw == "print(3)" and tests == gold, "ok"
+
+        monkeypatch.setattr(rollout, "run_code", scorer)
+        monkeypatch.setattr(ultradata, "run_code", scorer)
+    counts, _, _ = rollout.score_question(row, [{"text": answer, "token_ids": [7, 0], "finish_reason": finish}], 0)
+    path, offset = row["_source"]
+    env = skyrl_gym.make(
+        "ultradata",
+        extras={"data_source": domain, "reward_spec": {"source_path": path, "source_offset": offset}},
+    )
+    _, metadata = env.init([{"role": "user", "content": query}])
+    assert metadata["chat_template_kwargs"]["rwkv_generation_prompt"] == (
+        "open_think" if domain == "Math" else "fake_think"
+    )
+    env.set_generation_metadata(
+        action=answer, ended_eod=finish == "stop", truncated=finish == "length", stop_reason=finish
+    )
+    assert env.step(answer)["reward"] == float(counts["correct"])
+
+
+def test_prepare_ultradata_rl_keeps_lazy_rewards_and_question_split(tmp_path):
+    import pyarrow.parquet as pq
+
+    from examples.train.rwkv.prepare_opd import prepare
+
+    source = tmp_path / "source"
+    source.mkdir()
+    for domain in rollout.DOMAINS:
+        for index in range(8):
+            gold = {"inputs": [""], "outputs": ["3\n"]} if domain == "Code" else "3"
+            dataset_row(source, domain, f"{domain}_{index}", f"query {index}", gold)
+    output = tmp_path / "rl" / "train.parquet"
+    prepare(source, output, task_rewards=True, validation_fraction=0.5, seed=42)
+    train = pq.read_table(output).to_pylist()
+    validation = pq.read_table(output.with_name("validation.parquet")).to_pylist()
+    assert len(train) + len(validation) == 32
+    assert not {row["uuid"] for row in train} & {row["uuid"] for row in validation}
+    for row in train + validation:
+        assert row["env_class"] == "ultradata"
+        spec = row["reward_spec"]
+        with open(spec["source_path"], "rb") as stream:
+            stream.seek(spec["source_offset"])
+            assert json.loads(stream.readline())["uuid"] == row["uuid"]
+    opd_output = tmp_path / "opd" / "train.parquet"
+    prepare(source, opd_output)
+    assert {row["env_class"] for row in pq.read_table(opd_output).to_pylist()} == {"aime"}
+
+
 def test_code_python_and_cpp_execution():
     fence = chr(96) * 3
     tests = {"inputs": [""], "outputs": ["3\n"]}

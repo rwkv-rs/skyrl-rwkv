@@ -86,6 +86,14 @@ def iter_merged_lora_weights(model, state_dict=None):
     for name, tensor in state_dict.items():
         if ".lora_A." in name or ".lora_B." in name:
             continue
+        if ".original_module." in name:
+            continue
+        if ".modules_to_save." in name:
+            module_name, adapter_weight = name.split(".modules_to_save.", 1)
+            adapter_prefix = f"{modules[module_name].active_adapters[0]}."
+            if adapter_weight.startswith(adapter_prefix):
+                yield f"{module_name}.{adapter_weight.removeprefix(adapter_prefix)}", materialize(tensor)
+            continue
         weight = materialize(tensor)
         if name.endswith(".base_layer.weight"):
             module_name = name.removesuffix(".base_layer.weight")

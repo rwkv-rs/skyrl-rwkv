@@ -438,10 +438,13 @@ def validate_cfg(cfg: SkyRLTrainConfig):
     ), f"only ulysses is supported as of now, got {cfg.trainer.sequence_parallel_backend}"
 
     # if advantage estimator is GAE, then critic path should be provided
-    if cfg.trainer.algorithm.advantage_estimator == "gae":
+    if cfg.trainer.algorithm.advantage_estimator in ("gae", "gae_adaptive"):
         assert (
             cfg.trainer.critic.model.path
         ), "`trainer.critic.model.path` should be provided for PPO training, got `None`"
+    if cfg.trainer.algorithm.advantage_estimator == "gae_adaptive":
+        if not 0 <= cfg.trainer.algorithm.gamma <= 1 or not 0 <= cfg.trainer.algorithm.lambd <= 1:
+            raise ValueError("gae_adaptive requires gamma and lambd between zero and one")
 
     assert not (
         cfg.trainer.algorithm.use_kl_in_reward and cfg.trainer.algorithm.use_kl_loss
@@ -485,6 +488,12 @@ def validate_cfg(cfg: SkyRLTrainConfig):
     )
 
     algorithm = cfg.trainer.algorithm
+    if algorithm.rollout_is.score_centering and (
+        algorithm.use_tis or off_policy_correction_enabled(algorithm.off_policy_correction)
+    ):
+        raise ValueError(
+            "rollout_is.score_centering already centers the DIS weight; disable off_policy_correction and use_tis"
+        )
     flash_loss_names = {"flashreinforce", "flash_reinforce"}
     flash_advantage_names = {"flashreinforce", "flash_reinforce"}
     flash_enabled = (
@@ -589,7 +598,11 @@ def validate_cfg(cfg: SkyRLTrainConfig):
     # uniformly to every step's response tokens. This only makes sense for outcome-based estimators.
     # Temporal estimators (GAE, REINFORCE++) produce per-token advantages, which the broadcast
     # discards. Reject the combination explicitly.
-    if cfg.generator.step_wise_trajectories and cfg.trainer.algorithm.advantage_estimator in ("gae", "reinforce++"):
+    if cfg.generator.step_wise_trajectories and cfg.trainer.algorithm.advantage_estimator in (
+        "gae",
+        "gae_adaptive",
+        "reinforce++",
+    ):
         raise ValueError(
             f"advantage_estimator={cfg.trainer.algorithm.advantage_estimator!r} is not supported with "
             f"step_wise_trajectories=True. The step-wise branch collapses each trajectory to a single "

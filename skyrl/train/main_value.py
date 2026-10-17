@@ -22,7 +22,7 @@ from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
 from skyrl.backends.skyrl_train.workers.model_wrapper import (
     get_llm_for_sequence_regression,
 )
-from skyrl.train.config import FSDPConfig, OptimizerConfig
+from skyrl.train.config import FSDPConfig, ModelConfig, OptimizerConfig, SkyRLLoraConfig
 from skyrl.train.dataset.value_dataset import (
     RewardDataCollator,
     ValueDataset,
@@ -94,23 +94,52 @@ def train(args):
         sampler = DistributedSampler(train_dataset, seed=args.seed)
         loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, collate_fn=collator)
         steps_per_epoch = math.ceil(len(loader) / args.gradient_accumulation_steps)
+        lora_config = SkyRLLoraConfig(
+            rank=args.rank if args.use_nora else 0,
+            alpha=args.lora_alpha,
+            dropout=0.0,
+            use_nora=args.use_nora,
+            target_modules=args.target_modules,
+        )
         strategy = FSDPStrategy(
-            FSDPConfig(),
+            FSDPConfig(fsdp_size=args.fsdp_size),
             optimizer_config=OptimizerConfig(lr=args.lr, offload_after_step=False),
+            model_config=ModelConfig(path=args.model, lora=lora_config),
             seed=args.seed,
             micro_train_batch_size_per_gpu=args.batch_size,
             num_training_steps=steps_per_epoch * args.epochs,
         )
         strategy.setup_distributed()
-        model = get_llm_for_sequence_regression(args.model, "critic", bf16=True)
-        model.config.pad_token_id = tokenizer.pad_token_id
+        model = get_llm_for_sequence_regression(
+            args.model,
+            "critic",
+            bf16=True,
+            lora_rank=lora_config.rank,
+            lora_alpha=lora_config.alpha,
+            lora_dropout=lora_config.dropout,
+            target_modules=lora_config.target_modules,
+            use_nora=lora_config.use_nora,
+        )
+        if model.config.model_type != "rwkv":
+            model.config.pad_token_id = tokenizer.pad_token_id
+        trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
+        total_parameters = sum(parameter.numel() for parameter in model.parameters())
+        logger.info(f"Trainable parameters: {trainable_parameters:,} / {total_parameters:,}")
         if args.gradient_checkpointing:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model, optimizer, scheduler = strategy.prepare((model, None, None))
         if dist.get_rank() == 0 and args.report_to == "wandb":
             import wandb
 
-            run = wandb.init(project=args.wandb_project, config=vars(args))
+            run = wandb.init(
+                project=args.wandb_project,
+                name=args.run_name,
+                config={
+                    **vars(args),
+                    "trainable_parameters": trainable_parameters,
+                    "total_parameters": total_parameters,
+                },
+            )
 
         best_mse = math.inf
 
@@ -127,10 +156,14 @@ def train(args):
                 client_state={"global_step": step, **metrics},
                 tokenizer=tokenizer,
             )
-            strategy.save_hf_model(model, os.path.join(checkpoint, "huggingface"), tokenizer=tokenizer)
+            strategy.save_hf_model(
+                model, os.path.join(checkpoint, "huggingface"), tokenizer=tokenizer, output_dtype=torch.bfloat16
+            )
             if metrics["eval/sequence_mse"] < best_mse:
                 best_mse = metrics["eval/sequence_mse"]
-                strategy.save_hf_model(model, os.path.join(args.output_dir, "best"), tokenizer=tokenizer)
+                strategy.save_hf_model(
+                    model, os.path.join(args.output_dir, "best"), tokenizer=tokenizer, output_dtype=torch.bfloat16
+                )
 
         step = 0
         for epoch in range(args.epochs):
@@ -170,7 +203,7 @@ def train(args):
         dist.destroy_process_group()
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
     parser.add_argument("--train-data", required=True)
@@ -184,14 +217,28 @@ def main():
     parser.add_argument("--save-steps", type=int, default=50)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument("--use-nora", action="store_true", help="Train NoRA backbone adapters and the full value head")
+    parser.add_argument("--rank", type=int, default=8, help="NoRA rank; sweep 8, 16, 32, 64, ...")
+    parser.add_argument("--lora-alpha", type=int, default=None, help="NoRA alpha; defaults to rank")
+    parser.add_argument("--target-modules", nargs="+", default=["r_proj", "k_proj", "v_proj", "o_proj"])
+    parser.add_argument(
+        "--fsdp-size", type=int, default=-1, help="FSDP shard size; -1 uses all ranks, 1 replicates the base"
+    )
     parser.add_argument("--report-to", choices=("wandb", "none"), default="wandb")
     parser.add_argument("--wandb-project", default="rwkv-value-pretraining")
-    args = parser.parse_args()
+    parser.add_argument("--run-name", default=None)
+    args = parser.parse_args(argv)
     for name in ("epochs", "batch_size", "gradient_accumulation_steps", "save_steps"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive.")
     if args.max_length < 2 or not math.isfinite(args.lr) or args.lr <= 0:
         parser.error("--max-length must be >= 2 and --lr must be finite and positive.")
+    if args.rank <= 0 or (args.lora_alpha is not None and args.lora_alpha <= 0):
+        parser.error("--rank and --lora-alpha must be positive.")
+    if args.fsdp_size != -1 and args.fsdp_size <= 0:
+        parser.error("--fsdp-size must be -1 or positive.")
+    if args.lora_alpha is None:
+        args.lora_alpha = args.rank
     train(args)
 
 

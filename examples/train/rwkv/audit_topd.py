@@ -790,8 +790,13 @@ def main():
         shard = copy.deepcopy(batch[rank * per_rank : (rank + 1) * per_rank])
         size = args.streaming_microbatches * cfg.trainer.micro_train_batch_size_per_gpu
         chunks = shard.chunk(size) if size and loss_fn == topd_stopd_policy_loss else [shard]
-        for chunk in chunks:
+        for index, chunk in enumerate(chunks):
             status = worker.forward_backward(chunk, return_per_token_outputs=False)
+            if index + 1 < len(chunks):
+                # Match the policy/reference residency transitions between
+                # streamed groups; accumulated gradients must survive offload.
+                strategy.offload_to_cpu(model, optimizer)
+                strategy.backload_to_gpu(model, optimizer)
         missing = [name for name, p in zip(names, parameters) if p.grad is None]
         nonfinite = [
             name

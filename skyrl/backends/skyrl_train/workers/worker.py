@@ -1312,10 +1312,10 @@ class PolicyWorkerBase(Worker):
 
     def optim_step(self, gradient_scale: float = 1.0) -> float:
         """
-        Perform optimizer step.
+        Normalize accumulated gradients, clip them, and perform an optimizer step.
 
         Returns:
-            The gradient norm (before scaling, after clipping)
+            The gradient norm after normalization and before clipping.
         """
         # Streaming token-mean objectives learn their global token count only
         # after the logical batch closes. Normalize before clipping and Adam.

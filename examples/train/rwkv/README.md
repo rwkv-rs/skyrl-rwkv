@@ -372,6 +372,16 @@ established before FSDP wraps the frozen parameters. ChannelMix transposes are
 built after each layer's all-gather while FSDP retains ownership of parameter
 placement. These dtypes and caches remain valid across CPU offload and GPU reload.
 
+Long-context FP16 teacher scoring can produce WKV readouts larger than 65504.
+The optional `trainer.ref.model_config_kwargs.wkv_output_dtype=float32` keeps
+the recurrent output and its head normalization in FP32 while preserving the
+exported FP16 weights. This requires FlashRWKV2's FP32-output/readout support
+and the corresponding `transformers-rwkv` config support in the prepared
+environment. The validated local revisions are FlashRWKV2
+`fd29c063aeecc27ef0142e9bce28331fdc846831` and `transformers-rwkv`
+`b8643244727e7d5e1c4a2be90c26e6bb5118f3b8`; the public dependency pins do not
+yet include these patches. Record the installed revisions with the run config.
+
 `MAX_GENERATE_LENGTH=16384` extends the training response horizon. With TOP-D or
 STOPD, each request is limited by the remaining space in the configured
 `generator.inference_engine.engine_init_kwargs.max_model_len=25600` context.

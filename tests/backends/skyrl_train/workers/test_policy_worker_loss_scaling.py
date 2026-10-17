@@ -4,14 +4,18 @@ from contextlib import ExitStack, nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 from pytest import approx
 
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from tests.backends.skyrl_train.sample_support_helpers import ragged_support
+from skyrl.backends.skyrl_train.utils.ppo_utils import rollout_is_policy_loss
 from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase
 from skyrl.backends.skyrl_train.workers.worker import PolicyWorkerBase
 from skyrl.train.config import SkyRLTrainConfig
+from skyrl.train.dataset.replay_buffer import Experience
 
 
 class _NoopDeviceMesh:
@@ -93,6 +97,71 @@ def _patch_worker_cuda_for_cpu():
     stack.enter_context(patch("torch.cuda.current_device", return_value=torch.device("cpu")))
     stack.enter_context(patch("torch.autocast", side_effect=lambda *args, **kwargs: nullcontext()))
     return stack
+
+
+@pytest.mark.parametrize("forward_only", [False, True])
+def test_rollout_is_score_centering_worker_passes_sampler_support(forward_only):
+    cfg = _make_loss_scaling_cfg("rollout_is", 1)
+    cfg.trainer.algorithm.rollout_is.score_centering = True
+    logits = torch.tensor([0.4, 0.3, 0.2, 0.1]).log().requires_grad_()
+    trainer_logp = logits.log_softmax(-1)
+    sampler_logp = torch.tensor([0.3, 0.3, 0.25, 0.15]).log()
+    support = ragged_support(
+        [np.array([[0, 1]], dtype=np.int32)],
+        [sampler_logp[:2].numpy()[None].astype(np.float32)],
+    )
+    experience = Experience(
+        sequences=torch.tensor([[0, 2]]),
+        attention_mask=torch.ones(1, 2, dtype=torch.long),
+        action_log_probs=None,
+        base_action_log_probs=None,
+        rollout_logprobs=sampler_logp[2].view(1, 1),
+        values=None,
+        returns=None,
+        advantages=torch.ones(1, 1),
+        loss_mask=torch.ones(1, 1),
+        response_mask=torch.ones(1, 1),
+        rollout_expert_indices=None,
+        num_actions=1,
+        info={},
+        rollout_sample_support=support,
+    )
+    model = MagicMock()
+
+    def forward(sequences, num_actions, **kwargs):
+        assert kwargs["enable_score_centering"]
+        assert not kwargs["enable_sample_support_replay"]
+        assert torch.equal(kwargs["sample_support"].columns[0], torch.as_tensor(support.columns[0]))
+        assert torch.equal(kwargs["sample_support"].columns[1], torch.as_tensor(support.columns[1]))
+        return trainer_logp[2].view(1, 1), {
+            "entropy": torch.zeros(1, 2),
+            "score_centering_train_logprobs": trainer_logp[:2].view(1, 1, 2),
+            "score_centering_sampler_logprobs": sampler_logp[:2].view(1, 1, 2),
+        }
+
+    model.side_effect = forward
+    strategy = MagicMock()
+    strategy.backward.side_effect = lambda loss, model, optimizer: loss.backward()
+    worker = _make_policy_worker(cfg, strategy=strategy, model=model)
+    expected, _ = rollout_is_policy_loss(
+        trainer_logp[2].view(1, 1),
+        None,
+        experience.advantages,
+        cfg.trainer.algorithm,
+        loss_mask=experience.loss_mask,
+        rollout_logprobs=experience.rollout_logprobs,
+        score_centering_train_logprobs=trainer_logp[:2].view(1, 1, 2),
+        score_centering_sampler_logprobs=sampler_logp[:2].view(1, 1, 2),
+    )
+    with _patch_worker_cuda_for_cpu():
+        if forward_only:
+            result = worker._forward_micro_with_loss(experience, loss_fn="rollout_is")
+            assert result["loss"] == approx(expected.item())
+            strategy.backward.assert_not_called()
+        else:
+            result = worker._forward_backward_micro(experience, microbatch_weight=1.0)
+            assert result["policy_loss"] == approx(expected.item())
+            assert torch.isfinite(logits.grad).all()
 
 
 def _all_reduce_payload(strategy, op, key):

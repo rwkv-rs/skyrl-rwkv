@@ -21,6 +21,7 @@ def dummy_config():
     ("estimator", "should_raise"),
     [
         ("gae", True),
+        ("gae_adaptive", True),
         ("reinforce++", True),
         ("grpo", False),
         ("rloo", False),
@@ -42,7 +43,7 @@ def test_validate_cfg_step_wise_estimator_compatibility(dummy_config, estimator,
     """
     dummy_config.generator.step_wise_trajectories = True
     dummy_config.trainer.algorithm.advantage_estimator = estimator
-    if estimator == "gae":
+    if estimator in ("gae", "gae_adaptive"):
         dummy_config.trainer.critic.model.path = "dummy-critic-path"
 
     if should_raise:

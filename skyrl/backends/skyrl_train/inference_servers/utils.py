@@ -317,7 +317,7 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
             else cfg.generator.sampling_params.top_k
         )
         overrides["max_logprobs"] = support_top_k
-        if cfg.trainer.algorithm.flashreinforce.score_centering:
+        if cfg.trainer.algorithm.flashreinforce.score_centering or cfg.trainer.algorithm.rollout_is.score_centering:
             overrides["logprobs_mode"] = ie_cfg.sample_support_logprobs_mode
     for key, value in overrides.items():
         setattr(args, key, value)

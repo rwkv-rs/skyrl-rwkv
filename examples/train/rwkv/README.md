@@ -32,6 +32,9 @@ The launcher uses the persistent `$HOME/.cache/skyrl-rwkv/torch_extensions` cach
 using `rwkv7-g1k-1.5b-20260930-ctx25600`. It reads
 `$HOME/data/UltraData-RL-2609/files/{Math,Code,Long_Context,Knowledge}`. A positive
 `--limit` is an explicit, domain-balanced smoke-test limit; the default `--limit 0` is unlimited.
+`--samples-per-prompt` controls the sample count (default 64). An initial SAO
+collection can use `--sampling rollout --save-rollouts --samples-per-prompt 1`;
+resuming a collection requires the same sample count.
 
 After preparing this project's RWKV `.venv` and FlashRWKV2 cache:
 
@@ -116,14 +119,15 @@ rollouts, using the native critic loader and `FSDPStrategy` (no inference engine
 Ray cluster). The data/alignment implementation is adapted from
 [ReDiPPO standard critic pretraining](https://github.com/cii030/ReDiPPO/tree/ecb67b2119b966616a6b8ffbad3db830c4c423fd/critic_pretraining),
 under Apache-2.0 (see the repository `LICENSE`). It does not include ReDiPPO's dual
-critics. This is critic initialization, not the full online SAO algorithm.
+critics. This stage initializes the critic for the online actor-critic path below.
 
 ### Collect rollouts and build data
 
 Use `--sampling rollout` to match the training policy (temperature 1, top-p 1,
 top-k -1, no penalties). The existing evaluation sampling remains the default.
 This explicit 128-question run is a small data-collection example; omit `--limit`
-to collect the full UltraData corpus. Each question still has 64 scored samples.
+to collect the full UltraData corpus. Each question has 64 scored samples by
+default; set `--samples-per-prompt` explicitly for a different collection budget.
 
 ```bash
 MODEL_DIR="$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600"
@@ -186,11 +190,50 @@ uv run --isolated --no-project .venv/bin/torchrun --standalone --nproc-per-node=
   --model "$MODEL_DIR" \
   --train-data "$HOME/data/rwkv-value/train.jsonl" \
   --val-data "$HOME/data/rwkv-value/validation.jsonl" \
-  --output-dir outputs/rwkv7-g1k-1.5b-20260930-ctx25600-value \
+  --output-dir outputs/rwkv7-g1k-1.5b-20260930-ctx25600-value-nora-r8 \
+  --use-nora --rank 8 \
+  --run-name rwkv7-g1k-1.5b-20260930-ctx25600-value-nora-r8 \
   --epochs 2 --lr 5e-6 --batch-size 1 --gradient-accumulation-steps 4 \
   --max-length 8192 --gradient-checkpointing \
   > /tmp/results_rwkv_value_pretraining.log 2>&1
 ```
+
+Install the pinned NoRA PEFT fork from "Antidoom FTPO with NoRA" before using
+`--use-nora`. NoRA freezes the original backbone weights and trains adapters on
+`r_proj`, `k_proj`, `v_proj`, and `o_proj`, together with the complete FP32
+`value_head`. It reuses the existing fused FlashRWKV2 projections. Rank defaults
+to 8, alpha defaults to rank, and adapter dropout is zero. `--target-modules`
+selects the backbone projections; the value head is always trained in full.
+Omitting `--use-nora` retains full-parameter critic training.
+
+For the later rank sweep, keep the rollout dataset, seed, batch sizes, epochs,
+and learning rate fixed and double the rank at each run. Set `MAX_RANK` to the
+desired endpoint; the following example covers 8, 16, 32, 64, 128, and 256:
+
+```bash
+MODEL_DIR="$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600"
+DATA_DIR="$HOME/data/rwkv-value"
+MAX_RANK=256
+for ((RANK=8; RANK<=MAX_RANK; RANK*=2)); do
+  RUN_NAME="rwkv7-g1k-1.5b-20260930-ctx25600-value-nora-r${RANK}"
+  TORCH_EXTENSIONS_DIR="$HOME/.cache/skyrl-rwkv/torch_extensions" \
+  uv run --isolated --no-project .venv/bin/torchrun --standalone --nproc-per-node=8 \
+    -m skyrl.train.main_value \
+    --model "$MODEL_DIR" \
+    --train-data "$DATA_DIR/train.jsonl" --val-data "$DATA_DIR/validation.jsonl" \
+    --output-dir "outputs/$RUN_NAME" --run-name "$RUN_NAME" \
+    --use-nora --rank "$RANK" \
+    --epochs 2 --lr 5e-6 --seed 42 --batch-size 1 --gradient-accumulation-steps 4 \
+    --max-length 8192 --gradient-checkpointing \
+    > "/tmp/results_${RUN_NAME}.log" 2>&1 || break
+done
+```
+
+Each rank has its own checkpoints and W&B run, including the adapter settings
+and trainable/total parameter counts. `--lora-alpha` overrides alpha explicitly.
+`--fsdp-size` defaults to -1 (all ranks); 1 keeps a full frozen backbone per GPU
+and synchronizes trainable gradients. Compare validation MSE and explained
+variance across the sweep before choosing a critic for online training.
 
 Default: native BF16 RWKV, `wkv_mode=fp32io16`, raw scalar predictions and FP32 masked
 MSE, globally normalized over action tokens across ranks and accumulation windows.
@@ -205,7 +248,114 @@ variance (`--report-to none` disables it).
 `get_llm_for_sequence_regression(path, "critic")`, or set
 `trainer.critic.model.path=<output-dir>/best` for an online critic. Keep the actor's
 model path separate so online initialization does not reset the pretrained value head.
+With NoRA, `step_N/lora_adapter/` saves adapters and the complete trained head.
+The HF exports and `best/` contain complete BF16 critic weights, merged with
+FP32 NoRA normalization and addition; they load without PEFT. Export leaves the
+live adapters, head, and frozen backbone untouched.
 The offline entry point starts a fresh optimizer; it does not resume interrupted runs.
+
+## Online SAO and Score-Centering
+
+### UltraData task rewards
+
+Prepare the native UltraData environment dataset with the same UUID split and
+seed as offline value pretraining:
+
+```bash
+uv run --isolated --no-config --no-project .venv/bin/python3 \
+  examples/train/rwkv/prepare_opd.py --task-rewards \
+  --output "$HOME/data/ultradata-sao/train.parquet" \
+  --validation-fraction 0.05 --seed 42 \
+  > /tmp/results_ultradata_sao_prepare.log 2>&1
+```
+
+This writes `train.parquet` and `validation.parquet` with `env_class=ultradata`.
+The environment shares Math, Code, Long_Context, and Knowledge scoring with the
+offline collector. Parquet records retain source paths and byte offsets; keep
+the original UltraData shards available and unchanged during training. Code test
+cases are read per question instead of loading the entire corpus into memory.
+The default `prepare_opd.py` behavior remains the OPD dataset preparation.
+
+Use `generator.batched=false` and `generator.use_conversation_multi_turn=true`.
+Environment metadata selects `open_think` for Math and `fake_think` for the other
+domains while preserving the generated token IDs. For a 25600-token training
+context and 8192 generated tokens, set `data.max_prompt_length=17408`.
+
+Initialize the actor from the rollout checkpoint and the critic from the merged
+offline `best/` export. To continue critic training with NoRA, set
+`trainer.critic.model.lora.use_nora=true`, `rank=8`, `alpha=8`, and
+`target_modules=[r_proj,k_proj,v_proj,o_proj]` under the same `lora` config.
+The critic backbone is frozen; its adapters and full FP32 value head train.
+
+### SAO configuration
+
+Use the native `gae_adaptive` advantage estimator with `rollout_is` policy loss.
+It scans only positions where both `response_mask` and `loss_mask` are active:
+tool observations remain in the model context but do not advance the GAE trace
+or supply its next-state value. Response-level terminal rewards are placed at
+the last active action; per-token rewards retain their action-boundary positions.
+
+The actor uses `lambda = max(0, 1 - 1 / (alpha * action_length))`, with
+`alpha=1.5` by default. Critic return targets use a separate
+`gae_adaptive.critic_lambd=1.0`, giving Monte-Carlo targets when `gamma=1`.
+Set `gae_adaptive.mode=fixed` to use `algorithm.lambd` for the actor while
+retaining skip-observation and the separate critic lambda. Advantages are raw;
+normalization and loss reduction use the existing trainer controls. The original
+`gae` estimator and other algorithms retain their existing behavior.
+
+For an initial synchronous run, reuse the existing RWKV launcher with explicit
+algorithm overrides and a pretrained critic. A smaller critic mini-batch gives
+two critic optimizer steps for each actor step. This is a starting configuration,
+not a validated convergence recipe:
+
+```bash
+CRITIC_DIR="$PWD/outputs/rwkv7-g1k-1.5b-20260930-ctx25600-value-nora-r8/best"
+RUN_NAME=rwkv7-g1k-1.5b-20260930-ctx25600-gsm8k-sao \
+MICRO_BATCH_SIZE=4 \
+bash examples/train/rwkv/run_rwkv_flashreinforce.sh \
+  trainer.algorithm.advantage_estimator=gae_adaptive \
+  trainer.algorithm.policy_loss_type=rollout_is \
+  trainer.algorithm.gae_adaptive.alpha=1.5 \
+  trainer.algorithm.gae_adaptive.critic_lambd=1.0 \
+  trainer.algorithm.eps_clip_low=0.3 \
+  trainer.algorithm.eps_clip_high=5.0 \
+  trainer.critic.model.path="$CRITIC_DIR" \
+  trainer.critic.model_config_kwargs.wkv_mode=fp32io16 \
+  trainer.critic_mini_batch_size=64 \
+  generator.use_conversation_multi_turn=true \
+  > /tmp/results_rwkv_sao.log 2>&1
+```
+
+After checking a few synchronous steps, use native fully async scheduling with
+`trainer.fully_async.enabled=true`, `trainer.placement.colocate_all=false`,
+appropriate policy/critic/inference GPU counts, and
+`trainer.fully_async.num_parallel_generation_workers=256`. Account for all three
+model placements when sizing a non-colocated run. The estimator is shared by the
+synchronous and fully async trainers. Keep `generator.n_samples_per_prompt=1`,
+and leave step-wise trajectory splitting disabled so GAE sees complete trajectories.
+
+For the experimental DIS + Score-Centering combination, additionally set:
+
+```text
+trainer.algorithm.rollout_is.score_centering=true
+trainer.algorithm.rollout_is.score_centering_top_k=128
+```
+
+This reuses the FSDP/RWKV sampler-support path already used by FlashREINFORCE.
+Capture width is independent of sampling top-k. Use temperature 1, top-p 1,
+top-k -1, no penalties, retained rollout logprobs, and conversation multi-turn
+format. The captured raw sampler probabilities then match the behavior
+denominator used by DIS. Evaluation sampling is independent of capture.
+
+The correction centers the complete weighted score
+`w(a) * grad(log p(a)) - E_q[w(v) * grad(log p(v))]`, where
+`w = ratio * 1{1-eps_low < ratio < 1+eps_high}`. It reuses the existing top-k/tail
+approximation and detaches score coefficients. The correction is not multiplied
+by the sampled action's gate again: a rejected sampled action can still contribute
+the expectation correction. This follows the weighted-score construction in
+[Score Centering](https://arxiv.org/html/2609.20807v1); its benefit alongside SAO
+requires a controlled training comparison. Additional off-policy corrections
+and sample-support replay cannot be combined with this option.
 
 ## Download and verify the model
 

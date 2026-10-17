@@ -4,10 +4,27 @@
 
 - **`skyrl/train/entrypoints/main_base.py`** — Primary training entrypoint. Handles inference server setup, training loop, weight sync.
 - **`skyrl/train/entrypoints/main_generate.py`** — Generation-only entrypoint (no training).
-- **`skyrl/train/main_value.py`** — Standalone offline critic pretraining via `torchrun` and native `FSDPStrategy`; argparse flags, no Ray/inference engines. Dataset/collator: `skyrl/train/dataset/value_dataset.py`. Exact-token input contract and RWKV commands: `examples/train/rwkv/README.md` (Offline value pretraining).
+- **`skyrl/train/main_value.py`** — Standalone offline critic pretraining via `torchrun` and native `FSDPStrategy`; argparse flags, no Ray/inference engines. Optional `--use-nora` freezes the RWKV backbone and trains existing fused NoRA adapters plus the full FP32 value head; `--rank` defaults to 8 and alpha defaults to rank. Rank sweeps double 8, 16, 32, etc. FSDP checkpoints retain adapters/head; HF exports and `best/` merge complete BF16 critic weights. Dataset/collator: `skyrl/train/dataset/value_dataset.py`. Exact-token input contract and RWKV commands: `examples/train/rwkv/README.md` (Offline value pretraining).
 - **`examples/train/rwkv/antidoom.py`** — Select complete benchmarks by active G1k truncation rate, export all original native LightEval questions, append untested AntiDoom mix components with `export-mix` (excluding GSM8K/MMLU/MATH and MetaMathQA), and generate fresh rollouts with an explicit RWKV checkpoint. Extract FTPO data from new repetitions, then train NoRA in length-bucketed microbatches with native `FSDPStrategy` via `torchrun` and automatically merge the final adapter into full HF weights. See the RWKV README (Antidoom FTPO with NoRA) for selection/export commands and pinned dependencies.
 
 RWKV offline data collection uses `examples/train/rwkv/rollout.py --sampling rollout --save-rollouts`. Build the exact-token train/validation dataset with `examples/train/rwkv/build_value_data.py --input <rollout-output> --output <new-data-directory>`; see the RWKV README for the complete command chain.
+
+`rollout.py --samples-per-prompt` controls collection size (default 64). For online
+UltraData rewards, use `prepare_opd.py --task-rewards --validation-fraction 0.05
+--seed 42` and the same UUID split as value pretraining. The native `ultradata`
+environment loads golden answers/test cases by source path and byte offset and
+shares the offline scoring functions. Per-environment template metadata selects
+Math `open_think` and other domains `fake_think`; use unbatched generation with
+conversation multi-turn token preservation. Online FSDP critics accept
+`trainer.critic.model.lora.use_nora=true`, training adapters and the full head.
+
+Online SAO uses the native `gae_adaptive` estimator with `rollout_is` loss. It skips
+observation positions using `response_mask & loss_mask`, uses action-length-adaptive
+policy lambda (`gae_adaptive.alpha=1.5`), and separate critic lambda
+(`gae_adaptive.critic_lambd=1`). Optional `rollout_is.score_centering=true` reuses
+FSDP sampler-support capture and centers the complete DIS-weighted score. Its raw
+support capture requires temperature 1, top-p 1, top-k -1 and no penalties. See the
+RWKV README's Online SAO section for the configuration and validation scope.
 
 ## Running Training
 

@@ -200,6 +200,52 @@ def test_calc_advantages_and_returns(mock_compute_adv_and_ret, dummy_config):
     )
 
 
+def test_calc_gae_adaptive_passes_action_mask_and_keeps_mc_returns(dummy_config):
+    dummy_config.trainer.algorithm.advantage_estimator = "gae_adaptive"
+    trainer = RayPPOTrainer(
+        cfg=dummy_config,
+        tracker=None,
+        tokenizer=None,
+        train_dataset=DummyDataset(),
+        eval_dataset=DummyDataset(),
+        inference_engine_client=None,
+        generator=None,
+    )
+    data = _get_test_data(trainer)
+    data["values"] = torch.zeros_like(data["rewards"])
+    data = trainer.compute_advantages_and_returns(data)
+    torch.testing.assert_close(data["returns"], data["loss_mask"].float())
+    assert not data["advantages"][~data["loss_mask"].bool()].any()
+    assert data["advantages"][0, 0] == approx(1 - 1 / (1.5 * 2))
+    assert data["advantages"][1, 0] == approx((1 - 1 / (1.5 * 3)) ** 2)
+
+
+@pytest.mark.parametrize("estimator, reward_index", [("gae_adaptive", 1), ("grpo", 3)])
+def test_postprocess_scalar_reward_at_last_action_for_adaptive_gae(dummy_config, estimator, reward_index):
+    dummy_config.trainer.algorithm.advantage_estimator = estimator
+    trainer = RayPPOTrainer(
+        cfg=dummy_config,
+        tracker=None,
+        tokenizer=None,
+        train_dataset=DummyDataset(),
+        eval_dataset=DummyDataset(),
+        inference_engine_client=None,
+        generator=None,
+    )
+    output = {"response_ids": [[11, 12, 21, 22]], "loss_masks": [[1, 1, 0, 0]], "rewards": [1.0]}
+    with patch(
+        "skyrl.train.trainer.get_metrics_from_generator_output",
+        return_value={
+            "pass_at_n": 1.0,
+            "avg_score": 1.0,
+            "mean_positive_reward": 1.0,
+        },
+    ):
+        result, _ = trainer.postprocess_generator_output(output, ["a"])
+    assert result["rewards"][0][reward_index] == 1.0
+    assert sum(result["rewards"][0]) == 1.0
+
+
 def test_calc_advantages_and_returns_step_wise_broadcast(dummy_config):
     """Regression test for the step-wise advantage broadcast across trajectories.
 

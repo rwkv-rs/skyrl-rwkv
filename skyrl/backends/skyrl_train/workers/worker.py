@@ -1134,6 +1134,7 @@ class PolicyWorkerBase(Worker):
             # NOTE: users can provide a custom loss config class, so we need to use the same class after applying overrides
             loss_config = type(loss_config).from_dict_config(new_loss_config)
 
+        score_centering = loss_config.flashreinforce.score_centering or loss_config.rollout_is.score_centering
         # TODO (sumanthrh): don't think this does anything for fsdp rn because autocast happens internally
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             # actor loss
@@ -1148,13 +1149,11 @@ class PolicyWorkerBase(Worker):
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
                 sample_support=(
-                    experience.rollout_sample_support
-                    if (sample_support_replay or loss_config.flashreinforce.score_centering)
-                    else None
+                    experience.rollout_sample_support if (sample_support_replay or score_centering) else None
                 ),
-                loss_mask=loss_mask if (sample_support_replay or loss_config.flashreinforce.score_centering) else None,
+                loss_mask=loss_mask if (sample_support_replay or score_centering) else None,
                 enable_sample_support_replay=sample_support_replay,
-                enable_score_centering=loss_config.flashreinforce.score_centering,
+                enable_score_centering=score_centering,
             )
             # loss function
             # TODO: recompute advantages
@@ -1164,9 +1163,9 @@ class PolicyWorkerBase(Worker):
             }
             if resolved_loss_name in ("flashreinforce", "flash_reinforce"):
                 policy_loss_kwargs["real_rows"] = loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
-                if loss_config.flashreinforce.score_centering:
-                    policy_loss_kwargs["score_centering_train_logprobs"] = output["score_centering_train_logprobs"]
-                    policy_loss_kwargs["score_centering_sampler_logprobs"] = output["score_centering_sampler_logprobs"]
+            if score_centering:
+                policy_loss_kwargs["score_centering_train_logprobs"] = output["score_centering_train_logprobs"]
+                policy_loss_kwargs["score_centering_sampler_logprobs"] = output["score_centering_sampler_logprobs"]
             policy_loss, loss_metrics = current_loss_fn(
                 action_log_probs,
                 old_action_log_probs,
@@ -1428,6 +1427,7 @@ class PolicyWorkerBase(Worker):
             new_loss_config = OmegaConf.merge(OmegaConf.create(asdict(loss_config)), OmegaConf.create(loss_fn_config))
             loss_config = type(loss_config).from_dict_config(new_loss_config)
 
+        score_centering = loss_config.flashreinforce.score_centering or loss_config.rollout_is.score_centering
         with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             action_log_probs, output = self.model(
                 sequences,
@@ -1440,13 +1440,11 @@ class PolicyWorkerBase(Worker):
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
                 sample_support=(
-                    experience.rollout_sample_support
-                    if (sample_support_replay or loss_config.flashreinforce.score_centering)
-                    else None
+                    experience.rollout_sample_support if (sample_support_replay or score_centering) else None
                 ),
-                loss_mask=loss_mask if (sample_support_replay or loss_config.flashreinforce.score_centering) else None,
+                loss_mask=loss_mask if (sample_support_replay or score_centering) else None,
                 enable_sample_support_replay=sample_support_replay,
-                enable_score_centering=loss_config.flashreinforce.score_centering,
+                enable_score_centering=score_centering,
             )
             policy_loss_kwargs = {
                 "loss_mask": loss_mask,
@@ -1454,9 +1452,9 @@ class PolicyWorkerBase(Worker):
             }
             if loss_fn in ("flashreinforce", "flash_reinforce"):
                 policy_loss_kwargs["real_rows"] = loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
-                if loss_config.flashreinforce.score_centering:
-                    policy_loss_kwargs["score_centering_train_logprobs"] = output["score_centering_train_logprobs"]
-                    policy_loss_kwargs["score_centering_sampler_logprobs"] = output["score_centering_sampler_logprobs"]
+            if score_centering:
+                policy_loss_kwargs["score_centering_train_logprobs"] = output["score_centering_train_logprobs"]
+                policy_loss_kwargs["score_centering_sampler_logprobs"] = output["score_centering_sampler_logprobs"]
             policy_loss, _ = current_loss_fn(
                 action_log_probs,
                 old_action_log_probs,

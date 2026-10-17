@@ -298,6 +298,7 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
         strategy = FSDPStrategy(
             fsdp_config=self.cfg.critic.fsdp_config,
             optimizer_config=self.cfg.critic.optimizer_config,
+            model_config=self.cfg.critic.model,
             fsdp_strategy=self.cfg.strategy,
             seed=self.cfg.seed,
             micro_train_batch_size_per_gpu=self.cfg.micro_train_batch_size_per_gpu,
@@ -319,6 +320,7 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
             lora_rank=self.cfg.critic.model.lora.rank,
             lora_alpha=self.cfg.critic.model.lora.alpha,
             lora_dropout=self.cfg.critic.model.lora.dropout,
+            use_nora=self.cfg.critic.model.lora.use_nora,
             target_modules=self.cfg.critic.model.lora.target_modules,
             exclude_modules=self.cfg.critic.model.lora.exclude_modules,
             value_head_prefix=self.cfg.algorithm.value_head_prefix,
@@ -344,7 +346,8 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
         self._set_expandable_segments(True)
 
     def _set_pad_token_id(self, pad_token_id):
-        self.model.config.pad_token_id = pad_token_id
+        if not self.model.is_rwkv:
+            self.model.config.pad_token_id = pad_token_id
 
     def forward(
         self,

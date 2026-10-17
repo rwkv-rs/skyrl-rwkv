@@ -889,7 +889,8 @@ def _get_critic_model(
             with torch.autocast(device_type=input_ids.device.type, enabled=False):
                 outputs = getattr(self, self.base_model_prefix)(recurrent_ids, use_cache=False)
                 hidden_states = outputs["last_hidden_state"]
-                recurrent_values = getattr(self, self.value_head_prefix)(hidden_states).squeeze(-1)
+                value_head = getattr(self, self.value_head_prefix)
+                recurrent_values = value_head(hidden_states.to(value_head.weight.dtype)).squeeze(-1)
             values = recurrent_values.new_zeros(input_ids.shape)
             for index, length in enumerate(lengths.tolist()):
                 values[index, attention_mask[index].bool()] = recurrent_values[index, :length]
@@ -1004,6 +1005,7 @@ def get_llm_for_sequence_regression(
     target_modules=None,
     exclude_modules=None,
     lora_dropout=0,
+    use_nora=False,
     use_flash_attention_2=False,
     init_value_head: bool = False,
     value_head_prefix="value_head",
@@ -1028,6 +1030,11 @@ def get_llm_for_sequence_regression(
     assert model_type == "critic", f"Only model_type critic is supported, got: {model_type}."
 
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True, **model_config_kwargs)
+    if use_nora:
+        if config.model_type != "rwkv" or lora_rank <= 0:
+            raise ValueError("NoRA critic training requires an RWKV model and a positive LoRA rank.")
+        if "use_nora" not in LoraConfig.__dataclass_fields__:
+            raise RuntimeError("Install the NoRA PEFT fork used by AntiDoom; see examples/train/rwkv/README.md.")
     if config.model_type == "rwkv":
         # FlashRWKV2 requires native BF16, including evaluation and FSDP master weights.
         bf16 = True
@@ -1076,6 +1083,8 @@ def get_llm_for_sequence_regression(
     # LoRA
     if lora_rank > 0:
         model.enable_input_require_grads()
+        if use_nora:
+            getattr(model, value_head_prefix).float()
         lora_config = LoraConfig(
             r=lora_rank,
             lora_alpha=lora_alpha,
@@ -1083,8 +1092,11 @@ def get_llm_for_sequence_regression(
             exclude_modules=exclude_modules,
             lora_dropout=lora_dropout,
             bias="none",
+            **({"use_nora": True, "modules_to_save": [value_head_prefix]} if use_nora else {}),
         )
         model = get_peft_model(model, lora_config)
+        if use_nora:
+            model.train()
 
         if load_in_4bit:
             for name, module in model.named_modules():

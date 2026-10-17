@@ -19,6 +19,7 @@ import os
 import sys
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Set, Tuple
@@ -508,6 +509,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         )
         self._generation_completion_order = 0
         self._generation_consumption_order = 0
+        self._generation_submission_lock = asyncio.Lock()
         self._pending_generation_batches = {}
         if cfg.trainer.fully_async.streaming_batch_size:
             self._validate_gradient_streaming()
@@ -1190,29 +1192,31 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         """
         try:
             while True:
-                # 0. Pull next batch from dataloader. If returns None, then dataloader is exhausted.
-                rand_prompts = await self.async_train_dataloader.get_next_non_consumed_data()
-                if rand_prompts is None:
-                    return
-
-                # 1. Prepare generator input
-                assert len(rand_prompts) == 1
-                generator_input, uids = prepare_generator_input(
-                    rand_prompts,
-                    self.cfg.generator.n_samples_per_prompt,
-                    get_sampling_params_for_backend(
-                        self.cfg.generator.inference_engine.backend, self.cfg.generator.sampling_params
-                    ),
-                    self.cfg.environment.env_class,
-                    "train",
-                    self.global_step,
-                )
-                assert all(uid == uids[0] for uid in uids), "Expect all uids to be the same"
-
-                # 2. Acquire capacity slot.
                 slot_acquired = False
-                submission_order = await self._staleness_manager.acquire_submission_slot()
-                slot_acquired = True
+                # Fixed batches reserve admission in sampler order. Capacity
+                # waiters can otherwise overtake rows already pulled by another
+                # worker, changing mini-batch membership after a weight update.
+                admission = self._generation_submission_lock if self.async_mode != "fully_async" else nullcontext()
+                async with admission:
+                    # Read before reserving so epoch exhaustion needs no slot.
+                    rand_prompts = await self.async_train_dataloader.get_next_non_consumed_data()
+                    if rand_prompts is None:
+                        return
+
+                    assert len(rand_prompts) == 1
+                    generator_input, uids = prepare_generator_input(
+                        rand_prompts,
+                        self.cfg.generator.n_samples_per_prompt,
+                        get_sampling_params_for_backend(
+                            self.cfg.generator.inference_engine.backend, self.cfg.generator.sampling_params
+                        ),
+                        self.cfg.environment.env_class,
+                        "train",
+                        self.global_step,
+                    )
+                    assert all(uid == uids[0] for uid in uids), "Expect all uids to be the same"
+                    submission_order = await self._staleness_manager.acquire_submission_slot()
+                    slot_acquired = True
                 generation_batch_step = None
                 if self.async_mode != "fully_async":
                     generation_batch_step = submission_order // self.mini_batch_size + 1

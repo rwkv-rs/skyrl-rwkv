@@ -134,17 +134,21 @@ def validate_batch_sizes(cfg: SkyRLTrainConfig):
     policy_mini_batch_size_per_gpu = (
         cfg.trainer.policy_mini_batch_size * cfg.generator.n_samples_per_prompt // policy_dp_size
     )
+    # Separate async pools need not divide the logical batch (e.g. seven
+    # learners and one sampler). Native MeshDispatch pads each mini-batch with
+    # loss_mask=0; FSDP's microbatch iterator handles the equal partial tails.
+    padded_async = cfg.trainer.fully_async.enabled and cfg.trainer.strategy == "fsdp"
     assert policy_mini_batch_size_per_gpu > 0, (
         f"Invalid policy_mini_batch_size_per_gpu: {policy_mini_batch_size_per_gpu}. "
         f"mini_batch_size={cfg.trainer.policy_mini_batch_size}, "
         f"n_samples_per_prompt={cfg.generator.n_samples_per_prompt}, "
         f"dp_size={policy_dp_size}"
     )
-    assert policy_mini_batch_size_per_gpu % cfg.trainer.micro_train_batch_size_per_gpu == 0, (
+    assert padded_async or policy_mini_batch_size_per_gpu % cfg.trainer.micro_train_batch_size_per_gpu == 0, (
         f"normalized policy_mini_batch_size_per_gpu {policy_mini_batch_size_per_gpu} should be divisible "
         f"by micro_train_batch_size_per_gpu {cfg.trainer.micro_train_batch_size_per_gpu}"
     )
-    assert policy_mini_batch_size_per_gpu // cfg.trainer.micro_train_batch_size_per_gpu > 0, (
+    assert padded_async or policy_mini_batch_size_per_gpu // cfg.trainer.micro_train_batch_size_per_gpu > 0, (
         f"normalized policy_mini_batch_size_per_gpu {policy_mini_batch_size_per_gpu} should be larger than "
         f"micro_train_batch_size_per_gpu {cfg.trainer.micro_train_batch_size_per_gpu}"
     )
@@ -153,7 +157,7 @@ def validate_batch_sizes(cfg: SkyRLTrainConfig):
     )
 
     # `train_batch_size_per_gpu` should be divisible by `policy_mini_batch_size_per_gpu`
-    assert policy_train_batch_size_per_gpu % policy_mini_batch_size_per_gpu == 0, (
+    assert padded_async or policy_train_batch_size_per_gpu % policy_mini_batch_size_per_gpu == 0, (
         f"normalized policy_train_batch_size_per_gpu (train_batch_size * n_samples_per_prompt // policy_dp_size) "
         f"{policy_train_batch_size_per_gpu} should be divisible by policy_mini_batch_size_per_gpu "
         f"(policy_mini_batch_size * n_samples_per_prompt // policy_dp_size) {policy_mini_batch_size_per_gpu}"

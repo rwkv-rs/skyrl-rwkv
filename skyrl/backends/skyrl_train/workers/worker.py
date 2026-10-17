@@ -1020,7 +1020,7 @@ class PolicyWorkerBase(Worker):
 
         for microbatch_index, microbatch in enumerate(microbatch_iterator):
             experience = BaseBatchIterator.batch_to_experience(microbatch)
-            microbatch_weight = len(microbatch) / len(data)
+            microbatch_weight = len(microbatch) / len(data) * data.metadata.get("loss_scale", 1.0)
             with self._microbatch_context(is_last=microbatch_index == len(microbatch_iterator) - 1):
                 metrics = self._forward_backward_micro(
                     experience,
@@ -1162,6 +1162,8 @@ class PolicyWorkerBase(Worker):
                 "loss_mask": loss_mask,
                 "rollout_logprobs": rollout_action_logprobs,
             }
+            if resolved_loss_name == "async_opd":
+                policy_loss_kwargs["teacher_log_probs"] = base_action_log_probs
             if resolved_loss_name in ("flashreinforce", "flash_reinforce"):
                 policy_loss_kwargs["real_rows"] = loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
                 if loss_config.flashreinforce.score_centering:
@@ -1308,13 +1310,20 @@ class PolicyWorkerBase(Worker):
 
         return status
 
-    def optim_step(self) -> float:
+    def optim_step(self, gradient_scale: float = 1.0) -> float:
         """
         Perform optimizer step.
 
         Returns:
             The gradient norm (before scaling, after clipping)
         """
+        # Streaming token-mean objectives learn their global token count only
+        # after the logical batch closes. Normalize before clipping and Adam.
+        if gradient_scale != 1.0:
+            for group in self.optimizer.param_groups:
+                for parameter in group["params"]:
+                    if parameter.grad is not None:
+                        parameter.grad.mul_(gradient_scale)
         # Perform optimizer step (includes gradient clipping)
         grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
 

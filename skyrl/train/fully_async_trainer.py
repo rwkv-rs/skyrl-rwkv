@@ -12,10 +12,13 @@ High-level notes:
 """
 
 import asyncio
+import copy
 import inspect
+import math
 import os
 import sys
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Set, Tuple
@@ -33,7 +36,9 @@ from skyrl.backends.skyrl_train.utils.io import io
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
     LOSSES_WITH_OLD_LOGPROBS,
     PolicyLossType,
+    get_kl_controller,
 )
+from skyrl.backends.skyrl_train.workers.worker_utils import reduce_metrics
 from skyrl.train.generators.base import GeneratorInput, GeneratorOutput
 from skyrl.train.generators.utils import (
     concatenate_generator_outputs,
@@ -100,6 +105,8 @@ class GeneratedOutputGroup:
     generation_consumption_order: Optional[int] = None
     prompts: Optional[List[Any]] = None
     generator_input: Optional[GeneratorInput] = None
+    generation_batch_step: Optional[int] = None
+    generation_submission_order: Optional[int] = None
 
 
 @dataclass
@@ -205,7 +212,7 @@ class _AsyncStalenessManager:
         producer_concurrency_capacity = self.max_concurrent_generation_groups - self._stat.running
         return min(producer_concurrency_capacity, producer_staleness_capacity)
 
-    async def acquire_submission_slot(self) -> None:
+    async def acquire_submission_slot(self) -> int:
         """Block until there is capacity, then reserve a slot (increments submitted and running).
 
         This method always uses the latest current version tracked internally, which is
@@ -217,6 +224,12 @@ class _AsyncStalenessManager:
             # Reserve slot
             self._stat.submitted += 1
             self._stat.running += 1
+            return self._stat.submitted - 1
+
+    async def wait_for_accepted(self, count: int) -> None:
+        """Wait for a fixed admitted batch to close before publishing new weights."""
+        async with self._cond:
+            await self._cond.wait_for(lambda: self._stat.accepted >= count)
 
     async def on_rollout_accepted(self) -> None:
         async with self._cond:
@@ -262,7 +275,7 @@ class _AsyncDataloader:
       because the batch size is 1 in fully async training.
     """
 
-    def __init__(self, train_dataloader: StatefulDataLoader, mini_batch_size: int):
+    def __init__(self, train_dataloader: StatefulDataLoader, mini_batch_size: int, reshuffle_each_epoch: bool = False):
         self._train_dataloader = train_dataloader
         self._train_dataloader_initial_state = train_dataloader.state_dict()
         self._effective_dataloader_length = len(self._train_dataloader) // mini_batch_size * mini_batch_size
@@ -274,23 +287,68 @@ class _AsyncDataloader:
         self._consumed_data_uids: Set[str] = set()
         self._filtered_data_uids: Set[str] = set()
         self._exhausted: bool = False  # currently not used.
+        self._reshuffle_each_epoch = reshuffle_each_epoch
 
     def load_state_from_checkpoint(
-        self, consumed_data_uids_set: Set[str], filtered_data_uids_set: Optional[Set[str]] = None
+        self,
+        consumed_data_uids_set: Set[str],
+        filtered_data_uids_set: Optional[Set[str]] = None,
+        epoch_start_state: Optional[dict] = None,
     ) -> None:
         """
         Load the state from a checkpoint.
         """
         self._consumed_data_uids = consumed_data_uids_set
         self._filtered_data_uids = filtered_data_uids_set if filtered_data_uids_set is not None else set()
+        if epoch_start_state is not None:
+            self._train_dataloader_initial_state = epoch_start_state
 
         # Reset in case the dataloader loaded the state from the checkpoint, which we do not want.
         self._train_dataloader.load_state_dict(self._train_dataloader_initial_state)
+        self._iter = enumerate(self._train_dataloader)
+        if self._reshuffle_each_epoch and self._train_dataloader.num_workers == 0:
+            # Loading the single-process sampler restores its pre-worker-seed
+            # RNG snapshot. Preserve the draw that native epoch iteration made.
+            torch.empty((), dtype=torch.int64).random_(generator=self._train_dataloader.generator)
+
+    def import_synchronous_state(self, state: dict, batch_size: int) -> Set[str]:
+        """Recover this epoch's consumed prefix using the saved native sampler RNG.
+
+        Keep the permutation and worker seed, but rewind the batch sampler so
+        the one-prompt async loader can replay it and skip the exact trained UIDs.
+        """
+        initial = copy.deepcopy(state)
+        if "_snapshot" in initial:
+            snapshot = initial["_snapshot"]
+            main = snapshot["_main_snapshot"]
+            consumed_count = (
+                main["_sampler_iter_state"]["samples_yielded"] + initial["_steps_since_snapshot"] * batch_size
+            )
+            snapshot["_snapshot_step"] = 0
+            snapshot["_last_yielded_worker_id"] = self._train_dataloader.num_workers - 1
+            initial["_steps_since_snapshot"] = 0
+        else:
+            main = initial
+            consumed_count = main["_sampler_iter_state"]["samples_yielded"]
+            main["_num_yielded"] = 0
+        main["_sampler_iter_state"]["samples_yielded"] = 0
+        main["_sampler_iter_state"]["sampler_iter_state"]["yielded"] = 0
+        main["_sampler_iter_yielded"] = 0
+        initial["_iterator_finished"] = False
+        self._train_dataloader_initial_state = initial
+        self._train_dataloader.load_state_dict(initial)
+        iterator = iter(self._train_dataloader)
+        consumed = {next(iterator)[0]["uid"] for _ in range(consumed_count)}
+        self.load_state_from_checkpoint(consumed, epoch_start_state=initial)
+        return consumed
 
     async def reset_at_epoch_end(self) -> None:
         async with self._lock:
-            self._train_dataloader.load_state_dict(self._train_dataloader_initial_state)  # reset to initial state
+            if not self._reshuffle_each_epoch:
+                self._train_dataloader.load_state_dict(self._train_dataloader_initial_state)
             self._iter = enumerate(self._train_dataloader)
+            if self._reshuffle_each_epoch:
+                self._train_dataloader_initial_state = self._train_dataloader.state_dict()
             self._consumed_data_uids.clear()
             self._filtered_data_uids.clear()
             self._exhausted = False
@@ -346,6 +404,9 @@ class _AsyncDataloader:
 
 
 class FullyAsyncRayPPOTrainer(RayPPOTrainer):
+    async_mode = "fully_async"
+    _streaming_supports_token_mean = False
+    _preserve_epoch_shuffle = False
 
     def __init__(self, *args, **kwargs):
         # Extract cfg before base init so we can initialize async-specific knobs used by our overrides.
@@ -354,7 +415,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         # Initialize async-specific knobs
         self.num_parallel_generation_workers = cfg.trainer.fully_async.num_parallel_generation_workers
-        self.mini_batch_size = cfg.trainer.policy_mini_batch_size
+        self.async_mode = cfg.trainer.fully_async.mode
+        self.mini_batch_size = (
+            cfg.trainer.policy_mini_batch_size if self.async_mode == "fully_async" else cfg.trainer.train_batch_size
+        )
         self.max_staleness_steps = cfg.trainer.fully_async.max_staleness_steps
         self.sample_full_batch = cfg.trainer.fully_async.sample_full_batch
 
@@ -393,13 +457,15 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         assert (
             self.cfg.trainer.fully_async.enabled
         ), "trainer.fully_async.enabled must be True when using the fully async trainer."
-        assert (
-            self.cfg.trainer.train_batch_size == self.cfg.trainer.policy_mini_batch_size
-        ), "train_batch_size must equal policy_mini_batch_size for fully async training"
+        assert self.cfg.trainer.train_batch_size % self.cfg.trainer.policy_mini_batch_size == 0 and (
+            self.async_mode != "fully_async" or self.cfg.trainer.train_batch_size == self.mini_batch_size
+        ), "Async training requires complete policy mini-batches; fully_async requires one mini-batch"
         assert (
             self.cfg.trainer.algorithm.dynamic_sampling.type is None
         ), "dynamic sampling is not supported for fully async training yet."
         if self.sample_full_batch:
+            if self.async_mode != "fully_async":
+                raise ValueError("Fixed logical batches cannot use sample_full_batch filtering")
             assert self.cfg.trainer.algorithm.zero_variance_filter, (
                 "trainer.fully_async.sample_full_batch=True requires trainer.algorithm.zero_variance_filter=True "
                 "(it is the async-native equivalent of dynamic_sampling='filter')."
@@ -415,7 +481,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             optimizes_against_rollout = True
         else:
             optimizes_against_rollout = loss_type not in LOSSES_WITH_OLD_LOGPROBS
-        assert optimizes_against_rollout, (
+        assert optimizes_against_rollout or self.async_mode == "zero_stale", (
             f"Found trainer.algorithm.policy_loss_type={loss_type} in "
             f"{sorted([loss.value for loss in LOSSES_WITH_OLD_LOGPROBS])}. Fully async training should use "
             "rollout logprobs (i.e. rollout_is, dppo, or cispo with cispo.cispo_anchor='rollout') instead "
@@ -425,7 +491,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # TODO(Charlie): need to assert we are doing TIS and returning logprobs
 
         # Async-specific states
-        self.async_train_dataloader = _AsyncDataloader(self.train_dataloader, self.mini_batch_size)
+        self.async_train_dataloader = _AsyncDataloader(
+            self.train_dataloader,
+            self.mini_batch_size,
+            reshuffle_each_epoch=self.async_mode != "fully_async" or self._preserve_epoch_shuffle,
+        )
         self._staleness_manager = _AsyncStalenessManager(
             max_concurrent_generation_groups=self.num_parallel_generation_workers,
             mini_batch_size=self.mini_batch_size,
@@ -433,9 +503,103 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         )
         self._generation_completion_order = 0
         self._generation_consumption_order = 0
+        self._pending_generation_batches = {}
+        if cfg.trainer.fully_async.streaming_batch_size:
+            self._validate_gradient_streaming()
 
     def add_callback(self, callback):
         raise NotImplementedError("Callbacks are not yet supported by FullyAsyncRayPPOTrainer. ")
+
+    def _validate_gradient_streaming(self):
+        cfg = self.cfg
+        size = cfg.trainer.fully_async.streaming_batch_size
+        if (
+            cfg.trainer.strategy != "fsdp"
+            or cfg.trainer.update_epochs_per_batch != 1
+            or cfg.trainer.policy_mini_batch_size != cfg.trainer.train_batch_size
+            or cfg.trainer.train_batch_size % size
+            or cfg.trainer.critic.model.path is not None
+            or cfg.trainer.algorithm.advantage_batch_normalize
+            or cfg.generator.step_wise_trajectories
+        ):
+            raise ValueError(
+                "Gradient streaming requires FSDP, one complete-batch optimizer step, and group-local advantages"
+            )
+        if cfg.trainer.algorithm.advantage_estimator not in ("grpo", "no_op"):
+            raise ValueError("Gradient streaming requires GRPO group advantages or OPD token advantages")
+        if cfg.trainer.algorithm.loss_reduction == "token_mean" and not self._streaming_supports_token_mean:
+            raise ValueError("Streaming token_mean requires OPD; use sequence_mean or prompt_mean for GRPO")
+        dp = cfg.trainer.placement.policy_num_nodes * cfg.trainer.placement.policy_num_gpus_per_node
+        dp = math.lcm(dp, cfg.trainer.placement.ref_num_nodes * cfg.trainer.placement.ref_num_gpus_per_node)
+        if size * cfg.generator.n_samples_per_prompt % (dp * cfg.trainer.micro_train_batch_size_per_gpu):
+            raise ValueError("Streaming batches must fill the policy DP/microbatch grid with complete prompt groups")
+
+    def _streaming_token_normalization(self):
+        return False
+
+    def _begin_streaming_step(self):
+        self._streaming_metrics = defaultdict(list)
+        self._streaming_cache = []
+        self._streaming_tokens = 0
+
+    def _stream_training_groups(self, groups):
+        """Backpropagate ready complete groups while the policy snapshot is fixed."""
+        output = concatenate_generator_outputs([group.generator_output for group in groups])
+        uids = [group.uid for group in groups for _ in group.generator_output["response_ids"]]
+        output, uids = self.postprocess_generator_output(output, uids)
+        data = self.convert_to_training_input(output, uids, train_batch_size=len(groups))
+        timings = {}
+        with Timer("streaming_forward", timings):
+            data = self.fwd_logprobs_values_reward(data)
+        self._streaming_cache.append(
+            (
+                list(data.metadata["uids"]),
+                {key: data.get(key) for key in ("action_log_probs", "base_action_log_probs", "values")},
+            )
+        )
+        if self.cfg.trainer.algorithm.use_kl_in_reward:
+            data = self.apply_reward_kl_penalty(data)
+        data = self.compute_advantages_and_returns(data)
+        data = self._normalize_advantages(
+            data, data.metadata["policy_mini_batch_boundaries"], data.metadata["policy_prompt_boundaries"]
+        )
+        tokens = int(data["loss_mask"].sum())
+        self._streaming_tokens += tokens
+        if self._streaming_token_normalization():
+            scale = tokens
+        elif self.cfg.trainer.algorithm.loss_reduction == "token_mean":
+            # STOPD already divides every ready source by the same lagged C_k.
+            scale = 1.0
+        else:
+            scale = len(groups) / self.mini_batch_size
+        data["advantages"] = data["advantages"] * scale
+        data.metadata["loss_scale"] = len(groups) / self.mini_batch_size
+        with Timer("streaming_backward", timings):
+            status = self.dispatch.forward_backward("policy", data, return_per_token_outputs=False)
+        for key, value in timings.items():
+            self.all_timings[key] = self.all_timings.get(key, 0.0) + value
+        for key, value in status.metrics.items():
+            self._streaming_metrics[key].append(value)
+
+    def _restore_streaming_scores(self, data):
+        """Place cached scores back in the logical batch's prompt/sample order."""
+        sources = defaultdict(list)
+        for uids, scores in self._streaming_cache:
+            for row, uid in enumerate(uids):
+                sources[uid].append((scores, row))
+        fields = self._streaming_cache[0][1]
+        for key, sample in fields.items():
+            data[key] = None if sample is None else torch.zeros_like(data["loss_mask"], dtype=sample.dtype)
+        for row, uid in enumerate(data.metadata["uids"]):
+            scores, source_row = sources[uid].pop(0)
+            for key, value in scores.items():
+                if value is not None:
+                    data[key][row, -value.shape[1] :] = value[source_row]
+        self._streaming_cache.clear()
+        return data
+
+    def _finish_streaming_step(self, data):
+        """Objective-specific state advances once, at the optimizer barrier."""
 
     def _build_train_dataloader_and_compute_training_steps(self):
         """
@@ -506,6 +670,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         if self._vllm_metrics_scraper is not None:
             await self._vllm_metrics_scraper.sample()
 
+        if self.cfg.trainer.algorithm.use_kl_in_reward:
+            self.reward_kl_controller = get_kl_controller(self.cfg.trainer.algorithm)
+
         # Eval before training
         if self.cfg.trainer.eval_interval > 0 and self.cfg.trainer.eval_before_train:
             with self._phase_gauge.timed_phase("eval", self.all_timings):
@@ -527,6 +694,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
                 # Buffer of completed generation, size bounded by capacity - consumed = B * (max_staleness_steps + 1)
                 generation_output_group_buffer = asyncio.Queue[GeneratedOutputGroup](maxsize=self._gen_buffer_maxsize)
+                self._pending_generation_batches.clear()
                 # First generation-worker exception; consumers waiting on the buffer raise it.
                 generation_failure = BackgroundFailure()
 
@@ -621,6 +789,15 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             )
 
                         # 4. After training: pause generation, sync weights, resume.
+                        if self.async_mode == "one_step_off":
+                            # Keep every sampled prefix in each logical batch on
+                            # one policy. Admission remains closed until after sync.
+                            target = min(
+                                (self.global_step + 1) * self.mini_batch_size,
+                                (epoch + 1) * self.num_steps_per_epoch * self.mini_batch_size,
+                            )
+                            with self._phase_gauge.timed_phase("wait_for_rollout_batch", self.all_timings):
+                                await generation_failure.guard(self._staleness_manager.wait_for_accepted(target))
                         async with self._weight_sync_deadline():
                             with self._phase_gauge.timed_phase("sync_weights", self.all_timings):
                                 await self.dispatch.save_weights_for_sampler()
@@ -746,6 +923,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         pbar.close()
 
+        # The loop increments after every completed update, including the final
+        # update. Checkpoint names and optimizer/algorithm state use that update.
+        if self.async_mode != "fully_async" or self._preserve_epoch_shuffle:
+            self.global_step -= 1
+
         if not stop_training:
             # All epochs completed: advance past the last epoch so resuming from the final checkpoint
             # does not redo the last epoch (whose consumed UIDs were cleared at its epoch end).
@@ -857,6 +1039,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         Returns ``(kept_groups, dropped_groups, epoch_exhausted)``. On exhaustion the kept groups are a
         (possibly empty) partial batch to discard; dropped groups are kept for metrics only.
         """
+        if self.async_mode != "fully_async":
+            return await self._collect_fixed_batch(generation_output_group_buffer, failure)
         kept_groups: List[GeneratedOutputGroup] = []
         dropped_groups: List[GeneratedOutputGroup] = []
         epoch_exhausted = False
@@ -895,6 +1079,26 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             buffer_pbar.close()
         return kept_groups, dropped_groups, epoch_exhausted
 
+    async def _collect_fixed_batch(self, buffer: asyncio.Queue, failure: BackgroundFailure):
+        """Consume every preassigned group once, independently of completion time."""
+        groups = self._pending_generation_batches.setdefault(self.global_step, [])
+        streaming_size = self.cfg.trainer.fully_async.streaming_batch_size
+        streamed = 0
+        if streaming_size:
+            self._begin_streaming_step()
+        with self._phase_gauge.timed_phase("wait_for_generation_buffer", self.all_timings):
+            while len(groups) < self.mini_batch_size:
+                group = await failure.guard(buffer.get())
+                self._pending_generation_batches.setdefault(group.generation_batch_step, []).append(group)
+                if streaming_size and len(groups) - streamed >= streaming_size:
+                    await asyncio.to_thread(self._stream_training_groups, groups[streamed : streamed + streaming_size])
+                    streamed += streaming_size
+        if streaming_size and streamed < len(groups):
+            await asyncio.to_thread(self._stream_training_groups, groups[streamed:])
+        del self._pending_generation_batches[self.global_step]
+        groups.sort(key=lambda group: group.generation_submission_order)
+        return groups, [], False
+
     @staticmethod
     def _log_group_processing_error(group: GeneratedOutputGroup, kept_so_far: int, dropped_so_far: int) -> None:
         """Log the offending group's reward / loss-mask shape before a drain-loop error propagates,
@@ -917,7 +1121,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         # TODO(Charlie): share this code with the one-step-off async trainer.
         # inference and calculate values, log probs, rewards, kl divergence
         with Timer("fwd_logprobs_values_reward", self.all_timings):
-            training_input = await asyncio.to_thread(self.fwd_logprobs_values_reward, training_input)
+            if self.cfg.trainer.fully_async.streaming_batch_size:
+                training_input = self._restore_streaming_scores(training_input)
+            else:
+                training_input = await asyncio.to_thread(self.fwd_logprobs_values_reward, training_input)
 
         # calculate kl divergence and create experiences
         if self.cfg.trainer.algorithm.use_kl_in_reward:
@@ -939,7 +1146,19 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         # train policy/critic model
         with Timer("train_critic_and_policy", self.all_timings):
-            status = await asyncio.to_thread(self.train_critic_and_policy, training_input)
+            if self.cfg.trainer.fully_async.streaming_batch_size:
+                gradient_scale = 1.0 / self._streaming_tokens if self._streaming_token_normalization() else 1.0
+                grad_norm = await asyncio.to_thread(self.dispatch.optim_step, "policy", gradient_scale=gradient_scale)
+                status = reduce_metrics(self._streaming_metrics, sum_loss_metrics=True)
+                for key in ("final_loss", "policy_loss"):
+                    if key in status:
+                        status[key] *= gradient_scale
+                status["grad_norm"] = grad_norm
+                self.all_metrics.update({f"policy/{key}": value for key, value in status.items()})
+                self._finish_streaming_step(training_input)
+                self.all_metrics["async/streamed_groups"] = self.mini_batch_size
+            else:
+                status = await asyncio.to_thread(self.train_critic_and_policy, training_input)
 
         return status
 
@@ -974,8 +1193,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
                 # 2. Acquire capacity slot.
                 slot_acquired = False
-                await self._staleness_manager.acquire_submission_slot()
+                submission_order = await self._staleness_manager.acquire_submission_slot()
                 slot_acquired = True
+                generation_batch_step = None
+                if self.async_mode != "fully_async":
+                    generation_batch_step = submission_order // self.mini_batch_size + 1
+                    generator_input["batch_metadata"].global_step = generation_batch_step
 
                 # 3. Generate one rollout group
                 global_step_at_start = self.global_step  # for staleness control
@@ -1011,6 +1234,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             generation_completion_order=self._generation_completion_order,
                             prompts=generator_input["prompts"],
                             generator_input=generator_input,
+                            generation_batch_step=generation_batch_step,
+                            generation_submission_order=submission_order,
                         )
                     )
                 except asyncio.QueueFull:
@@ -1262,8 +1487,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             self.async_train_dataloader.get_consumed_uids_list()
         )  # read first to prevent race condition
         filtered_uids_list = self.async_train_dataloader.get_filtered_uids_list()
-        # The base method will save the model, dataloader path, trainer_state, and latest_ckpt_global_step.txt.
-        global_step_folder = super().save_checkpoints()
+        # Publish async/algorithm state before the base writer publishes the latest pointer.
+        global_step_folder = os.path.join(self.cfg.trainer.ckpt_path, f"global_step_{self.global_step}")
+        io.makedirs(global_step_folder, exist_ok=True)
         # Also save the consumed UIDs (do-not-redraw this epoch), the filtered subset (so dropped
         # prompts are skipped, not regenerated, on resume), and the epoch (not derivable from
         # global_step under sample_full_batch, where an epoch can end early).
@@ -1272,11 +1498,12 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             "consumed_uids": consumed_uids_list,
             "filtered_uids": filtered_uids_list,
             "epoch": self.epoch,
+            "epoch_start_dataloader_state": self.async_train_dataloader._train_dataloader_initial_state,
         }
         with io.open_file(fully_async_state_path, "wb") as f:
             torch.save(fully_async_state, f)
         logger.info(f"Saved fully-async state to {fully_async_state_path}")
-        return global_step_folder
+        return super().save_checkpoints()
 
     def load_checkpoints(self) -> Tuple[int, str, Optional[Set[str]], Optional[Set[str]], Optional[int]]:
         """
@@ -1290,7 +1517,18 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         if global_step == 0:
             return 0, checkpoint_path, None, None, None
         fully_async_state_path = os.path.join(checkpoint_path, "fully_async_state.pt")
-        assert io.exists(fully_async_state_path), f"Fully-async state file not found at {fully_async_state_path}"
+        if not io.exists(fully_async_state_path):
+            with io.open_file(os.path.join(checkpoint_path, "trainer_state.pt"), "rb") as f:
+                saved = torch.load(f, map_location="cpu", weights_only=False)
+            batch_size = saved["config"]["trainer"]["train_batch_size"]
+            if batch_size != self.mini_batch_size:
+                raise ValueError("Importing a synchronous checkpoint requires the same logical train_batch_size")
+            with io.open_file(os.path.join(checkpoint_path, "data.pt"), "rb") as f:
+                state = torch.load(f, map_location="cpu", weights_only=False)
+            consumed = self.async_train_dataloader.import_synchronous_state(state, batch_size)
+            epoch = (global_step - len(consumed) // batch_size) // self.num_steps_per_epoch
+            logger.info(f"Imported synchronous checkpoint: step={global_step}, epoch={epoch}, consumed={len(consumed)}")
+            return global_step, checkpoint_path, consumed, set(), epoch
         with io.open_file(fully_async_state_path, "rb") as f:
             fully_async_state = torch.load(f, map_location="cpu", weights_only=False)
             assert "consumed_uids" in fully_async_state, "consumed_uids key not found in fully-async state"
@@ -1298,6 +1536,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             # Backward compatible with checkpoints saved before filtered UIDs / epoch were tracked.
             filtered_data_uids_set = set(fully_async_state.get("filtered_uids", []))
             epoch = fully_async_state.get("epoch", None)
+            if "epoch_start_dataloader_state" in fully_async_state:
+                self.async_train_dataloader._train_dataloader_initial_state = fully_async_state[
+                    "epoch_start_dataloader_state"
+                ]
         logger.info(
             f"Loaded fully-async state with {len(consumed_data_uids_set)} consumed UIDs "
             f"({len(filtered_data_uids_set)} filtered), epoch={epoch}"

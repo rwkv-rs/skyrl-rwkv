@@ -1203,3 +1203,57 @@ uv run --isolated --no-config --no-project uv pip install \
   --python .venv/bin/python --no-deps 'peft==0.18.1' \
   > /tmp/results_antidoom_restore_peft.log 2>&1
 ```
+
+
+## Optional native asynchronous RL
+
+`run_rwkv_grpo.sh`, `run_rwkv_flashreinforce.sh`, and
+`run_rwkv_on_policy_distill.sh` accept `ASYNC_MODE` (default `disabled`).
+All modes reuse `FullyAsyncRayPPOTrainer`, native generation queues, FSDP
+workers, and NoRA-to-full-weight synchronization. Set `NUM_POLICY_GPUS` and
+`NUM_INFERENCE_GPUS` to partition the same device budget; the teacher shares
+learner devices. RWKV clears its recurrent cache when weights change.
+
+| Mode | Rollout/update scheduling | TOP-D + STOPD |
+| --- | --- | --- |
+| `one_step_off` | Fixed logical batches; overlap the next rollout batch with the current batch's updates; publish weights after that rollout batch closes | Supported |
+| `zero_stale` | Admit only the current batch; optionally accumulate ready complete-group gradients before one update | Supported |
+| `fully_async` | Native completion queue and bounded admission, with behavior-policy correction | TOP-D supported; STOPD requires a fixed-batch mode |
+
+For example, preserve the current OPD batch and optimizer schedule while testing
+seven learner/teacher devices and one rollout device:
+
+```bash
+ASYNC_MODE=one_step_off NUM_POLICY_GPUS=7 NUM_INFERENCE_GPUS=1 \
+USE_TOPD=true USE_STOPD=true TOPD_GROUP_SIZE=2 MINI_BATCH_SIZE=512 \
+TOPD_MINI_BATCH_SIZE=128 UPDATE_EPOCHS_PER_BATCH=2 \
+uv run --isolated bash examples/train/rwkv/run_rwkv_on_policy_distill.sh \
+  trainer.resume_mode=from_path trainer.resume_path=/absolute/path/to/global_step_N
+```
+
+Plain [AsyncOPD](https://arxiv.org/abs/2606.24143) recomputes
+`teacher_logprob - current_student_logprob` at every learner forward and uses
+an unclipped current/behavior action ratio. TOP-D instead retains its group
+normalization and future returns with a behavior-anchored clipped surrogate;
+STOPD's signed telescoping coefficients remain outside clipping. The local
+reverse-KL gradient identity for plain AsyncOPD does not apply to TOP-D's
+separate objective or remove stale-prefix distribution differences.
+
+Following [ThunderSyncRL](https://arxiv.org/abs/2610.05935), `zero_stale` can
+set `ASYNC_STREAMING_BATCH_SIZE` to a positive number of complete prompt groups.
+It retains the full causal graph, accumulates gradients at fixed weights,
+and normalizes/clips/updates once after the logical batch closes. This
+complete-group implementation supports GRPO and OPD, including TOP-D/STOPD;
+it does not implement the paper's trajectory-local GRPO decomposition.
+Streaming requires one update epoch, `policy_mini_batch_size=train_batch_size`,
+group-local advantages, and chunks divisible by the learner/teacher DP and
+microbatch grid. Use prompt/sequence reduction for GRPO. FlashREINFORCE's
+batch-wide baseline uses the complete batch and supports async scheduling
+without gradient streaming. A multi-update run should use `one_step_off` to
+retain its existing optimizer schedule.
+
+Synchronous checkpoints import model, optimizer, STOPD state, consumed prompt
+UIDs, and the saved epoch permutation. Keep the logical train batch size when
+switching modes. Throughput comparisons should use the same total GPU count,
+checkpoint, token budget, and optimizer updates; exclude initialization and
+compare multiple steady-state steps before enabling a production mode.

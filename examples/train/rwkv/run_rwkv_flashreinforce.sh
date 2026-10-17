@@ -36,7 +36,8 @@ fi
 : "${TRAINING_ENTRYPOINT:=skyrl.train.entrypoints.main_base}"
 : "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-gsm8k-flashreinforce-50step}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
-export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+export UV_PROJECT_ENVIRONMENT="$(realpath .venv)"
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 # FlashRWKV2 uses get_default_build_root() (XDG_CACHE_HOME), not TORCH_EXTENSIONS_DIR.
 export XDG_CACHE_HOME="$HOME/.cache/skyrl-rwkv"
 export TORCH_EXTENSIONS_DIR="$XDG_CACHE_HOME/torch_extensions"
@@ -49,14 +50,14 @@ if [[ "${1:-}" == --prepare-flashrwkv2 ]]; then
   fi
   export MAX_JOBS="${MAX_JOBS:-2}"
   uv sync --extra rwkv
-  uv run --isolated --no-project .venv/bin/python examples/train/rwkv/prepare_flashrwkv2.py
+  uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" examples/train/rwkv/prepare_flashrwkv2.py
   exit 0
 fi
 
 # Check the exact native cache key before loading.
-uv run --isolated --no-project .venv/bin/python examples/train/rwkv/prepare_flashrwkv2.py --check
+uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" examples/train/rwkv/prepare_flashrwkv2.py --check
 
-uv run --isolated --no-project .venv/bin/python -m "$TRAINING_ENTRYPOINT" \
+uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" -m "$TRAINING_ENTRYPOINT" \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
   trainer.algorithm.policy_loss_type=flashreinforce \

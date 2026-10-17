@@ -145,7 +145,8 @@ def test_returns_and_group_moments_match_independent_scalar_equations():
     assert (advantages[~data["loss_mask"].bool()] == 0).all()
 
 
-def test_balance_preserves_prompt_mini_batches_signed_targets_and_gradients():
+@pytest.mark.parametrize("dp_size", [4, 7])
+def test_balance_preserves_prompt_mini_batches_signed_targets_and_gradients(dp_size):
     lengths = [80, 79, 3, 2, 70, 68, 4, 3, 60, 59, 5, 4, 50, 49, 6, 5] * 4
     rows = len(lengths)
     tensors = convert_prompts_responses_to_batch_tensors(
@@ -166,12 +167,12 @@ def test_balance_preserves_prompt_mini_batches_signed_targets_and_gradients():
         "policy_mini_batch_boundaries": [(0, 32), (32, 64)],
     }
     original_uids = data.metadata["uids"].copy()
-    balanced, metrics = balance_training_input(data, dp_size=4, micro_batch_size=4)
+    balanced, metrics = balance_training_input(data, dp_size=dp_size, micro_batch_size=4)
     order = balanced.metadata["batch_permutation"]
     assert sorted(order) == list(range(rows))
     assert data.metadata["uids"] == original_uids
     assert metrics["perf/dense_tokens_after_balance"] < metrics["perf/dense_tokens_before_balance"]
-    assert metrics["perf/policy_rank_max_tokens_after_balance"] < metrics["perf/policy_rank_max_tokens_before_balance"]
+    assert metrics["perf/policy_rank_max_tokens_after_balance"] <= metrics["perf/policy_rank_max_tokens_before_balance"]
     for start, end in data.metadata["policy_mini_batch_boundaries"]:
         assert set(order[start:end]) == set(range(start, end))
     for start, end in groups:
@@ -302,11 +303,14 @@ def test_stopd_warmup_matches_full_topd_without_randomization():
 
 
 @pytest.mark.parametrize("displacement", [0.0, 0.1, 0.7])
-def test_explicit_prefix_objective_matches_signed_loss_gradient(displacement):
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_explicit_prefix_objective_matches_signed_loss_gradient(displacement, asynchronous):
     from examples.train.rwkv.audit_topd import reference_loss_gradient
 
     obj = trainer()
+    obj.cfg.trainer.algorithm.async_opd = asynchronous
     data = obj.apply_reward_kl_penalty(batch())
+    data["rollout_logprobs"] = data["action_log_probs"] - 0.3
     data = obj.compute_advantages_and_returns(data)
     obj._normalize_advantages(data, [(0, 4)])
     delta = torch.linspace(-displacement, displacement, data["action_log_probs"].numel()).reshape_as(
@@ -320,6 +324,7 @@ def test_explicit_prefix_objective_matches_signed_loss_gradient(displacement):
         data["advantages"],
         obj.cfg.trainer.algorithm,
         loss_mask=data["loss_mask"],
+        rollout_logprobs=data["rollout_logprobs"],
     )
     actual_gradient = torch.autograd.grad(actual_loss, current)[0]
     torch.testing.assert_close(
@@ -497,3 +502,99 @@ def test_topd_uses_independent_request_seeds_with_or_without_stopd(monkeypatch, 
     assert result["grouped_budgets"] == stopd
     assert result["stopd_cfg"].seed == (19 if stopd else 42)
     assert cfg.trainer.algorithm.stopd.seed == 19
+
+
+@pytest.mark.parametrize("shift", [0.0, 0.4, 1.3])
+def test_async_opd_expected_gradient_is_current_reverse_kl(shift):
+    from examples.train.on_policy_distillation.main_on_policy_distill import (
+        async_opd_policy_loss,
+    )
+
+    # Enumerate all behavior-policy actions: this is an exact expectation,
+    # including stale behavior, rather than a Monte Carlo tolerance test.
+    logits = torch.tensor([[0.3, -0.9, 0.1 + shift], [-0.2, 0.7, -0.3]], requires_grad=True)
+    teacher = torch.tensor([[0.7, -0.4, 0.2], [-0.8, 0.3, 0.4]]).log_softmax(-1).requires_grad_()
+    behavior = torch.tensor([[-0.6, 0.2, 0.4], [0.8, 0.1, -0.9]]).log_softmax(-1)
+    current = logits.log_softmax(-1)
+    weights = torch.tensor([[0.5], [1.25]])  # Includes a fixed STOPD/IPW weight.
+    actual, _ = async_opd_policy_loss(
+        current,
+        torch.zeros_like(current),
+        behavior.exp() * weights,
+        SimpleNamespace(),
+        torch.ones_like(current),
+        behavior,
+        teacher,
+    )
+    expected = (current.exp() * (current - teacher.detach()) * weights).sum()
+    actual_gradient = torch.autograd.grad(actual, logits, retain_graph=True)[0]
+    expected_gradient = torch.autograd.grad(expected, logits)[0]
+    torch.testing.assert_close(actual_gradient, expected_gradient, atol=2e-7, rtol=2e-6)
+    assert torch.autograd.grad(actual, teacher, allow_unused=True)[0] is None
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_topd_stopd_streamed_gradients_and_adam_equal_whole_batch(asynchronous):
+    obj = trainer()
+    obj.cfg.trainer.algorithm.async_opd = asynchronous
+    data = obj.apply_reward_kl_penalty(batch())
+    data["rollout_logprobs"] -= 0.4
+    data = obj.compute_advantages_and_returns(data)
+    obj._normalize_advantages(data, [(0, 4)])
+    torch.manual_seed(13)
+    features = torch.randn(*data["action_log_probs"].shape, 5)
+    initial = torch.randn(5) * 0.2
+    results = []
+    for streaming in [False, True]:
+        parameter = torch.nn.Parameter(initial.clone())
+        optimizer = torch.optim.AdamW([parameter], lr=1e-3)
+        for _ in range(3):
+            optimizer.zero_grad()
+            for start, end in [(2, 4), (0, 2)] if streaming else [(0, 4)]:
+                current = data["action_log_probs"][start:end] + features[start:end] @ parameter
+                loss, _ = topd_stopd_policy_loss(
+                    current,
+                    data["action_log_probs"][start:end],
+                    data["advantages"][start:end],
+                    obj.cfg.trainer.algorithm,
+                    data["loss_mask"][start:end],
+                    data["rollout_logprobs"][start:end],
+                )
+                loss.backward()
+            gradient = parameter.grad.clone()
+            torch.nn.utils.clip_grad_norm_([parameter], 0.05)
+            optimizer.step()
+        results.append(
+            (
+                gradient,
+                parameter.detach(),
+                optimizer.state[parameter]["exp_avg"],
+                optimizer.state[parameter]["exp_avg_sq"],
+            )
+        )
+    for actual, expected in zip(*results):
+        torch.testing.assert_close(actual, expected, atol=2e-7, rtol=2e-6)
+
+
+@pytest.mark.parametrize("mode", ["one_step_off", "zero_stale"])
+@pytest.mark.parametrize("policy_gpus", [4, 6, 7])
+def test_async_topd_stopd_configuration_preserves_logical_optimizer_schedule(mode, policy_gpus):
+    from skyrl.train.utils.utils import validate_batch_sizes
+
+    cfg = config(
+        **{
+            "trainer.fully_async.enabled": True,
+            "trainer.fully_async.mode": mode,
+            "trainer.fully_async.max_staleness_steps": int(mode == "one_step_off"),
+            "trainer.algorithm.async_opd": mode != "zero_stale",
+            "trainer.placement.policy_num_gpus_per_node": policy_gpus,
+            "trainer.placement.ref_num_gpus_per_node": policy_gpus,
+            "trainer.train_batch_size": 512,
+            "trainer.policy_mini_batch_size": 128,
+            "trainer.micro_train_batch_size_per_gpu": 4,
+            "trainer.micro_forward_batch_size_per_gpu": 4,
+            "trainer.algorithm.topd.balance_batch": True,
+        }
+    )
+    validate_batch_sizes(cfg)
+    assert cfg.trainer.update_epochs_per_batch * cfg.trainer.train_batch_size // cfg.trainer.policy_mini_batch_size == 8

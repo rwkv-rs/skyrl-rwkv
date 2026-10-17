@@ -168,7 +168,12 @@ class BasePPOExp:
         Returns:
             The trainer.
         """
-        return RayPPOTrainer(
+        trainer_cls = RayPPOTrainer
+        if cfg.trainer.fully_async.enabled:
+            from skyrl.train.fully_async_trainer import FullyAsyncRayPPOTrainer
+
+            trainer_cls = FullyAsyncRayPPOTrainer
+        return trainer_cls(
             cfg=cfg,
             tracker=tracker,
             tokenizer=tokenizer,

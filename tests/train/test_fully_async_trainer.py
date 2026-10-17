@@ -363,3 +363,94 @@ def test_should_keep_group_token_level_rewards():
         )
         is True
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("workers", [0, 2])
+@pytest.mark.parametrize("epoch", [0, 1])
+async def test_import_synchronous_checkpoint_preserves_remaining_shuffle(workers, epoch):
+    import copy
+
+    import torch
+
+    rows = [{"uid": str(i)} for i in range(24)]
+
+    def loader(batch_size):
+        return StatefulDataLoader(
+            rows,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=workers,
+            generator=torch.Generator().manual_seed(42),
+            collate_fn=list,
+        )
+
+    synchronous = loader(4)
+    for _ in range(epoch):
+        list(synchronous)
+    iterator = iter(synchronous)
+    prefix = [row["uid"] for _ in range(2) for row in next(iterator)]
+    state = copy.deepcopy(synchronous.state_dict())
+    remaining = [row["uid"] for batch in iterator for row in batch]
+    following_epoch = [row["uid"] for batch in synchronous for row in batch]
+    asynchronous = _AsyncDataloader(loader(1), 4, reshuffle_each_epoch=True)
+    assert asynchronous.import_synchronous_state(state, 4) == set(prefix)
+    restored = []
+    while (batch := await asynchronous.get_next_non_consumed_data()) is not None:
+        restored.append(batch[0]["uid"])
+    assert restored == remaining
+    # A subsequent async checkpoint must replay the same epoch permutation too.
+    epoch_state = copy.deepcopy(asynchronous._train_dataloader_initial_state)
+    second = _AsyncDataloader(loader(1), 4, reshuffle_each_epoch=True)
+    second.load_state_from_checkpoint(set(prefix), epoch_start_state=epoch_state)
+    replay = []
+    while (batch := await second.get_next_non_consumed_data()) is not None:
+        replay.append(batch[0]["uid"])
+    assert replay == remaining
+    await asynchronous.reset_at_epoch_end()
+    restored = []
+    while (batch := await asynchronous.get_next_non_consumed_data()) is not None:
+        restored.append(batch[0]["uid"])
+    assert restored == following_epoch
+
+
+@pytest.mark.asyncio
+async def test_fixed_batches_ignore_completion_order_and_stream_before_closure():
+    trainer = object.__new__(FullyAsyncRayPPOTrainer)
+    trainer.global_step = 1
+    trainer.mini_batch_size = 4
+    trainer._pending_generation_batches = {}
+    trainer.all_timings = {}
+    trainer._phase_gauge = MagicMock()
+    trainer.cfg = SimpleNamespace(trainer=SimpleNamespace(fully_async=SimpleNamespace(streaming_batch_size=2)))
+    trainer._begin_streaming_step = MagicMock()
+    streamed = []
+    trainer._stream_training_groups = lambda groups: streamed.extend(group.uid for group in groups)
+    buffer = asyncio.Queue()
+    for order in [4, 2, 0, 5, 3, 1]:
+        buffer.put_nowait(
+            GeneratedOutputGroup(
+                {}, str(order), 1, generation_batch_step=order // 4 + 1, generation_submission_order=order
+            )
+        )
+    groups, dropped, exhausted = await asyncio.wait_for(trainer._collect_fixed_batch(buffer, BackgroundFailure()), 2)
+    assert [group.uid for group in groups] == ["0", "1", "2", "3"]
+    assert streamed == ["2", "0", "3", "1"]
+    assert [group.uid for group in trainer._pending_generation_batches[2]] == ["4", "5"]
+    assert not dropped and not exhausted
+
+
+@pytest.mark.asyncio
+async def test_weight_publication_barrier_waits_for_entire_admitted_batch():
+    manager = _AsyncStalenessManager(4, 2, 1)
+    assert [await manager.acquire_submission_slot() for _ in range(4)] == list(range(4))
+    for _ in range(3):
+        await manager.on_rollout_accepted()
+    barrier = asyncio.create_task(manager.wait_for_accepted(4))
+    await asyncio.sleep(0)
+    assert not barrier.done()
+    await manager.on_rollout_accepted()
+    await asyncio.wait_for(barrier, 1)
+    assert manager._compute_capacity_unlocked() == 0
+    await manager.notify_capacity_change(2)
+    assert manager._compute_capacity_unlocked() == 2

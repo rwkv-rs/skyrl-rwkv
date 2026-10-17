@@ -460,7 +460,7 @@ class WorkerDispatch:
         self._save_memory_snapshot(model, "forward_backward")
         return WorkerOutput.cat(self._actor_groups[model].actor_infos, statuses)
 
-    def optim_step(self, model: str, model_id: Optional[str] = None) -> Optional[float]:
+    def optim_step(self, model: str, model_id: Optional[str] = None, gradient_scale: float = 1.0) -> Optional[float]:
         """Run optimizer step. For single-tenant training, the model should already be on GPU from forward_backward.
 
         For multi-tenant LoRA training, ``model_id`` is used to ensure the correct adapter is used.
@@ -471,7 +471,8 @@ class WorkerDispatch:
         """
         self._ensure_on_gpu(model, need_optimizer=True, need_model=True)
         self.ensure_active_adapter(model, model_id)
-        refs = self._actor_groups[model].async_run_ray_method("pass_through", "optim_step")
+        kwargs = {"gradient_scale": gradient_scale} if gradient_scale != 1.0 else {}
+        refs = self._actor_groups[model].async_run_ray_method("pass_through", "optim_step", **kwargs)
         grad_norms = deadline.ray_get(refs, "optim_step")
 
         self._save_memory_snapshot(model, "optim_step")
@@ -946,9 +947,7 @@ class WorkerDispatch:
                     start = time.perf_counter()
                     await self._inference_engine_client.pause_generation()
                     self.last_pause_generation_seconds = time.perf_counter() - start
-                    async with cleanup_preserving_primary(
-                        _resume_generation_timed, "resume_generation"
-                    ):
+                    async with cleanup_preserving_primary(_resume_generation_timed, "resume_generation"):
                         await self._inference_engine_client.sleep_for_weight_sync(offload_kv=offload_kv)
                         # Wake the KV cache even if the sync fails, so the resume above never
                         # schedules the frozen requests onto a sleeping KV cache.

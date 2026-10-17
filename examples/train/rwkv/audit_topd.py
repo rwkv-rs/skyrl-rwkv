@@ -456,7 +456,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--samples", type=int, default=256)
     parser.add_argument(
-        "--mode", choices=("gradient", "control", "score", "kl", "replay", "precision"), default="gradient"
+        "--mode", choices=("gradient", "control", "score", "kl", "replay", "precision", "targets"), default="gradient"
     )
     parser.add_argument("--teacher-adapter", type=Path, help="Original AntiDoom adapter for the precision comparison")
     parser.add_argument(
@@ -494,7 +494,8 @@ def main():
     assert args.samples % (world * cfg.trainer.micro_train_batch_size_per_gpu) == 0
     assert cfg.generator.n_samples_per_prompt == 2
     cfg.trainer.train_batch_size = args.samples // 2
-    cfg.trainer.policy_mini_batch_size = args.samples // 2
+    if args.mode != "targets":
+        cfg.trainer.policy_mini_batch_size = args.samples // 2
     if rank == 0:
         args.output.mkdir(parents=True, exist_ok=True)
     dist.barrier()
@@ -732,6 +733,28 @@ def main():
         return
     trainer.compute_advantages_and_returns(data)
     trainer._normalize_advantages(data, data.metadata["policy_mini_batch_boundaries"])
+    if args.mode == "targets":
+        mask = data["loss_mask"].bool()
+        permutation = data.metadata.get("batch_permutation", range(len(data)))
+        diagnostics = {}
+        for key in ("action_log_probs", "base_action_log_probs", "rewards", "advantages"):
+            invalid = ~torch.isfinite(data[key])
+            if invalid.ndim == 3:
+                invalid = invalid.any(-1)
+            affected = (invalid & mask).any(-1).nonzero().flatten().tolist()
+            diagnostics[key] = {
+                "nonfinite_valid_tokens": int((invalid & mask).sum()),
+                "nonfinite_padding_tokens": int((invalid & ~mask).sum()),
+                "source_rows": [permutation[i] for i in affected],
+                "uids": [data.metadata["uids"][i] for i in affected],
+            }
+        emit("target_finiteness", diagnostics)
+        if rank == 0:
+            torch.save(data, args.output / "scored.pt")
+        emit("complete", True)
+        dist.barrier()
+        dist.destroy_process_group()
+        return
     initial = [local_tensor(p).detach().cpu().clone() for p in parameters] if rank == 0 else None
     if rank == 0:
         torch.save(data, args.output / "scored.pt")

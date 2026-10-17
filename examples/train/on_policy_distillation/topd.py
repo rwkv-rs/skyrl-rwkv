@@ -6,6 +6,7 @@ It only needs observed prefixes, including for future returns and group moments.
 """
 
 from dataclasses import dataclass
+import copy
 import math
 
 import torch
@@ -186,4 +187,6 @@ def topd_stopd_policy_loss(log_probs, old_log_probs, advantages, config, loss_ma
 
 def async_topd_policy_loss(log_probs, old_log_probs, advantages, config, loss_mask=None, rollout_logprobs=None):
     """TOP-D's clipped surrogate anchored to the recorded behavior policy."""
+    config = copy.copy(config)
+    config.policy_loss_type = "regular"
     return ppo_policy_loss(log_probs, rollout_logprobs, advantages, config, loss_mask, rollout_logprobs)

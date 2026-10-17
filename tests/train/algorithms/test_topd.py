@@ -710,3 +710,34 @@ async def test_native_group_streaming_matches_complete_topd_stopd_optimizer(obje
         )
     for actual, expected in zip(*results):
         torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-7)
+
+
+@pytest.mark.parametrize("displacement", [0.0, 0.7])
+def test_async_topd_without_stopd_reuses_native_clipped_behavior_objective(displacement):
+    from examples.train.on_policy_distillation.topd import async_topd_policy_loss
+
+    cfg = config(
+        **{
+            "trainer.algorithm.stopd.enabled": False,
+            "trainer.algorithm.async_opd": True,
+            "trainer.algorithm.policy_loss_type": "async_topd",
+            "trainer.fully_async.enabled": True,
+            "trainer.fully_async.mode": "one_step_off",
+            "trainer.fully_async.max_staleness_steps": 1,
+        }
+    )
+    data = batch()
+    advantage, _, _ = compute_topd_advantage(data["rewards"], data["loss_mask"], [(0, 2), (2, 4)])
+    current = (data["action_log_probs"] + displacement).requires_grad_()
+    behavior = data["rollout_logprobs"] - 0.3
+    actual, _ = async_topd_policy_loss(
+        current, data["action_log_probs"], advantage, cfg.trainer.algorithm, data["loss_mask"], behavior
+    )
+    regular = copy.copy(cfg.trainer.algorithm)
+    regular.policy_loss_type = "regular"
+    expected, _ = ppo_policy_loss(current, behavior, advantage, regular, data["loss_mask"], behavior)
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(
+        torch.autograd.grad(actual, current, retain_graph=True)[0], torch.autograd.grad(expected, current)[0]
+    )
+    assert cfg.trainer.algorithm.policy_loss_type == "async_topd"

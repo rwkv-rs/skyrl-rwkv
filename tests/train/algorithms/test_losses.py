@@ -12,6 +12,7 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     compute_bpo_outcome_advantage,
     compute_flashreinforce_outcome_advantage,
     flashreinforce_policy_loss,
+    rollout_is_policy_loss,
     score_centering_token_loss,
     score_centering_token_loss_from_support,
 )
@@ -25,6 +26,7 @@ from skyrl.train.config import (
     FlashReinforceConfig,
     KLCovConfig,
     OffPolicyCorrectionConfig,
+    RolloutISConfig,
     SAPOConfig,
 )
 
@@ -34,6 +36,85 @@ NULL_OFF_POLICY_CORR = OffPolicyCorrectionConfig(
     outlier_token_is_threshold_low=None,
     outlier_token_is_threshold_high=None,
 )
+
+
+@pytest.mark.parametrize("score_centering", [False, True])
+def test_rollout_is_weighted_score_gradient(score_centering):
+    """Center the complete gated score, including rejected sampled actions."""
+    logits = torch.tensor([0.6, 0.25, 0.15]).log().requires_grad_()
+    p_log = logits.log_softmax(-1)
+    q = torch.tensor([0.3, 0.4, 0.3])
+    advantages = torch.tensor([1.0, -0.5, 0.2])
+    config = AlgorithmConfig(
+        policy_loss_type="rollout_is",
+        eps_clip_low=0.3,
+        eps_clip_high=1.5,
+        rollout_is=RolloutISConfig(score_centering=score_centering),
+    )
+    # Enumerate every sampler outcome at the same prefix, with full support.
+    loss, metrics = rollout_is_policy_loss(
+        p_log.view(1, 3),
+        None,
+        (q * advantages).view(1, 3),
+        config,
+        loss_mask=torch.ones(1, 3),
+        rollout_logprobs=q.log().view(1, 3),
+        score_centering_train_logprobs=p_log.view(1, 1, 3).expand(1, 3, 3),
+        score_centering_sampler_logprobs=q.log().view(1, 1, 3).expand(1, 3, 3),
+    )
+    grad = torch.autograd.grad(loss, logits)[0]
+    p = p_log.detach().exp()
+    ratios = p / q
+    weights = torch.where((ratios > 0.7) & (ratios < 2.5), ratios, 0.0)
+    scores = torch.eye(3) - p[None, :]
+    weighted_scores = weights[:, None] * scores
+    if score_centering:
+        weighted_scores -= (q[:, None] * weighted_scores).sum(0)
+        assert metrics["rollout_is/score_centering"] == 1.0
+    expected = -(q[:, None] * advantages[:, None] * weighted_scores).sum(0)
+    torch.testing.assert_close(grad, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_rollout_is_score_centering_cancels_constant_advantage_drift():
+    logits = torch.tensor([0.6, 0.25, 0.15]).log().requires_grad_()
+    p_log = logits.log_softmax(-1)
+    q = torch.tensor([0.3, 0.4, 0.3])
+    loss, _ = rollout_is_policy_loss(
+        p_log[None],
+        None,
+        q[None],
+        AlgorithmConfig(eps_clip_low=0.3, eps_clip_high=1.5, rollout_is=RolloutISConfig(score_centering=True)),
+        loss_mask=torch.ones(1, 3),
+        rollout_logprobs=q.log()[None],
+        score_centering_train_logprobs=p_log.view(1, 1, 3).expand(1, 3, 3),
+        score_centering_sampler_logprobs=q.log().view(1, 1, 3).expand(1, 3, 3),
+    )
+    loss.backward()
+    torch.testing.assert_close(logits.grad, torch.zeros(3), atol=1e-6, rtol=0)
+
+
+def test_rollout_is_score_centering_tail_matches_reconstructed_sampler():
+    """A sampled tail token uses the same gated weight as the head correction."""
+    logits = torch.tensor([0.4, 0.3, 0.2, 0.1]).log().requires_grad_()
+    p_log = logits.log_softmax(-1)
+    q = torch.tensor([0.3, 0.3, 0.4 * 2 / 3, 0.4 / 3])
+    loss, _ = rollout_is_policy_loss(
+        p_log[2].view(1, 1),
+        None,
+        torch.ones(1, 1),
+        AlgorithmConfig(eps_clip_low=0.3, eps_clip_high=0.2, rollout_is=RolloutISConfig(score_centering=True)),
+        loss_mask=torch.ones(1, 1),
+        rollout_logprobs=q[2].log().view(1, 1),
+        score_centering_train_logprobs=p_log[:2].view(1, 1, 2),
+        score_centering_sampler_logprobs=q[:2].log().view(1, 1, 2),
+    )
+    loss.backward()
+    p = p_log.detach().exp()
+    ratio = p / q
+    weights = torch.where((ratio > 0.7) & (ratio < 1.2), ratio, 0.0)
+    scores = torch.eye(4) - p[None]
+    expected = -(weights[2] * scores[2] - (q[:, None] * weights[:, None] * scores).sum(0))
+    torch.testing.assert_close(logits.grad, expected, atol=1e-6, rtol=1e-5)
 
 
 # Adapted a good test from NeMO-RL

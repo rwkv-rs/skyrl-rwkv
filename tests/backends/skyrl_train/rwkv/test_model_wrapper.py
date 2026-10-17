@@ -21,7 +21,10 @@ from skyrl.backends.skyrl_train.utils.sample_support import (
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
 from skyrl.backends.skyrl_train.workers import model_wrapper as model_wrapper_module
 from skyrl.backends.skyrl_train.weight_sync.sources import FsdpWeightSource
-from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase
+from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
+    FSDPCriticWorkerBase,
+    FSDPPolicyWorkerBase,
+)
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
 from skyrl.train.config import SamplingParams
 
@@ -452,6 +455,14 @@ def test_rwkv_policy_does_not_write_tokenizer_padding_into_model_config():
 
     assert not hasattr(rwkv_wrapper.model.config, "pad_token_id")
     assert direct_wrapper.model.config.pad_token_id == 0
+
+
+@pytest.mark.parametrize("is_rwkv", [True, False])
+def test_critic_preserves_rwkv_padding_config(is_rwkv):
+    worker = object.__new__(FSDPCriticWorkerBase)
+    worker.model = SimpleNamespace(is_rwkv=is_rwkv, config=SimpleNamespace(pad_token_id=None))
+    worker._set_pad_token_id(0)
+    assert worker.model.config.pad_token_id == (None if is_rwkv else 0)
 
 
 def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):

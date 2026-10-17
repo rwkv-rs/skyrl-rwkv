@@ -333,7 +333,7 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
             if ie_cfg.sample_support_top_k is not None
             else cfg.generator.sampling_params.top_k
         )
-        if cfg.trainer.algorithm.flashreinforce.score_centering:
+        if cfg.trainer.algorithm.flashreinforce.score_centering or cfg.trainer.algorithm.rollout_is.score_centering:
             args.logprobs_mode = ie_cfg.sample_support_logprobs_mode
 
     # The sharded_rdt backend pulls weight slices from a named trainer actor over

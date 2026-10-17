@@ -441,6 +441,7 @@ def test_cache_salt_is_vllm_safe_for_hf_model_names():
 @pytest.mark.parametrize("use_conversation_multi_turn", [True, False])
 @pytest.mark.parametrize("logprobs_setting", [None, 0])
 @pytest.mark.parametrize("mock_llm_output_ids", [[1, 10, 12, 4], [1, 10, 12]])
+@pytest.mark.parametrize("env_template_kwargs", [{}, {"rwkv_generation_prompt": "fake_think"}])
 async def test_agent_loop_single_turn(
     mock_make,
     mock_tokenizer,
@@ -451,6 +452,7 @@ async def test_agent_loop_single_turn(
     logprobs_setting,
     mock_llm_output_ids,
     mock_env_cfg,
+    env_template_kwargs,
 ):
     """
     This test mocks when we call SkyRLGymGenerator.agent_loop() despite being a single-turn generation.
@@ -462,7 +464,10 @@ async def test_agent_loop_single_turn(
     mock_tokenizer.eos_token_id = 4  # bypass check for eos token id for this test
 
     mock_make.return_value = mock_env
-    mock_env.init.return_value = ([{"role": "user", "content": "Initial input"}], {})
+    mock_env.init.return_value = (
+        [{"role": "user", "content": "Initial input"}],
+        {"chat_template_kwargs": env_template_kwargs},
+    )
 
     def mock_generate(_, model=None):
         result = {
@@ -487,6 +492,11 @@ async def test_agent_loop_single_turn(
     prompt = [{"role": "user", "content": "What is 2 + 2?"}]
     extras = {"answer": "4"}
     output = await generator.agent_loop(prompt, mock_env_cfg.env_class, extras, max_tokens=8, max_input_length=512)
+
+    if env_template_kwargs:
+        calls = mock_tokenizer.apply_chat_template.call_args_list
+        assert any(call.kwargs.get("rwkv_generation_prompt") == "fake_think" for call in calls)
+    assert generator_cfg.chat_template_kwargs == {}
 
     if use_conversation_multi_turn:
         expected_response_ids = mock_llm_output_ids

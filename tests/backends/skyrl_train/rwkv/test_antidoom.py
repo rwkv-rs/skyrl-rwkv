@@ -173,7 +173,8 @@ def test_selects_whole_benchmarks_by_truncation(tmp_path):
     assert (output / "benchmarks.toml").read_text() == 'maths = ["aime25", "aime24"]\n'
 
 
-def test_exports_every_native_doc_and_keeps_gpqa_problem_identity(tmp_path, monkeypatch):
+@pytest.mark.parametrize("include_answers", [False, True])
+def test_exports_every_native_doc_and_keeps_gpqa_problem_identity(tmp_path, monkeypatch, include_answers):
     native_calls = []
 
     class Task:
@@ -184,7 +185,7 @@ def test_exports_every_native_doc_and_keeps_gpqa_problem_identity(tmp_path, monk
             self.evaluation_split = ["train"]
             self.rows = [{"Question": question} for _ in queries]
             self.docs = [
-                SimpleNamespace(query=query, id=str(index), choices=["cached-gold"])
+                SimpleNamespace(query=query, id=str(index), choices=["cached-gold"], get_golds=lambda: ["cached-gold"])
                 for index, query in enumerate(queries)
             ]
 
@@ -232,15 +233,23 @@ def test_exports_every_native_doc_and_keeps_gpqa_problem_identity(tmp_path, monk
         )
     )
     output = tmp_path / "prompts"
-    antidoom.export_benchmarks(SimpleNamespace(benchmarks=path, lighteval_project=tmp_path, output=output, seed=42))
+    antidoom.export_benchmarks(
+        SimpleNamespace(
+            benchmarks=path,
+            lighteval_project=tmp_path,
+            output=output,
+            seed=42,
+            include_answers=include_answers,
+        )
+    )
     rows = list(antidoom.read_jsonl(output / "prompts.jsonl"))
     assert len(rows) == 4
     assert native_calls == [("gpqa:main", None), ("gpqa:diamond", None)]
     assert {row["source"]["doc_id"] for row in rows} == {"0", "1"}
     assert len({row["source"]["problem_key"] for row in rows}) == 1
     assert all(row["source"]["prompt_template"] == "bot" for row in rows)
-    assert "cached-gold" not in (output / "prompts.jsonl").read_text()
-    assert set(rows[0]) == {"query", "source"}
+    assert ("cached-gold" in (output / "prompts.jsonl").read_text()) == include_answers
+    assert set(rows[0]) == ({"query", "source", "gold_answers"} if include_answers else {"query", "source"})
 
 
 @pytest.mark.parametrize("pubmed_evaluated", [False, True])

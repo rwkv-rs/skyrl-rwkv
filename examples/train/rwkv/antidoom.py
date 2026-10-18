@@ -212,11 +212,15 @@ def export_benchmarks(args):
                     question = doc.query
                     if spec["name"].startswith("gpqa:"):
                         question = task.dataset[task.evaluation_split[0]][int(doc.id)]["Question"]
+                    elif spec["name"] == "gsm_plus" and getattr(args, "include_answers", False):
+                        question = task.dataset[task.evaluation_split[0]][int(doc.id)]["seed_question"]
+                        question = f"Question: {question}\n"
                     key = hashlib.sha256(question.strip().encode()).hexdigest()
                     write_json(
                         handle,
                         {
                             "query": doc.query,
+                            **({"gold_answers": doc.get_golds()} if getattr(args, "include_answers", False) else {}),
                             "source": {
                                 "benchmark": spec["name"],
                                 "task": task.full_name,
@@ -226,7 +230,8 @@ def export_benchmarks(args):
                                 "task_version": task.dataset_config.version,
                                 "hf_repo": task.dataset_config.hf_repo,
                                 "evaluation_splits": task.evaluation_split,
-                                "prompt_template": (
+                                "prompt_template": spec.get("prompt_template")
+                                or (
                                     "bot"
                                     if spec["field"] in {"maths", "coding"} or spec["name"].startswith("gpqa:")
                                     else "assistant"
@@ -857,7 +862,7 @@ async def generate(args):
                                     raise
                                 print(f"prompt_index={index} POST retry={attempt + 1}: {exc}", flush=True)
                                 await asyncio.sleep(1)
-                    for choice in payload["choices"]:
+                    for sample_index, choice in enumerate(payload["choices"]):
                         response_ids = choice["token_ids"]
                         text = tokenizer.decode(response_ids, skip_special_tokens=True)
                         found, hit = find_inner_repetition(text)
@@ -866,6 +871,7 @@ async def generate(args):
                             {
                                 "model": args.model,
                                 "prompt_index": index,
+                                "sample_index": choice.get("index", sample_index),
                                 "seed": args.seed + index,
                                 "prompt_ids": prompt_ids,
                                 "response_ids": response_ids,
@@ -1468,6 +1474,9 @@ def main():
     export_parser.add_argument("--lighteval-project", type=Path, required=True)
     export_parser.add_argument("--output", type=Path, required=True)
     export_parser.add_argument("--seed", type=int, default=42)
+    export_parser.add_argument(
+        "--include-answers", action="store_true", help="Retain native golds for offline value scoring"
+    )
     mix_parser = commands.add_parser("export-mix")
     mix_parser.add_argument("--benchmark-data", type=Path, required=True)
     mix_parser.add_argument("--tested-benchmarks", type=Path, required=True)

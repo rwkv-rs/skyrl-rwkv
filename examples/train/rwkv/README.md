@@ -154,6 +154,38 @@ manifest. Thus the default MC dataset is conditioned on completion within the le
 budget; it does not claim to estimate values for excluded truncated trajectories.
 The manifest records the source model, sampling configuration, split seed, and counts.
 
+For sparse rewards, supplement UltraData with fresh CoT benchmark trajectories.
+Use `antidoom export-benchmarks --include-answers` with the pinned native LightEval
+checkout described below. A benchmark specification may set `prompt_template`;
+the scoreboard uses `assistant` for GSM8K/GSM-Plus and `bot` for MATH. The exporter
+retains native gold answers for scoring only; the collector sends just the query
+through the checkpoint's chat template. With `--include-answers`, GSM-Plus uses
+its `seed_question` as the split identity, shared with the original GSM8K question.
+Collect with `antidoom generate --sampling rollout --samples-per-prompt 4`, then:
+
+```bash
+uv run --isolated --no-config --no-project .venv/bin/python \
+  examples/train/rwkv/build_value_data.py \
+  --input "$BENCHMARK_ROLLOUTS" --benchmark-prompts "$BENCHMARK_PROMPTS" \
+  --lighteval-project "$LIGHTEVAL_PROJECT" --output "$BENCHMARK_SCORED" \
+  > /tmp/results_rwkv_benchmark_scores.log 2>&1
+uv run --isolated --no-config --no-project .venv/bin/python \
+  examples/train/rwkv/build_value_data.py \
+  --input "$ULTRADATA_ROLLOUTS" --additional-input "$BENCHMARK_SCORED" \
+  --balance-rewards --max-length 25600 --seed 42 --validation-fraction 0.05 \
+  --output "$BALANCED_VALUE_DATA" > /tmp/results_rwkv_balanced_value_data.log 2>&1
+```
+
+Scoring reuses the native RWKV LightEval answer extractor and mathematical
+equivalence verifier, with the exact generated prompt and response token IDs.
+All inputs must come from the same checkpoint. Balancing first partitions by
+question identity, then independently downsamples each split/domain to equal
+positive and zero outcomes, without replacement. Domains missing either outcome
+are excluded; the manifest reports retained counts and counts before balancing.
+The resulting values describe the balanced training distribution. Keep the
+question-held-out split for value validation; benchmarks used for training are
+no longer independent model evaluation sets.
+
 ### Dataset contract and pretraining
 
 Store exact rollout token IDs, not re-tokenized decoded text, as unpadded JSONL,

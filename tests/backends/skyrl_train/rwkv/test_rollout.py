@@ -502,6 +502,130 @@ def token_rollout_run(tmp_path):
     return output
 
 
+def test_build_balanced_value_data_keeps_disjoint_questions_and_both_sources(tmp_path, token_rollout_run):
+    other = tmp_path / "benchmark-run"
+    shards = other / "rollouts/gsm8k"
+    shards.mkdir(parents=True)
+    (other / "summary.json").write_bytes((token_rollout_run / "summary.json").read_bytes())
+    for index in range(20):
+        with (shards / f"{index}.jsonl").open("w") as handle:
+            for sample in range(4):
+                handle.write(
+                    json.dumps(
+                        {
+                            "uuid": f"problem_{index}",
+                            "domain": "gsm8k",
+                            "sample_index": sample,
+                            "prompt_ids": [11, 12],
+                            "response_ids": [13 + sample, 0],
+                            "reward": float(sample == 0),
+                            "truncated": False,
+                        }
+                    )
+                    + "\n"
+                )
+    outputs = [tmp_path / name for name in ("balanced", "balanced-repeat")]
+    for output in outputs:
+        manifest = build_value_data.build_data(
+            token_rollout_run,
+            output,
+            validation_fraction=0.5,
+            max_length=8,
+            additional_inputs=[other],
+            balance_rewards=True,
+        )
+        assert len(manifest["additional_sources"]) == 1
+        questions = {}
+        for split in ("train", "validation"):
+            rows = [json.loads(line) for line in (output / f"{split}.jsonl").read_text().splitlines()]
+            assert {row["domain"] for row in rows} == {"Knowledge", "gsm8k"}
+            identities = [(row["uuid"], row["sample_index"]) for row in rows]
+            assert len(set(identities)) == len(identities)
+            questions[split] = {row["uuid"] for row in rows}
+            for domain in ("Knowledge", "gsm8k"):
+                outcomes = Counter(row["reward"] for row in rows if row["domain"] == domain)
+                assert outcomes[0] == outcomes[1] > 0
+            assert manifest["counts"][f"{split}_rollouts"] == len(rows)
+            assert manifest["counts"][f"{split}_action_tokens"] == sum(sum(row["loss_mask"]) for row in rows)
+        assert questions["train"].isdisjoint(questions["validation"])
+    for split in ("train", "validation"):
+        assert (outputs[0] / f"{split}.jsonl").read_bytes() == (outputs[1] / f"{split}.jsonl").read_bytes()
+    (other / "summary.json").write_text(json.dumps({"config": {"save_rollouts": True, "model": "other-checkpoint"}}))
+    with pytest.raises(ValueError, match="same checkpoint"):
+        build_value_data.build_data(token_rollout_run, tmp_path / "wrong-model", additional_inputs=[other])
+
+
+def test_balance_drops_domains_without_both_outcomes_and_rejects_nonbinary(tmp_path):
+    path = tmp_path / "data.jsonl"
+    row = {"uuid": "one", "domain": "Math", "reward": 0, "loss_mask": [0, 1]}
+    path.write_text(json.dumps(row) + "\n")
+    counts, _ = build_value_data.balance_data(path, 42)
+    assert counts["rollouts"] == counts["positive_rewards"] == 0
+    assert path.read_bytes() == b""
+    path.write_text(json.dumps({**row, "reward": 0.25}) + "\n")
+    with pytest.raises(ValueError, match="binary"):
+        build_value_data.balance_data(path, 42)
+
+
+def test_native_benchmark_value_scoring_preserves_tokens_and_checks_provenance(tmp_path, monkeypatch):
+    import hashlib
+
+    from skyrl.utils import tok
+
+    calls = []
+
+    def extract(text, extractor, *, rendered_prompt):
+        calls.append((text, extractor, rendered_prompt))
+        return text
+
+    monkeypatch.setitem(
+        sys.modules,
+        "src.rwkv_eval.answer_extract.free_response",
+        SimpleNamespace(
+            answer_extractor_for_benchmark=lambda name: "math",
+            extract_answer=extract,
+            verify_math_answer=lambda gold, answer: gold == answer,
+        ),
+    )
+    monkeypatch.setattr(tok, "get_tokenizer", lambda model: SimpleNamespace(decode=lambda ids, **kwargs: "<think"))
+    prompts = tmp_path / "prompts.jsonl"
+    prompts.write_text(
+        json.dumps({"gold_answers": ["42"], "source": {"benchmark": "gsm8k", "problem_key": "family"}}) + "\n"
+    )
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    config = {
+        "model": "test-rwkv",
+        "input_sha256": hashlib.sha256(prompts.read_bytes()).hexdigest(),
+        "samples_per_prompt": 2,
+    }
+    (raw / "generation.json").write_text(json.dumps(config))
+    rows = [
+        {
+            "model": "test-rwkv",
+            "prompt_index": 0,
+            "sample_index": sample,
+            "prompt_ids": [7, 8],
+            "response_ids": [9 + sample, 0],
+            "text": text,
+            "finish_reason": finish,
+        }
+        for sample, text, finish in [(0, "42", "stop"), (1, "41", "length")]
+    ]
+    (raw / "rollouts.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    output = tmp_path / "scored"
+    result = build_value_data.score_benchmarks(raw, prompts, output, tmp_path)
+    assert result["counts"] == {"rollouts": 2, "positive_rewards": 1, "truncated": 1}
+    scored = [json.loads(line) for line in (output / "rollouts/gsm8k/0.jsonl").read_text().splitlines()]
+    assert [row["reward"] for row in scored] == [1.0, 0.0]
+    assert [row["response_ids"] for row in scored] == [[9, 0], [10, 0]]
+    assert all(row["uuid"] == "family" for row in scored)
+    assert calls == [("42", "math", "<think"), ("41", "math", "<think")]
+    prompts.write_text("changed\n")
+    with pytest.raises(ValueError, match="match the input"):
+        build_value_data.score_benchmarks(raw, prompts, tmp_path / "mismatched", tmp_path)
+
+
 def test_build_value_data_preserves_tokens_masks_outcomes_and_uuid_split(tmp_path, token_rollout_run):
     import torch
 

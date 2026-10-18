@@ -164,12 +164,12 @@ def build_data(
         raise ValueError("No completed token trajectory shards found.")
     output_dir.parent.mkdir(parents=True, exist_ok=True)
     counts = Counter()
+    questions = {split: set() for split in ("train", "validation")}
     with tempfile.TemporaryDirectory(prefix=".value-data-", dir=output_dir.parent) as directory:
         staging = Path(directory)
         with (staging / "train.jsonl").open("wb") as train, (staging / "validation.jsonl").open("wb") as validation:
             files = {"train": train, "validation": validation}
             for shard in shards:
-                kept_question = False
                 with shard.open("rb") as source:
                     for line in source:
                         row = orjson.loads(line)
@@ -206,9 +206,9 @@ def build_data(
                         counts[f"{split}_rollouts"] += 1
                         counts[f"{split}_positive_rewards"] += row["reward"] > 0
                         counts[f"{split}_action_tokens"] += sum(response_mask)
-                        kept_question = True
-                if kept_question:
-                    counts[f"{split}_questions"] += 1
+                        questions[split].add(row["uuid"])
+        for split in questions:
+            counts[f"{split}_questions"] = len(questions[split])
         domains = {}
         if balance_rewards:
             for split in ("train", "validation"):

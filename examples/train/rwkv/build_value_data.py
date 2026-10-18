@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import math
+import os
 import random
 import sys
 import tempfile
@@ -32,6 +33,10 @@ def score_benchmarks(input_dir: Path, prompts_path: Path, output_dir: Path, ligh
     """Score fresh Antidoom collector tokens with the scoreboard's native math verifier."""
     sys.path.insert(0, str(lighteval_project / "src"))
     sys.path.insert(0, str(lighteval_project))
+    # The native verifier starts a clean interpreter; pass the source paths on.
+    os.environ["PYTHONPATH"] = os.pathsep.join(
+        [str(lighteval_project.resolve()), str((lighteval_project / "src").resolve()), os.environ.get("PYTHONPATH", "")]
+    )
     from src.rwkv_eval.answer_extract.free_response import (
         answer_extractor_for_benchmark,
         extract_answer,
@@ -50,7 +55,7 @@ def score_benchmarks(input_dir: Path, prompts_path: Path, output_dir: Path, ligh
         with path.open("rb") as handle:
             for line in handle:
                 row = orjson.loads(line)
-                if row["model"] != config["model"]:
+                if Path(row["model"]).resolve() != Path(config["model"]).resolve():
                     raise ValueError("Scoring requires the checkpoint that generated the tokens.")
                 sample = prompts[row["prompt_index"]]
                 source = sample["source"]
@@ -155,7 +160,7 @@ def build_data(
     for config in configs:
         if not config.get("save_rollouts"):
             raise ValueError("Collect token trajectories with rollout.py --save-rollouts first.")
-        if config["model"] != configs[0]["model"]:
+        if Path(config["model"]).resolve() != Path(configs[0]["model"]).resolve():
             raise ValueError("All rollout inputs must use the same checkpoint.")
     if output_dir.exists():
         raise FileExistsError(f"Output already exists: {output_dir}")

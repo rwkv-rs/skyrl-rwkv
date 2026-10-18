@@ -572,6 +572,11 @@ def test_native_benchmark_value_scoring_preserves_tokens_and_checks_provenance(t
 
     from skyrl.utils import tok
 
+    model = tmp_path / "model"
+    model.mkdir()
+    alias = tmp_path / "model-alias"
+    alias.symlink_to(model, target_is_directory=True)
+    monkeypatch.setenv("PYTHONPATH", "original-path")
     calls = []
 
     def extract(text, extractor, *, rendered_prompt):
@@ -595,14 +600,14 @@ def test_native_benchmark_value_scoring_preserves_tokens_and_checks_provenance(t
     raw = tmp_path / "raw"
     raw.mkdir()
     config = {
-        "model": "test-rwkv",
+        "model": str(model),
         "input_sha256": hashlib.sha256(prompts.read_bytes()).hexdigest(),
         "samples_per_prompt": 2,
     }
     (raw / "generation.json").write_text(json.dumps(config))
     rows = [
         {
-            "model": "test-rwkv",
+            "model": str(alias),
             "prompt_index": 0,
             "sample_index": sample,
             "prompt_ids": [7, 8],

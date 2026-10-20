@@ -69,7 +69,9 @@ with (evaluation_root.parent / f".{phase}.upload.lock").open("a") as lock:
                          job_type="evaluation", allow_val_change=True,
                          config={"model_name": model_name, "phase": phase,
                                  "avg_k": samples, "samples_per_question": samples,
-                                 "max_generated_tokens": 24576, "wkv_mode": "fp32io16"})
+                                 "context_length": 25600,
+                                 "generation_budget": "context_length - actual prompt tokens",
+                                 "wkv_mode": "fp32io16"})
         values = {f"eval/{phase}/{selector}/{key}": value for selector, rows in scores.items()
                   for row in rows.values() for key, value in row.items()}
         run.define_metric("eval/global_step")

@@ -12,6 +12,7 @@ import argparse
 import math
 import os
 import shutil
+import time
 from itertools import islice
 from pathlib import Path
 
@@ -19,6 +20,7 @@ import torch
 import torch.distributed as dist
 from loguru import logger
 from torch.utils.data import DataLoader, DistributedSampler
+from transformers.trainer_pt_utils import DistributedLengthGroupedSampler
 
 from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
 from skyrl.backends.skyrl_train.workers.model_wrapper import (
@@ -103,7 +105,14 @@ def train(args):
         collator = RewardDataCollator(tokenizer.pad_token_id)
         train_dataset = ValueDataset(args.train_data, args.max_length)
         val_dataset = ValueDataset(args.val_data, args.max_length)
-        sampler = DistributedSampler(train_dataset, seed=args.seed)
+        if args.group_by_length:
+            sampler = DistributedLengthGroupedSampler(
+                batch_size=args.batch_size * args.gradient_accumulation_steps * dist.get_world_size(),
+                lengths=[len(ids) for ids in train_dataset.dataset["input_ids"]],
+                seed=args.seed,
+            )
+        else:
+            sampler = DistributedSampler(train_dataset, seed=args.seed)
         loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=sampler, collate_fn=collator)
         steps_per_epoch = math.ceil(len(loader) / args.gradient_accumulation_steps)
         lora_config = SkyRLLoraConfig(
@@ -185,10 +194,19 @@ def train(args):
             sampler.set_epoch(epoch)
             iterator = iter(loader)
             while batches := list(islice(iterator, args.gradient_accumulation_steps)):
+                started = time.perf_counter()
                 # FSDP averages rank gradients. Normalize over all action tokens
                 # in the entire accumulation window, not each microbatch/rank.
-                count = torch.tensor(sum(int(batch["response_mask"].sum()) for batch in batches), device=device)
-                dist.all_reduce(count)
+                counts = torch.tensor(
+                    [
+                        sum(int(batch["response_mask"].sum()) for batch in batches),
+                        sum(int(batch["attention_mask"].sum()) for batch in batches),
+                        sum(batch["input_ids"].numel() for batch in batches),
+                    ],
+                    device=device,
+                )
+                dist.all_reduce(counts)
+                count = counts[0]
                 error_sum = torch.zeros((), device=device)
                 for batch in batches:
                     predictions, labels, mask = critic_forward(model, batch, device)
@@ -204,10 +222,21 @@ def train(args):
                     "train/action_tokens": count.item(),
                     "train/lr": scheduler.get_last_lr()[0],
                 }
+                seconds = time.perf_counter() - started
+                metrics.update(
+                    {
+                        "timing/train_step": seconds,
+                        "train/input_tokens": counts[1].item(),
+                        "train/tokens_per_second": counts[1].item() / seconds,
+                        "train/padding_fraction": 1 - counts[1].item() / counts[2].item(),
+                    }
+                )
                 if grad_norm is not None:
                     metrics["train/grad_norm"] = grad_norm.detach().cpu().item()
                 if step % args.save_steps == 0 or step == steps_per_epoch * args.epochs:
+                    validation_started = time.perf_counter()
                     validate_and_save(step, metrics)
+                    metrics["timing/eval_and_save"] = time.perf_counter() - validation_started
                 if dist.get_rank() == 0:
                     logger.info(f"step={step} {metrics}")
                     if run is not None:
@@ -233,6 +262,9 @@ def main(argv=None):
     parser.add_argument("--max-ckpts-to-keep", type=int, default=-1, help="Keep the last N checkpoints; -1 keeps all")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gradient-checkpointing", action="store_true")
+    parser.add_argument(
+        "--group-by-length", action="store_true", help="Group similar lengths across data-parallel ranks"
+    )
     parser.add_argument("--use-nora", action="store_true", help="Train NoRA backbone adapters and the full value head")
     parser.add_argument("--rank", type=int, default=8, help="NoRA rank; sweep 8, 16, 32, 64, ...")
     parser.add_argument("--lora-alpha", type=int, default=None, help="NoRA alpha; defaults to rank")

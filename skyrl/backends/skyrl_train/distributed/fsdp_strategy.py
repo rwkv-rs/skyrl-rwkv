@@ -398,7 +398,12 @@ class FSDPStrategy(DistributedStrategy):
         # Define paths for saving individual rank files
         rank = self.get_rank()
         world_size = self.world_size
-        replicated_rwkv = isinstance(model, HFModelWrapper) and model.is_rwkv and self.fsdp_config.fsdp_size == 1
+        is_rwkv = (
+            model.is_rwkv
+            if isinstance(model, HFModelWrapper)
+            else getattr(getattr(save_model, "config", None), "model_type", None) == "rwkv"
+        )
+        replicated_rwkv = is_rwkv and self.fsdp_config.fsdp_size == 1
 
         with io.local_work_dir(ckpt_dir) as work_dir:
             model_path = os.path.join(work_dir, f"model_world_size_{world_size}_rank_{rank}.pt")

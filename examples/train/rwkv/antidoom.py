@@ -779,7 +779,7 @@ async def generate(args):
             else await start_servers(
                 args,
                 processes,
-                enforce_eager=True,
+                enforce_eager=args.enforce_eager,
                 gpu_memory_utilization=args.gpu_memory_utilization,
                 max_num_batched_tokens=args.max_num_batched_tokens,
             )
@@ -1518,6 +1518,9 @@ def main():
     generate_parser.add_argument("--max-num-seqs", type=int, default=128)
     generate_parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     generate_parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    generate_parser.add_argument(
+        "--enforce-eager", action=argparse.BooleanOptionalAction, default=True, help="Disable to use CUDA graphs"
+    )
     generate_parser.add_argument("--port", type=int, default=19001)
     generate_parser.add_argument("--timeout", type=float, default=1800)
     generate_parser.add_argument("--startup-timeout", type=float, default=900)

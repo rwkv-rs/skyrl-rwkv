@@ -1763,7 +1763,9 @@ class TrainerConfig(BaseConfig):
     NOTE: this is a *soft* cap. Sequences are never split across microbatches, so a single sequence
     longer than ``max_tokens_per_microbatch`` is placed alone in its own microbatch that exceeds the
     cap (no error, no truncation). The true peak microbatch size is therefore
-    ``max(max_tokens_per_microbatch, longest_sequence_in_batch)``."""
+    ``max(max_tokens_per_microbatch, longest_sequence_in_batch)``.
+    RWKV groups similar lengths and bounds ``batch_size * longest_sequence`` instead,
+    because its recurrent kernels process a right-padded microbatch."""
     recompute_old_logprobs_per_minibatch: bool = True
     """When True, recomputes policy/ref model logprobs (and critic values) per mini-batch using
     the same mini-batch + DP partition as the training step. When False, a single full-batch forward is run.

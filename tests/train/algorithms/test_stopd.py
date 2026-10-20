@@ -30,12 +30,16 @@ from examples.train.rwkv.benchmark_stopd import (
     validate_training_input,
 )
 from examples.train.rwkv.evaluate import set_generation_budgets
+from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
+    get_vllm_sampling_params,
+)
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
     AdvantageEstimatorRegistry,
     importance_sampling_loss,
 )
 from skyrl.train.dataset.preprocess import convert_prompts_responses_to_batch_tensors
+from skyrl.train.entrypoints.main_base import BasePPOExp
 from skyrl.train.fully_async_trainer import _AsyncStalenessManager
 from skyrl.train.generators.skyrl_gym_generator import SkyRLGymGenerator
 from skyrl.train.generators.utils import prepare_generator_input
@@ -63,6 +67,34 @@ def config(**overrides):
     cfg = OnPolicyDistillationConfig.from_cli_overrides(defaults | overrides)
     validate_stopd_cfg(cfg)
     return cfg
+
+
+@pytest.mark.parametrize("model_type", ["rwkv", "qwen3"])
+@pytest.mark.parametrize("explicit_stop", [None, [], ["custom stop"]])
+def test_rwkv_model_termination_defaults_preserve_sampling_overrides(monkeypatch, model_type, explicit_stop):
+    cfg = config()
+    cfg.generator.sampling_params.stop = copy.deepcopy(explicit_stop)
+    cfg.generator.eval_sampling_params.stop = copy.deepcopy(explicit_stop)
+    stops = ["✿", "\nUser:", "\n### User"]
+    monkeypatch.setattr("skyrl.train.entrypoints.main_base.get_tokenizer", MagicMock())
+    monkeypatch.setattr(
+        "transformers.AutoConfig.from_pretrained", lambda *a, **k: SimpleNamespace(model_type=model_type)
+    )
+    generation_config = MagicMock(return_value=SimpleNamespace(stop_strings=stops))
+    monkeypatch.setattr("transformers.GenerationConfig.from_pretrained", generation_config)
+    for method in ("get_train_dataset", "get_eval_dataset", "get_colocate_pg"):
+        monkeypatch.setattr(BasePPOExp, method, lambda self: None)
+
+    BasePPOExp(cfg)
+
+    expected = stops if model_type == "rwkv" and explicit_stop is None else explicit_stop
+    assert cfg.generator.sampling_params.stop == expected
+    assert cfg.generator.eval_sampling_params.stop == expected
+    assert generation_config.call_count == (1 if model_type == "rwkv" else 0)
+    for sampling_params in (cfg.generator.sampling_params, cfg.generator.eval_sampling_params):
+        request = get_vllm_sampling_params(sampling_params)
+        assert request["stop"] == expected
+        assert request["include_stop_str_in_output"] is True
 
 
 def test_lighteval_budgets_use_exact_producer_messages_and_rwkv_template():

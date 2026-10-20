@@ -84,9 +84,10 @@ def evaluate(args):
     from src.rwkv_eval.configs import ModelEndpoint
     from src.rwkv_eval.main import RWKVExactMatches, _litelm_model
     from src.rwkv_eval.main import RWKVPipeline as ProducerPipeline
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, GenerationConfig
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    generation_config = GenerationConfig.from_pretrained(args.tokenizer)
 
     class RWKVPipeline(ProducerPipeline):
         def _run_model_for_docs(self, sampling_docs):
@@ -105,6 +106,10 @@ def evaluate(args):
     config = _litelm_model(
         endpoint, [endpoint], "CoT", "bot", args.context_length, 42, cache_dir=str(output / ".lighteval_cache")
     )
+    # The native producer clears task-level stops for CoT. Model termination
+    # strings belong in the provider request, independently of task formatting.
+    config.extra_body["stop"] = generation_config.stop_strings
+    config.extra_body["include_stop_str_in_output"] = True
     # The producer uses Doc.generation_size when no global completion cap is set.
     config.generation_parameters.max_new_tokens = None
     litellm.cache = None
@@ -158,6 +163,7 @@ def evaluate(args):
                 "generation_budget": "context_length - actual prompt tokens",
                 "prompt_template": "bot",
                 "generation_prompt": "open_think",
+                "stop_strings": generation_config.stop_strings,
                 "producer": str(project),
                 "completions_path": tracker.results["completions_path"],
                 "producer_commit": subprocess.check_output(

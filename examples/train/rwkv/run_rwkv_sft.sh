@@ -25,6 +25,7 @@ fi
 : "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-nemotron-cot-sft}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
 : "${EVAL_ROOT:=$OUTPUT_ROOT/evaluation/lighteval_avg16}"
+export MODEL_DIR
 export RAY_ADDRESS=local
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 export SKYRL_PYTHONPATH_EXPORT=1
@@ -261,8 +262,9 @@ PY
     fi
     (
       cd "$LIGHTEVAL_PROJECT"
-      unset PYTHONPATH WANDB_RUN_ID WANDB_RESUME WANDB_SERVICE
-      exec setsid uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+      unset WANDB_RUN_ID WANDB_RESUME WANDB_SERVICE
+      export PYTHONPATH="$SKYRL_PROJECT/.venv/rwkv-eval:$SKYRL_PROJECT"
+      exec setsid uv run --isolated --no-config --no-project "$SKYRL_PROJECT/.venv/bin/python" \
         - "$phase" "$PHASE_ROOT" "$EVAL_NAME" "$ROUTER_PORT" \
         "$EVAL_MAX_NUM_SEQS" "$WANDB_RUN_PATH" "$SKYRL_PROJECT" \
         "$EVAL_STEP" "$GPUS_PER_PHASE" <<'PY'
@@ -273,56 +275,27 @@ import subprocess
 import sys
 from pathlib import Path
 
-import litellm
-from lighteval.logging.evaluation_tracker import EvaluationTracker
-from lighteval.metrics.metrics import Metrics
-from lighteval.pipeline import ParallelismManager, PipelineParameters
-from lighteval.tasks.requests import SamplingMethod
-from src.rwkv_eval.configs import ModelEndpoint
-from src.rwkv_eval.main import RWKVExactMatches, RWKVPipeline, _litelm_model
+from argparse import Namespace
 
 logging.basicConfig(level=logging.INFO)
 phase, root, model_name, port, capacity, run_path, skyrl_project, step, gpu_count = sys.argv[1:]
+sys.path.insert(0, skyrl_project)
+from examples.train.rwkv.evaluate import evaluate
+
 root = Path(root)
 eval_metrics = {}
-endpoint = ModelEndpoint(f"http://127.0.0.1:{port}", "unused", model_name,
-                         int(gpu_count) * int(capacity) + 32, 25600)
 selectors = os.environ.get("EVAL_TASKS", "aime24 aime25 aimo_progress_prize_1 math_500").split()
 for selector in selectors:
     avg_k = int(os.environ.get("EVAL_AVG_K", 4 if selector == "math_500" else 16))
-    config = _litelm_model(endpoint, [endpoint], "CoT", "bot", 24576, 42,
-                          cache_dir=str(root / ".lighteval_cache"))
-    config.max_model_length = 32768
-    litellm.cache = None
-    tracker = EvaluationTracker(output_dir=str(root / selector),
-                                save_details=False, save_streaming_completions=True)
-    pipeline = RWKVPipeline(selector, PipelineParameters(
-        launcher_type=ParallelismManager.NONE, streaming_evaluation=True),
-        tracker, model_config=config)
-    for task in pipeline.tasks_dict.values():
-        metric = Metrics.avg_at_n_math(sample_params={"n": avg_k})
-        metric.sample_level_fn.compute_score = RWKVExactMatches().compute
-        task.metrics = task.config.metrics = [metric]
-        task.num_samples = [avg_k]
-        task.sampling_methods = [SamplingMethod.GENERATIVE]
-    tracker.task_config_logger.log(pipeline.tasks_dict)
-    pipeline.evaluate()
-    pipeline.save_and_push_results()
-    results = pipeline.get_results()
-    rows = {}
-    for task_name in pipeline.tasks_dict:
-        metrics = results["results"][task_name.replace("|", ":")]
-        score = next(value for name, value in metrics.items() if not name.endswith("_stderr"))
-        count = pipeline.task_sample_counts[task_name]
-        completions = pipeline.task_completion_counts[task_name]
-        if completions != avg_k * count or pipeline.task_avg_k[task_name] != avg_k:
-            raise ValueError(f"Incomplete avg@{avg_k} evaluation: {task_name}, {count=}, {completions=}")
-        row = {f"avg@{avg_k}": float(score), "num_questions": count,
-               "num_completions": completions,
-               "truncation_rate": pipeline.task_truncation_counts[task_name] / completions}
-        rows[task_name] = row
+    evaluate(Namespace(
+        project=Path.cwd(), url=f"http://127.0.0.1:{port}", model=model_name,
+        tokenizer=os.environ["MODEL_DIR"], output=root / selector, step=int(step),
+        task=selector, num_samples=avg_k, context_length=25600,
+        concurrency=int(gpu_count) * int(capacity) + 32, max_samples=None,
+    ))
+    rows = json.loads((root / selector / "scores.json").read_text())
+    for row in rows.values():
         eval_metrics.update({f"{phase}/{selector}/{key}": value for key, value in row.items()})
-    (root / selector / "scores.json").write_text(json.dumps(rows, indent=2) + "\n")
     (root / "eval_metrics.json").write_text(json.dumps(eval_metrics, indent=2) + "\n")
 (root / "completed.json").write_text(json.dumps({"global_step": int(step), "model_name": model_name,
                                                "benchmarks": selectors}) + "\n")

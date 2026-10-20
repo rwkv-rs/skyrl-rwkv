@@ -717,6 +717,11 @@ MODEL_DIR="$MODEL_DIR" DATA_DIR="$DATA_DIR" NUM_GPUS=8 \
   > /tmp/results_direct_sft.log 2>&1
 ```
 
+To train NoRA adapters instead of all parameters, pass the native overrides
+`model.lora.use_nora=true model.lora.rank=256 model.lora.alpha=256` and
+`'model.lora.target_modules=[r_proj,k_proj,v_proj,o_proj,lm_head]'`.
+HF exports merge the adapters into a complete model for subsequent OPD.
+
 The launcher trains one epoch with native FSDP and complete cross-chunk
 gradients (`rwkv_chunk_size=2048`, `wkv_mode=fp32io16`). Similar-length batches
 are shuffled using a checkpointable sampler; each source row is visited once.
@@ -763,11 +768,12 @@ avg@4 respectively: mean correctness across the responses, then across
 questions. Configure the producer explicitly; its current default sampling
 policy does not guarantee these response counts.
 
-Use CoT with the `bot` template and `open_think`, a 24,576-token completion
-budget, temperature 0.96, top-p 0.76, top-k 32, presence penalty 1.0,
+Use CoT with the `bot` template and `open_think`, a 25,600-token total context
+budget (completion budget equals context minus the exact prompt length),
+temperature 0.96, top-p 0.76, top-k 32, presence penalty 1.0,
 frequency penalty 0.1 and penalty decay 0.988. Save per-rollout results,
 question and completion counts, and truncation rates alongside aggregate
-scores. Invoke the existing producer checkout with its dedicated environment;
+scores. Invoke the existing producer source with the SkyRL project environment;
 SkyRL owns the final export and inference service. Set `LIGHTEVAL_PROJECT` to
 the producer checkout and `WANDB_RUN_PATH` to `entity/project/run_id` to enable
 periodic benchmarks. SFT loss evaluation and weight saving remain every
@@ -1280,3 +1286,10 @@ UIDs, and the saved epoch permutation. Keep the logical train batch size when
 switching modes. Throughput comparisons should use the same total GPU count,
 checkpoint, token budget, and optimizer updates; exclude initialization and
 compare multiple steady-state steps before enabling a production mode.
+
+RWKV rollout and evaluation load the checkpoint's `generation_config.json`
+`stop_strings` when no explicit sampling stop is configured. The inference
+request includes the generated stop string, preserving sampled token IDs and
+logprobs. Native conversation-mode generation masks a synthetically appended
+EOS with zero; sampled stop tokens remain active. LightEval receives the same
+model stops through its provider request, independently of task-level stops.

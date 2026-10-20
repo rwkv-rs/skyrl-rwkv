@@ -36,6 +36,9 @@ RWKV token microbatching (`trainer.max_tokens_per_microbatch`) groups similar
 lengths under a padded-token budget, preserving complete streams and restoring
 sample order. Offline benchmark generation can opt into CUDA graphs with
 `antidoom.py generate --no-enforce-eager`; its default remains eager.
+Full-sequence RWKV training right-pads internal recurrent inputs to a multiple
+of 16, retaining the native Pretrain kernel instead of the ragged StateTune
+path. Output positions and loss masks retain their original lengths.
 
 ## Running Training
 

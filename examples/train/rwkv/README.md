@@ -315,6 +315,9 @@ Set `trainer.max_tokens_per_microbatch=32768` to group similar RWKV sequence
 lengths under a padded-token budget. Long sequences remain complete; sequences
 exceeding the budget run alone. Forward and backward use the same grouping and
 restore per-sample outputs to the original order.
+Internal recurrent inputs are right-padded to a multiple of 16 to use RWKV's
+full-sequence training kernels; original output positions and loss masks are
+preserved.
 
 ### UltraData task rewards
 

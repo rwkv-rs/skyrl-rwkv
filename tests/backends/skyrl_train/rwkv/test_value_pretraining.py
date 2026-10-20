@@ -148,7 +148,9 @@ def test_rwkv_critic_ragged_padding_alignment_and_backward():
             batch["input_ids"], batch["num_actions"], batch["attention_mask"], return_output=True
         )
     assert len(model.model.calls) == 1
-    assert model.model.calls[0].tolist() == [[1, 2, 3, 0, 0], [4, 5, 6, 7, 8]]
+    assert model.model.calls[0].shape == (2, 16)
+    assert model.model.calls[0][:, :5].tolist() == [[1, 2, 3, 0, 0], [4, 5, 6, 7, 8]]
+    assert not model.model.calls[0][:, 5:].any()
     assert model.model.autocast_states == [False]
     assert outputs["last_hidden_state"].shape == (2, 5, 4)
     for index, row in enumerate(features):

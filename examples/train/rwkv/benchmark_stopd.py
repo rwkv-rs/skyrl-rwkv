@@ -180,9 +180,12 @@ def validate_rollouts(vanilla, truncated, max_len, block, step, denominator, see
         tokens = retained["response_token_ids"]
         if original["prompt_token_ids"] != retained["prompt_token_ids"]:
             raise ValueError("Benchmark prompt tokens differ")
-        if len(tokens) != len(retained["rollout_logprobs"]) or retained["loss_mask"] != [1] * len(tokens):
+        if not len(tokens) == len(retained["rollout_logprobs"]) == len(retained["loss_mask"]):
             raise ValueError("Truncated tokens, logprobs, and loss masks must remain aligned")
-        if len(tokens) > budget or (retained["truncated"] and len(tokens) != budget):
+        # Native generation may append one masked EOS after a sampled stop
+        # string. It does not consume the request's sampled-token budget.
+        sampled_tokens = sum(retained["loss_mask"])
+        if sampled_tokens > budget or (retained["truncated"] and sampled_tokens != budget):
             raise ValueError("Truncated rollout did not end at its block budget")
     native = validate_training_input(truncated, short, stopd, step, proximal_teacher_alpha)
     vanilla_stopd = STOPD(max_len, block, step + 1, denominator, seed)

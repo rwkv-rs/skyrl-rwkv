@@ -123,8 +123,10 @@ critics. This stage initializes the critic for the online actor-critic path belo
 
 ### Collect rollouts and build data
 
-Use `--sampling rollout` to match the training policy (temperature 1, top-p 1,
-top-k -1, no penalties). The existing evaluation sampling remains the default.
+Use `--sampling eval` for offline value initialization: temperature 0.96, top-p
+0.76, top-k 32, presence penalty 1, frequency penalty 0.1, and penalty decay
+0.988. Collect correct and incorrect completions before balancing their outcomes.
+Online SAO uses its separate, unmodified rollout sampling configuration below.
 This explicit 128-question run is a small data-collection example; omit `--limit`
 to collect the full UltraData corpus. Each question has 64 scored samples by
 default; set `--samples-per-prompt` explicitly for a different collection budget.
@@ -136,7 +138,7 @@ DATA_DIR="$HOME/data/rwkv-value"
 
 uv run --isolated --no-project .venv/bin/python examples/train/rwkv/rollout.py \
   --model "$MODEL_DIR" --output "$ROLLOUT_DIR" \
-  --sampling rollout --save-rollouts --limit 128 \
+  --sampling eval --save-rollouts --limit 128 \
   > /tmp/results_rwkv_value_rollouts.log 2>&1
 
 uv run --isolated --no-project .venv/bin/python examples/train/rwkv/build_value_data.py \
@@ -161,7 +163,7 @@ the scoreboard uses `assistant` for GSM8K/GSM-Plus and `bot` for MATH. The expor
 retains native gold answers for scoring only; the collector sends just the query
 through the checkpoint's chat template. With `--include-answers`, GSM-Plus uses
 its `seed_question` as the split identity, shared with the original GSM8K question.
-Collect with `antidoom generate --sampling rollout --samples-per-prompt 4`, then:
+Collect with `antidoom generate --sampling eval --samples-per-prompt 4`, then:
 
 ```bash
 uv run --isolated --no-config --no-project .venv/bin/python \

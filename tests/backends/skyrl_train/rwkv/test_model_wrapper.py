@@ -192,7 +192,9 @@ def test_rwkv_equal_length_sequences_share_one_forward_bucket():
     actual = wrapper(sequences, num_actions=2, attention_mask=attention_mask)
 
     assert len(model.calls) == 1
-    assert torch.equal(model.calls[0][0], torch.tensor([[1, 2, 3], [4, 5, 6]]))
+    assert model.calls[0][0].shape == (2, 16)
+    assert torch.equal(model.calls[0][0][:, :3], torch.tensor([[1, 2, 3], [4, 5, 6]]))
+    assert not model.calls[0][0][:, 3:].any()
     model.calls.clear()
     expected = expected_action_log_probs(model, sequences, attention_mask, num_actions=2)
     assert torch.allclose(actual, expected)
@@ -214,7 +216,9 @@ def test_rwkv_distributed_forward_uses_one_right_padded_bucket(monkeypatch):
     )
 
     assert len(model.calls) == 1
-    assert torch.equal(model.calls[0][0], torch.tensor([[1, 2, 3, 0], [4, 5, 6, 7]]))
+    assert model.calls[0][0].shape == (2, 16)
+    assert torch.equal(model.calls[0][0][:, :4], torch.tensor([[1, 2, 3, 0], [4, 5, 6, 7]]))
+    assert not model.calls[0][0][:, 4:].any()
     assert torch.equal(output["entropy"][0, :2], torch.zeros(2))
     model.calls.clear()
     expected = expected_action_log_probs(model, sequences, attention_mask, num_actions=2)
@@ -235,7 +239,7 @@ def test_rwkv_ragged_batch_restores_padding_and_entropy_positions():
         return_output=True,
     )
 
-    assert [tuple(call[0].shape) for call in model.calls] == [(1, 3), (2, 5)]
+    assert [tuple(call[0].shape) for call in model.calls] == [(1, 16), (2, 16)]
     assert action_log_probs.shape == (3, 2)
     assert output["entropy"].shape == sequences.shape
     assert torch.equal(output["entropy"][1, :2], torch.zeros(2))

@@ -43,6 +43,9 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
     logprobs_from_logits,
 )
 
+# RwkvCache._chunk_length: full-sequence kernels operate on 16-token chunks.
+RWKV_CHUNK_LENGTH = 16
+
 
 @dataclass(frozen=True)
 class _SampleSupportChannels:
@@ -451,6 +454,8 @@ class HFModelWrapper(nn.Module):
 
         for bucket_lengths, bucket_indices in buckets:
             bucket_length = int(bucket_lengths.max().item())
+            if not self.rwkv_chunk_size:
+                bucket_length = (bucket_length + RWKV_CHUNK_LENGTH - 1) // RWKV_CHUNK_LENGTH * RWKV_CHUNK_LENGTH
             if self.rwkv_chunk_size and torch.distributed.is_available() and torch.distributed.is_initialized():
                 # Each FSDP rank must enter the same number of chunk forwards and recomputations.
                 global_length = bucket_lengths.max().clone()
@@ -880,7 +885,9 @@ def _get_critic_model(
             Tail padding cannot affect earlier states in a causal recurrent model.
             """
             lengths = attention_mask.sum(-1)
-            recurrent_ids = input_ids.new_zeros((input_ids.shape[0], int(lengths.max().item())))
+            length = int(lengths.max().item())
+            length = (length + RWKV_CHUNK_LENGTH - 1) // RWKV_CHUNK_LENGTH * RWKV_CHUNK_LENGTH
+            recurrent_ids = input_ids.new_zeros((input_ids.shape[0], length))
             for index, length in enumerate(lengths.tolist()):
                 recurrent_ids[index, :length] = input_ids[index, attention_mask[index].bool()]
             with torch.autocast(device_type=input_ids.device.type, enabled=False):

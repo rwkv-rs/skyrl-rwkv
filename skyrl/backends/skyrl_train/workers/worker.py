@@ -1014,6 +1014,7 @@ class PolicyWorkerBase(Worker):
             data,
             micro_batch_size=self.cfg.micro_train_batch_size_per_gpu,
             max_tokens_per_microbatch=self.cfg.max_tokens_per_microbatch,
+            use_padded_token_count=getattr(self.model, "is_rwkv", False),
         )
         all_metrics = defaultdict(list)
         loss_fn_output_batches = []  # per-microbatch; restored to input order below
@@ -1350,6 +1351,7 @@ class PolicyWorkerBase(Worker):
                 data,
                 micro_batch_size=self.cfg.micro_forward_batch_size_per_gpu,
                 max_tokens_per_microbatch=self.cfg.max_tokens_per_microbatch,
+                use_padded_token_count=getattr(self.model, "is_rwkv", False),
             )
             outputs = [self._forward_micro_batch(micro_batch) for micro_batch in microbatch_iterator]
             output = microbatch_iterator.reorder_and_combine_batches(outputs)
@@ -1624,6 +1626,7 @@ class CriticWorkerBase(Worker):
             data,
             micro_batch_size=self.cfg.micro_train_batch_size_per_gpu,
             max_tokens_per_microbatch=self.cfg.max_tokens_per_microbatch,
+            use_padded_token_count=getattr(self.model, "is_rwkv", False),
         )
         all_metrics = defaultdict(list)
 
@@ -1772,6 +1775,7 @@ class CriticWorkerBase(Worker):
             data,
             micro_batch_size=self.cfg.micro_forward_batch_size_per_gpu,
             max_tokens_per_microbatch=self.cfg.max_tokens_per_microbatch,
+            use_padded_token_count=getattr(self.model, "is_rwkv", False),
         )
         outputs = [self._forward_micro_batch(micro_batch) for micro_batch in microbatch_iterator]
         output = microbatch_iterator.reorder_and_combine_batches(outputs)
@@ -1803,6 +1807,7 @@ class RefWorkerBase(Worker):
             data,
             micro_batch_size=self.cfg.micro_forward_batch_size_per_gpu,
             max_tokens_per_microbatch=self.cfg.max_tokens_per_microbatch,
+            use_padded_token_count=getattr(self.model, "is_rwkv", False),
         )
         outputs = [self._forward_micro_batch(micro_batch) for micro_batch in microbatch_iterator]
         output = microbatch_iterator.reorder_and_combine_batches(outputs)

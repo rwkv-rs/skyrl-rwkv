@@ -32,6 +32,11 @@ is rejected. Offline value pretraining supports `--group-by-length` through the
 Transformers distributed sampler. Its metrics separate training time/token throughput
 from evaluation and checkpoint export time.
 
+RWKV token microbatching (`trainer.max_tokens_per_microbatch`) groups similar
+lengths under a padded-token budget, preserving complete streams and restoring
+sample order. Offline benchmark generation can opt into CUDA graphs with
+`antidoom.py generate --no-enforce-eager`; its default remains eager.
+
 ## Running Training
 
 ```bash

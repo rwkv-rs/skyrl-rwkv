@@ -278,11 +278,13 @@ class TokenBasedBatchIterator(BaseBatchIterator):
         self,
         data: TrainingInputBatch,
         max_tokens_per_microbatch: int,
+        use_padded_token_count: bool = False,
     ):
         """
         Args:
             data: The training input batch to chunk.
             max_tokens_per_microbatch: Maximum number of tokens per microbatch.
+            use_padded_token_count: Bound padded recurrent work and group similar lengths.
         """
         super().__init__(data)
         self._max_tokens_per_microbatch = max_tokens_per_microbatch
@@ -294,8 +296,23 @@ class TokenBasedBatchIterator(BaseBatchIterator):
         # Create microbatches based on token count. The "balanced" packer treats
         # the token budget as a soft cap: a sequence longer than the budget gets
         # its own (over-budget) microbatch rather than raising.
-        packer = make_seq_packer("balanced", bin_capacity=self._max_tokens_per_microbatch)
-        self._microbatches = packer.pack(self._token_counts)
+        if use_padded_token_count:
+            # RWKV runs one right-padded recurrent batch. As in Antidoom's
+            # microbatches(), bound batch_size * longest_length, not the sum
+            # of lengths used by models that remove padding.
+            self._microbatches = []
+            indices = []
+            for index in sorted(range(len(self._token_counts)), key=self._token_counts.__getitem__):
+                length = self._token_counts[index]
+                if indices and (len(indices) + 1) * length > self._max_tokens_per_microbatch:
+                    self._microbatches.append(indices)
+                    indices = []
+                indices.append(index)
+            if indices:
+                self._microbatches.append(indices)
+        else:
+            packer = make_seq_packer("balanced", bin_capacity=self._max_tokens_per_microbatch)
+            self._microbatches = packer.pack(self._token_counts)
 
         # Synchronize the number of microbatches across all DP workers
         max_num_microbatches = self._sync_num_microbatches()
@@ -460,7 +477,10 @@ class TokenBasedBatchIterator(BaseBatchIterator):
 
 
 def get_microbatch_iterator(
-    data: TrainingInputBatch, micro_batch_size: int, max_tokens_per_microbatch: int
+    data: TrainingInputBatch,
+    micro_batch_size: int,
+    max_tokens_per_microbatch: int,
+    use_padded_token_count: bool = False,
 ) -> BaseBatchIterator:
     """Factory function to get the appropriate microbatch iterator.
 
@@ -468,11 +488,16 @@ def get_microbatch_iterator(
         data: The training input batch.
         micro_batch_size: Number of samples per microbatch (used if max_tokens_per_microbatch <= 0).
         max_tokens_per_microbatch: Maximum tokens per microbatch. If > 0, uses token-based batching.
+        use_padded_token_count: Bound batch size times maximum length, for RWKV.
 
     Returns:
         A BaseBatchIterator instance.
     """
     if max_tokens_per_microbatch > 0:
-        return TokenBasedBatchIterator(data, max_tokens_per_microbatch=max_tokens_per_microbatch)
+        return TokenBasedBatchIterator(
+            data,
+            max_tokens_per_microbatch=max_tokens_per_microbatch,
+            use_padded_token_count=use_padded_token_count,
+        )
     else:
         return SampleBasedBatchIterator(data, sample_batch_size=micro_batch_size, drop_last=False)

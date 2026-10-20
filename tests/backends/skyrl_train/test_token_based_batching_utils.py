@@ -10,6 +10,7 @@ uv run --isolated --extra dev --extra skyrl-train pytest tests/backends/skyrl_tr
 from types import SimpleNamespace
 from typing import List
 
+import pytest
 import torch
 
 from skyrl.backends.skyrl_train.training_batch import TensorList, TrainingInputBatch
@@ -156,10 +157,13 @@ class TestTokenBasedBatchIterator:
         count = sum(1 for _ in iterator)
         assert count == len(iterator)
 
-    def test_reorder_and_combine(self):
+    @pytest.mark.parametrize("use_padded_token_count", [False, True])
+    def test_reorder_and_combine(self, use_padded_token_count):
         """Verify that reorder_and_combine_batches restores original order."""
         batch = self._make_batch([10, 3, 8, 5])
-        iterator = TokenBasedBatchIterator(batch, max_tokens_per_microbatch=12)
+        iterator = TokenBasedBatchIterator(
+            batch, max_tokens_per_microbatch=12, use_padded_token_count=use_padded_token_count
+        )
 
         # Simulate forward outputs (just use the microbatch itself as output)
         outputs = []
@@ -171,9 +175,12 @@ class TestTokenBasedBatchIterator:
         for i in range(batch.batch_size):
             assert torch.equal(reordered["sequences"][i], batch["sequences"][i])
 
-    def test_reorder_and_combine_items_drops_padding(self):
+    @pytest.mark.parametrize("use_padded_token_count", [False, True])
+    def test_reorder_and_combine_items_drops_padding(self, use_padded_token_count):
         batch = self._make_batch([10, 3, 8, 5])
-        iterator = TokenBasedBatchIterator(batch, max_tokens_per_microbatch=12)
+        iterator = TokenBasedBatchIterator(
+            batch, max_tokens_per_microbatch=12, use_padded_token_count=use_padded_token_count
+        )
         output_batches = [
             [{"sample": index} for index in indices] + [{"sample": "padding"}] for indices in iterator._microbatches
         ]
@@ -183,6 +190,17 @@ class TestTokenBasedBatchIterator:
         reordered = iterator.reorder_and_combine_items(output_batches)
 
         assert [output["sample"] for output in reordered] == list(range(batch.batch_size))
+
+    @pytest.mark.parametrize("lengths", [[1000] + [40] * 16, [30, 5, 2000, 700, 8, 300]])
+    def test_padded_token_budget_bounds_recurrent_work(self, lengths):
+        batch = self._make_batch(lengths)
+        iterator = get_microbatch_iterator(
+            batch, micro_batch_size=1, max_tokens_per_microbatch=1024, use_padded_token_count=True
+        )
+        assert sorted(index for indices in iterator._microbatches for index in indices) == list(range(len(lengths)))
+        for indices in iterator._microbatches:
+            longest = max(lengths[index] for index in indices)
+            assert len(indices) * longest <= 1024 or (len(indices) == 1 and longest > 1024)
 
     def test_get_microbatch_iterator_factory(self):
         batch = self._make_batch([10, 10, 5, 5])
@@ -290,7 +308,8 @@ class TestTokenBasedBatchIterator:
         assert routes.sequence_lengths.tolist() == [2]
         assert torch.equal(routes.segment(0), torch.full((2, 2, 3), 2, dtype=torch.int16))
 
-    def test_worker_forward_backward_restores_input_order(self, monkeypatch):
+    @pytest.mark.parametrize("is_rwkv", [False, True])
+    def test_worker_forward_backward_restores_input_order(self, monkeypatch, is_rwkv):
         """Regression for the base (FSDP) Worker.forward_backward: with token-based
         batching, per-sample ``loss_fn_outputs`` must come back in input order with
         padding-microbatch entries dropped. Before the fix they were returned in
@@ -325,6 +344,7 @@ class TestTokenBasedBatchIterator:
         class _StubWorker(PolicyWorkerBase):
             def __init__(self, cfg):
                 self.cfg = cfg
+                self.model = SimpleNamespace(is_rwkv=is_rwkv)
                 self.strategy = None
                 self.device_mesh = SimpleNamespace(get_group=lambda name: None)
 
@@ -357,6 +377,7 @@ class TestTokenBasedBatchIterator:
         class _StubWorker(PolicyWorkerBase):
             def __init__(self, cfg):
                 self.cfg = cfg
+                self.model = None
                 self.strategy = None
                 self.device_mesh = SimpleNamespace(get_group=lambda name: None)
 

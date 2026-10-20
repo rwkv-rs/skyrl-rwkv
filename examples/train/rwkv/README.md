@@ -245,6 +245,12 @@ For larger critics, set `--max-ckpts-to-keep 3` to retain only the latest three
 save and preserves the separate `best/` export. The default `-1` keeps all
 checkpoints. Saving and validation still follow `--save-steps` (default 50).
 
+For mixed-length data, `--group-by-length` uses Transformers'
+`DistributedLengthGroupedSampler` to put similar lengths on data-parallel ranks
+at the same time. Keep the global batch size fixed when increasing GPU count by
+reducing `--gradient-accumulation-steps`. Logs separate `timing/train_step` from
+`timing/eval_and_save` and report input-token throughput and padding fraction.
+
 For the later rank sweep, keep the rollout dataset, seed, batch sizes, epochs,
 and learning rate fixed and double the rank at each run. Set `MAX_RANK` to the
 desired endpoint; the following example covers 8, 16, 32, 64, 128, and 256:
@@ -294,6 +300,12 @@ live adapters, head, and frozen backbone untouched.
 The offline entry point starts a fresh optimizer; it does not resume interrupted runs.
 
 ## Online SAO and Score-Centering
+
+When policy and critic occupy separate GPUs, set
+`trainer.train_critic_and_policy_parallel=true` to overlap their optimizer updates.
+Both use the already computed advantages and returns, and finish before rollout
+weight synchronization. The default remains sequential; parallel updates require
+`trainer.placement.colocate_all=false`.
 
 ### UltraData task rewards
 

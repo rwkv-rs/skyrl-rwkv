@@ -1687,6 +1687,10 @@ class TrainerConfig(BaseConfig):
     """Like ``policy_mini_batch_size``, but for the critic model.
     The critic generally tolerates off-policy updates better than the policy, so setting this lower than
     ``policy_mini_batch_size`` (i.e. more critic updates) is usually preferable."""
+    train_critic_and_policy_parallel: bool = False
+    """Train the critic and policy concurrently on their separate GPU groups.
+    Requires ``placement.colocate_all=False``. Both updates use the previously computed
+    returns and advantages, and complete before the next rollout weight synchronization."""
     micro_train_batch_size_per_gpu: int = 1
     """Micro batch size during the training step, common to both policy and critic.
     Each mini batch is split into micro batches of this size, and gradients are accumulated over them."""
@@ -1801,6 +1805,9 @@ class TrainerConfig(BaseConfig):
         # ref model defaults to the policy model
         if self.ref.model.path is None:
             self.ref.model.path = self.policy.model.path
+
+        if self.train_critic_and_policy_parallel and self.placement.colocate_all:
+            raise ValueError("train_critic_and_policy_parallel requires placement.colocate_all=False.")
 
         if self.policy.model.lora.use_nora:
             if self.strategy != "fsdp" or self.policy.model.lora.rank <= 0:

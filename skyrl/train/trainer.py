@@ -3,6 +3,8 @@ import math
 import os
 import shutil
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -1688,12 +1690,21 @@ class RayPPOTrainer:
         data.metadata["global_step"] = self.global_step
         critic_status = None
 
-        # Unified training interface for both FSDP and Megatron
-        if self.has_critic:
-            with Timer("critic_train", self.all_timings):
-                critic_status = self._execute_training_step("critic", data)
-        with Timer("policy_train", self.all_timings):
-            policy_status = self._execute_training_step("policy", data)
+        def train_model(role):
+            with Timer(f"{role}_train", self.all_timings):
+                return self._execute_training_step(role, data)
+
+        if self.has_critic and self.cfg.trainer.train_critic_and_policy_parallel:
+            # Each role has its own workers and optimizer. Propagate the step
+            # deadline to the critic thread just as asyncio.to_thread does.
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="critic-train") as executor:
+                critic_future = executor.submit(copy_context().run, train_model, "critic")
+                policy_status = train_model("policy")
+                critic_status = critic_future.result()
+        else:
+            if self.has_critic:
+                critic_status = train_model("critic")
+            policy_status = train_model("policy")
 
         # Update metrics
         if critic_status is not None:

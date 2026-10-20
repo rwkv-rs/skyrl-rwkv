@@ -47,6 +47,17 @@ def _make_validated_test_config():
     return cfg
 
 
+def test_parallel_critic_policy_requires_separate_gpus():
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        ["trainer.train_critic_and_policy_parallel=true", "trainer.placement.colocate_all=false"]
+    )
+    assert cfg.trainer.train_critic_and_policy_parallel
+    with pytest.raises(ValueError, match="requires placement.colocate_all=False"):
+        SkyRLTrainConfig.from_cli_overrides(
+            ["trainer.train_critic_and_policy_parallel=true", "trainer.placement.colocate_all=true"]
+        )
+
+
 def test_gae_adaptive_cli_and_rollout_is_score_centering_capture():
     cfg = SkyRLTrainConfig.from_cli_overrides(
         [

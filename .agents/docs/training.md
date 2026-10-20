@@ -26,6 +26,12 @@ FSDP sampler-support capture and centers the complete DIS-weighted score. Its ra
 support capture requires temperature 1, top-p 1, top-k -1 and no penalties. See the
 RWKV README's Online SAO section for the configuration and validation scope.
 
+With separate policy/critic GPU groups, `trainer.train_critic_and_policy_parallel=true`
+overlaps their updates while retaining the barrier before weight sync; colocation
+is rejected. Offline value pretraining supports `--group-by-length` through the
+Transformers distributed sampler. Its metrics separate training time/token throughput
+from evaluation and checkpoint export time.
+
 ## Running Training
 
 ```bash

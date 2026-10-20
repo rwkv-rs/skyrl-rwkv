@@ -2,6 +2,8 @@
 uv  run --isolated --extra dev pytest tests/train/test_trainer.py
 """
 
+from contextvars import ContextVar
+from threading import Barrier
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -779,3 +781,64 @@ def test_validate_batch_sizes_lcm_dp_requirement():
     # Pass: ref disabled -> requirement reduces to policy_dp. With policy_dp=2, tbs=2 is valid.
     cfg = create_config(train_batch_size=2, policy_dp=2, ref_dp=3, include_ref=False)
     validate_batch_sizes(cfg)
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_critic_policy_training_concurrency_preserves_metrics_and_context(parallel):
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.cfg = SkyRLTrainConfig()
+    trainer.cfg.trainer.critic.model.path = "critic"
+    trainer.cfg.trainer.train_critic_and_policy_parallel = parallel
+    trainer.global_step = 7
+    trainer.all_timings = {}
+    trainer.all_metrics = {}
+    trainer.dispatch = MagicMock()
+    data = TrainingInputBatch({"sequences": torch.ones((2, 3), dtype=torch.long)})
+    data.metadata = {}
+    barrier = Barrier(2)
+    context = ContextVar("training_test_context", default=None)
+    token = context.set("step-7")
+    calls = []
+
+    def train_model(role, batch):
+        assert context.get() == "step-7"
+        assert batch.metadata["global_step"] == 7
+        calls.append(role)
+        if parallel:
+            barrier.wait(timeout=5)
+        return {"loss": 1.0 if role == "policy" else 2.0}
+
+    trainer._execute_training_step = train_model
+    try:
+        result = trainer.train_critic_and_policy(data)
+    finally:
+        context.reset(token)
+    assert result == {"loss": 1.0}
+    assert trainer.all_metrics == {"policy/loss": 1.0, "critic/loss": 2.0}
+    assert set(trainer.all_timings) == {"policy_train", "critic_train"}
+    assert sorted(calls) == ["critic", "policy"]
+    if not parallel:
+        assert calls == ["critic", "policy"]
+    trainer.dispatch.empty_cache.assert_called_once_with()
+
+
+def test_parallel_critic_failure_propagates():
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.cfg = SkyRLTrainConfig()
+    trainer.cfg.trainer.critic.model.path = "critic"
+    trainer.cfg.trainer.train_critic_and_policy_parallel = True
+    trainer.global_step = 1
+    trainer.all_timings = {}
+    trainer.dispatch = MagicMock()
+    data = TrainingInputBatch({"sequences": torch.ones((1, 3), dtype=torch.long)})
+    data.metadata = {}
+
+    def train_model(role, batch):
+        if role == "critic":
+            raise RuntimeError("critic failed")
+        return {}
+
+    trainer._execute_training_step = train_model
+    with pytest.raises(RuntimeError, match="critic failed"):
+        trainer.train_critic_and_policy(data)
+    trainer.dispatch.empty_cache.assert_not_called()

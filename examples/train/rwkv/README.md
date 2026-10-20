@@ -251,6 +251,10 @@ at the same time. Keep the global batch size fixed when increasing GPU count by
 reducing `--gradient-accumulation-steps`. Logs separate `timing/train_step` from
 `timing/eval_and_save` and report input-token throughput and padding fraction.
 
+For offline benchmark collection, `antidoom.py generate --no-enforce-eager`
+enables CUDA graphs, matching the ordinary UltraData collector. The generation
+command retains eager execution by default.
+
 For the later rank sweep, keep the rollout dataset, seed, batch sizes, epochs,
 and learning rate fixed and double the rank at each run. Set `MAX_RANK` to the
 desired endpoint; the following example covers 8, 16, 32, 64, 128, and 256:
@@ -306,6 +310,11 @@ When policy and critic occupy separate GPUs, set
 Both use the already computed advantages and returns, and finish before rollout
 weight synchronization. The default remains sequential; parallel updates require
 `trainer.placement.colocate_all=false`.
+
+Set `trainer.max_tokens_per_microbatch=32768` to group similar RWKV sequence
+lengths under a padded-token budget. Long sequences remain complete; sequences
+exceeding the budget run alone. Forward and backward use the same grouping and
+restore per-sample outputs to the original order.
 
 ### UltraData task rewards
 

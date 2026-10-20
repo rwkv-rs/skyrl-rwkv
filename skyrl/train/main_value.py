@@ -11,7 +11,9 @@ training, optimizer, and checkpoint handling reuse SkyRL FSDPStrategy.
 import argparse
 import math
 import os
+import shutil
 from itertools import islice
+from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -79,6 +81,16 @@ def evaluate(model, dataset, collator, batch_size, device):
         "eval/target_mean": target_sum / count,
         "eval/value_mean": prediction_sum / count,
     }
+
+
+def cleanup_old_checkpoints(checkpoint_base_path, max_checkpoints):
+    """Retain recent value checkpoints, following the native trainer's retention policy."""
+    if max_checkpoints < 0:
+        return
+    checkpoint_dirs = sorted(Path(checkpoint_base_path).glob("step_*"), key=lambda path: int(path.name[5:]))
+    for path in checkpoint_dirs[:-max_checkpoints]:
+        shutil.rmtree(path)
+        logger.info(f"Cleaned up old checkpoint: {path}")
 
 
 def train(args):
@@ -164,6 +176,9 @@ def train(args):
                 strategy.save_hf_model(
                     model, os.path.join(args.output_dir, "best"), tokenizer=tokenizer, output_dtype=torch.bfloat16
                 )
+            if dist.get_rank() == 0:
+                cleanup_old_checkpoints(args.output_dir, args.max_ckpts_to_keep)
+            dist.barrier()
 
         step = 0
         for epoch in range(args.epochs):
@@ -215,6 +230,7 @@ def main(argv=None):
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--max-length", type=int, default=8192)
     parser.add_argument("--save-steps", type=int, default=50)
+    parser.add_argument("--max-ckpts-to-keep", type=int, default=-1, help="Keep the last N checkpoints; -1 keeps all")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gradient-checkpointing", action="store_true")
     parser.add_argument("--use-nora", action="store_true", help="Train NoRA backbone adapters and the full value head")
@@ -228,6 +244,8 @@ def main(argv=None):
     parser.add_argument("--wandb-project", default="rwkv-value-pretraining")
     parser.add_argument("--run-name", default=None)
     args = parser.parse_args(argv)
+    if args.max_ckpts_to_keep != -1 and args.max_ckpts_to_keep <= 0:
+        parser.error("--max-ckpts-to-keep must be -1 or positive.")
     for name in ("epochs", "batch_size", "gradient_accumulation_steps", "save_steps"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive.")

@@ -238,6 +238,11 @@ to 8, alpha defaults to rank, and adapter dropout is zero. `--target-modules`
 selects the backbone projections; the value head is always trained in full.
 Omitting `--use-nora` retains full-parameter critic training.
 
+For larger critics, set `--max-ckpts-to-keep 3` to retain only the latest three
+`step_*` checkpoints, including their HF exports. Cleanup runs after a successful
+save and preserves the separate `best/` export. The default `-1` keeps all
+checkpoints. Saving and validation still follow `--save-steps` (default 50).
+
 For the later rank sweep, keep the rollout dataset, seed, batch sizes, epochs,
 and learning rate fixed and double the rank at each run. Set `MAX_RANK` to the
 desired endpoint; the following example covers 8, 16, 32, 64, 128, and 256:

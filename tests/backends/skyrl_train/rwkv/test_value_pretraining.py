@@ -24,6 +24,18 @@ def write_dataset(tmp_path, rows):
     return str(path)
 
 
+def test_value_checkpoint_retention_keeps_recent_steps_and_best(tmp_path):
+    for name in ["step_2", "step_50", "step_100", "step_150", "best"]:
+        checkpoint = tmp_path / name
+        checkpoint.mkdir()
+        (checkpoint / "model.safetensors").write_bytes(b"checkpoint")
+    main_value.cleanup_old_checkpoints(tmp_path, -1)
+    assert len(list(tmp_path.iterdir())) == 5
+    main_value.cleanup_old_checkpoints(tmp_path, 2)
+    assert {path.name for path in tmp_path.iterdir()} == {"step_100", "step_150", "best"}
+    assert (tmp_path / "best/model.safetensors").read_bytes() == b"checkpoint"
+
+
 def test_value_dataset_terminal_reward_and_tool_observation_masks(tmp_path):
     path = write_dataset(
         tmp_path,

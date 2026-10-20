@@ -74,7 +74,12 @@ def test_text_match_uses_final_answer_and_option_mapping():
         ("Code", "print(3)", {"inputs": [""], "outputs": ["3\n"]}, "stop"),
     ],
 )
-def test_ultradata_native_rewards_match_rollout(tmp_path, tokenizer, monkeypatch, domain, answer, gold, finish):
+@pytest.mark.parametrize("threaded", [False, True])
+def test_ultradata_native_rewards_match_rollout(
+    tmp_path, tokenizer, monkeypatch, domain, answer, gold, finish, threaded
+):
+    from concurrent.futures import ThreadPoolExecutor
+
     import skyrl_gym
     from skyrl_gym.envs.ultradata import env as ultradata
 
@@ -101,7 +106,12 @@ def test_ultradata_native_rewards_match_rollout(tmp_path, tokenizer, monkeypatch
     env.set_generation_metadata(
         action=answer, ended_eod=finish == "stop", truncated=finish == "length", stop_reason=finish
     )
-    assert env.step(answer)["reward"] == float(counts["correct"])
+    if threaded:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(env.step, answer).result()
+    else:
+        result = env.step(answer)
+    assert result["reward"] == float(counts["correct"])
 
 
 def test_prepare_ultradata_rl_keeps_lazy_rewards_and_question_split(tmp_path):

@@ -26,6 +26,7 @@ fi
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
 : "${EVAL_ROOT:=$OUTPUT_ROOT/evaluation/lighteval_avg16}"
 export MODEL_DIR
+export UV_PROJECT_ENVIRONMENT="$(realpath .venv)"
 export RAY_ADDRESS=local
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 export SKYRL_PYTHONPATH_EXPORT=1
@@ -40,7 +41,7 @@ fi
 
 if [[ "${UPLOAD_ONLY:-0}" == 1 ]]; then
   unset WANDB_RUN_ID WANDB_RESUME WANDB_SERVICE
-  uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+  uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" \
     - "$EVAL_ROOT" "$EVAL_STEP" "$UPLOAD_PHASE" "$WANDB_RUN_PATH" <<'PY'
 import fcntl
 import json
@@ -88,7 +89,7 @@ PY
   exit 0
 fi
 
-TOTAL_STEPS=$(uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" - "$DATA_DIR" "$BATCH_SIZE" <<'PY'
+TOTAL_STEPS=$(uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" - "$DATA_DIR" "$BATCH_SIZE" <<'PY'
 import json
 import math
 import sys
@@ -102,7 +103,7 @@ WARMUP_STEPS=$((TOTAL_STEPS / 20))
 EVAL_OVERRIDES=()
 if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" != 1 ]]; then
   : "${WANDB_RUN_PATH:?Set the training run path: entity/project/run_id}"
-  EVAL_COMMAND=$(uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+  EVAL_COMMAND=$(uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" \
     - "$OUTPUT_ROOT" "$DATA_DIR" "$LIGHTEVAL_PROJECT" "$WANDB_RUN_PATH" <<'PY'
 import json
 import sys
@@ -121,7 +122,7 @@ PY
 fi
 
 if [[ "${EVAL_ONLY:-0}" != 1 ]]; then
-  uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" -m skyrl.train.main_sft \
+  uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" -m skyrl.train.main_sft \
     strategy=fsdp model.path="$MODEL_DIR" \
     "pretokenized_dataset_paths=['$DATA_DIR/train']" \
     "eval_pretokenized_dataset_paths=['$DATA_DIR/eval']" \
@@ -203,7 +204,7 @@ if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" == 1 ]]; then
       port=$((19100 + gpu))
       WORKER_URLS+=("http://127.0.0.1:$port")
       setsid env CUDA_VISIBLE_DEVICES="$gpu" VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
-        uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+        uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" \
         -m vllm.entrypoints.openai.api_server \
         --model "$EVAL_MODEL" --served-model-name "$EVAL_NAME" \
         --host 127.0.0.1 --port "$port" --dtype float16 \
@@ -214,7 +215,7 @@ if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" == 1 ]]; then
         > "$PHASE_ROOT/inference-gpu$gpu.log" 2>&1 &
       EVAL_PIDS+=("$!")
     done
-    setsid uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+    setsid uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" \
       -m vllm_router.launch_router --host 127.0.0.1 --port "$ROUTER_PORT" \
       --prometheus-port "$((19300 + phase_index))" \
       --worker-urls "${WORKER_URLS[@]}" \
@@ -223,7 +224,7 @@ if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" == 1 ]]; then
     phase_index=$((phase_index + 1))
   done
 
-  uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+  uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" \
     - "${#EVAL_PHASES[@]}" "${EVAL_PIDS[@]}" <<'PY'
 import time
 import sys
@@ -263,8 +264,8 @@ PY
     (
       cd "$LIGHTEVAL_PROJECT"
       unset WANDB_RUN_ID WANDB_RESUME WANDB_SERVICE
-      export PYTHONPATH="$SKYRL_PROJECT/.venv/rwkv-eval:$SKYRL_PROJECT"
-      exec setsid uv run --isolated --no-config --no-project "$SKYRL_PROJECT/.venv/bin/python" \
+      export PYTHONPATH="$UV_PROJECT_ENVIRONMENT/rwkv-eval:$SKYRL_PROJECT"
+      exec setsid uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" \
         - "$phase" "$PHASE_ROOT" "$EVAL_NAME" "$ROUTER_PORT" \
         "$EVAL_MAX_NUM_SEQS" "$WANDB_RUN_PATH" "$SKYRL_PROJECT" \
         "$EVAL_STEP" "$GPUS_PER_PHASE" <<'PY'

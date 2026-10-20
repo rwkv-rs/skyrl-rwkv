@@ -155,7 +155,10 @@ class UltraDataEnv(GSM8kEnv):
 
     def _get_reward(self, action: str) -> float:
         if self.strict_reward:
-            return super()._get_reward(action)
+            # The generator already scores this action in set_generation_metadata
+            # on its main thread. Math-Verify's signal timeout cannot run in the
+            # environment thread pool used for step().
+            return self._strict_reward_details["strict_reward"]
         if self._generation_metadata["truncated"] or not action.strip():
             reward, reason = False, "truncated_or_empty"
         elif self.domain == "Code":

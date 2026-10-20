@@ -105,13 +105,14 @@ EVAL_OVERRIDES=()
 if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" != 1 ]]; then
   : "${WANDB_RUN_PATH:?Set the training run path: entity/project/run_id}"
   EVAL_COMMAND=$(uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" \
-    - "$OUTPUT_ROOT" "$DATA_DIR" "$LIGHTEVAL_PROJECT" "$WANDB_RUN_PATH" <<'PY'
+    - "$OUTPUT_ROOT" "$DATA_DIR" "$LIGHTEVAL_PROJECT" "$WANDB_RUN_PATH" "$EVAL_ROOT" <<'PY'
 import json
 import sys
 
-output, data, producer, run = sys.argv[1:]
+output, data, producer, run, evaluation = sys.argv[1:]
 print(json.dumps(["env", "EVAL_ONLY=1", "EVAL_STEP={global_step}",
                   f"OUTPUT_ROOT={output}", f"DATA_DIR={data}",
+                  f"EVAL_ROOT={evaluation}",
                   f"LIGHTEVAL_PROJECT={producer}", f"WANDB_RUN_PATH={run}",
                   "NUM_GPUS=8", "BATCH_SIZE=56", "EVAL_MAX_NUM_SEQS=1024",
                   "EVAL_GPU_MEMORY_UTILIZATION=0.65",
@@ -119,7 +120,7 @@ print(json.dumps(["env", "EVAL_ONLY=1", "EVAL_STEP={global_step}",
 PY
 )
   EVAL_OVERRIDES+=("eval_command=$EVAL_COMMAND"
-    "eval_command_metrics_path=$OUTPUT_ROOT/evaluation/lighteval_avg16/global_step_{global_step}/sft/eval_metrics.json")
+    "eval_command_metrics_path=$EVAL_ROOT/global_step_{global_step}/sft/eval_metrics.json")
 fi
 
 if [[ "${EVAL_ONLY:-0}" != 1 ]]; then
@@ -219,6 +220,7 @@ if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" == 1 ]]; then
     setsid uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" \
       -m vllm_router.launch_router --host 127.0.0.1 --port "$ROUTER_PORT" \
       --prometheus-port "$((19300 + phase_index))" \
+      --policy round_robin \
       --worker-urls "${WORKER_URLS[@]}" \
       > "$PHASE_ROOT/router.log" 2>&1 &
     EVAL_PIDS+=("$!")

@@ -45,7 +45,7 @@ def test_gae_adaptive_matches_compressed_action_reference(gamma, mode):
     values = torch.tensor([[0.2, 999.0, -0.3, 999.0, 0.4], [999.0, 0.5, 999.0, 0.1, 999.0]])
     rewards = torch.tensor([[0.1, 999.0, 0.2, 999.0, 1.0], [999.0, -0.1, 999.0, 0.0, 999.0]])
     mask = torch.tensor([[1, 0, 1, 0, 1], [0, 1, 0, 1, 0]])
-    config = AlgorithmConfig(gae_adaptive=GAEAdaptiveConfig(mode=mode, alpha=1.5, critic_lambd=0.8))
+    config = AlgorithmConfig(gae_adaptive=GAEAdaptiveConfig(mode=mode, alpha=1.5, min_length=0, critic_lambd=0.8))
     adv, ret = compute_advantages_and_returns(
         rewards,
         torch.ones_like(mask),
@@ -89,7 +89,7 @@ def test_gae_adaptive_critic_mc_targets_independent_of_actor_lambda():
                 mask,
                 np.array(["a", "b"]),
                 "gae_adaptive",
-                AlgorithmConfig(gae_adaptive=GAEAdaptiveConfig(alpha=alpha)),
+                AlgorithmConfig(gae_adaptive=GAEAdaptiveConfig(alpha=alpha, min_length=0)),
                 values=values,
                 loss_mask=mask,
             )
@@ -115,6 +115,26 @@ def test_gae_adaptive_single_action_and_fully_masked_rows():
     )
     torch.testing.assert_close(adv, torch.tensor([[0.0, 0.8], [0.0, 0.0]]))
     torch.testing.assert_close(ret, torch.tensor([[0.0, 1.0], [0.0, 0.0]]))
+
+
+@pytest.mark.parametrize("length", [1, 2, 49, 50, 51])
+def test_gae_adaptive_short_trajectory_matches_sao_reference(length):
+    rewards = torch.zeros(1, length)
+    rewards[0, -1] = 1
+    mask = torch.ones_like(rewards)
+    advantages, returns = compute_advantages_and_returns(
+        rewards,
+        mask,
+        np.array(["answer"]),
+        "gae_adaptive",
+        AlgorithmConfig(),
+        values=torch.zeros_like(rewards),
+        loss_mask=mask,
+    )
+    lambd = 1.0 if length < 50 else 1 - 1 / (1.5 * length)
+    expected = lambd ** torch.arange(length - 1, -1, -1, dtype=torch.float64)
+    torch.testing.assert_close(advantages[0], expected.float())
+    torch.testing.assert_close(returns, torch.ones_like(returns))
 
 
 def test_gae_adaptive_long_trace_with_bf16_values_keeps_fp32_targets():

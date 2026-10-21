@@ -1,4 +1,5 @@
 import asyncio
+import json
 import math
 import os
 import shutil
@@ -139,6 +140,9 @@ class RayPPOTrainer:
         self.all_metrics = {}
         self.all_timings = {}
         self.global_step = 0
+        self.best_metric = None
+        self.best_global_step = None
+        self._previous_best_global_step = None
 
         self._vllm_metrics_scraper: Optional[VLLMMetricsScraper] = (
             VLLMMetricsScraper() if cfg.generator.inference_engine.enable_ray_prometheus_stats else None
@@ -269,7 +273,7 @@ class RayPPOTrainer:
         Returns:
             A dictionary of evaluation metrics.
         """
-        return await evaluate(
+        metrics = await evaluate(
             eval_dataloader=self.eval_dataloader,
             generator=self.generator,
             cfg=self.cfg,
@@ -279,6 +283,32 @@ class RayPPOTrainer:
             tracker=self.tracker,
             vllm_metrics_scraper=vllm_metrics_scraper,
         )
+        if self.cfg.trainer.metric_for_best_model is not None:
+            await asyncio.to_thread(self._save_best_checkpoint, metrics)
+        return metrics
+
+    def _save_best_checkpoint(self, metrics: Dict[str, float]) -> None:
+        """Save an evaluated best using the native checkpoint and HF export paths."""
+        metric = self.cfg.trainer.metric_for_best_model
+        value = metrics[metric]
+        if not math.isfinite(value):
+            return
+        improved = self.best_metric is None or (
+            value > self.best_metric if self.cfg.trainer.greater_is_better else value < self.best_metric
+        )
+        if not improved:
+            return
+        self._previous_best_global_step = self.best_global_step
+        self.best_metric, self.best_global_step = value, self.global_step
+        checkpoint_path = self.save_checkpoints()
+        self.save_models()
+        with io.open_file(os.path.join(self.cfg.trainer.ckpt_path, "best_checkpoint.json"), "w") as handle:
+            json.dump(
+                {"metric": metric, "value": value, "global_step": self.global_step, "checkpoint_path": checkpoint_path},
+                handle,
+            )
+        self._previous_best_global_step = None
+        logger.info(f"Saved best checkpoint at step {self.global_step}: {metric}={value}")
 
     async def train(self):
         """
@@ -1302,6 +1332,31 @@ class RayPPOTrainer:
         data["returns"] = returns
         data["advantages"] = advantages
 
+        if self.cfg.trainer.algorithm.advantage_estimator == "gae_adaptive":
+            active = data["response_mask"].bool() & data["loss_mask"].bool()
+            if active.any():
+                predictions = data["values"].float()[active]
+                targets = returns[active]
+                residual = targets - predictions
+                target_variance = targets.var(unbiased=False)
+                sequence_errors = ((returns - data["values"].float()).square() * active).sum(-1)
+                sequence_counts = active.sum(-1)
+                self.all_metrics.update(
+                    {
+                        "critic/token_mse": residual.square().mean().item(),
+                        "critic/sequence_mse": (sequence_errors / sequence_counts.clamp_min(1))[sequence_counts > 0]
+                        .mean()
+                        .item(),
+                        "critic/prediction_mean": predictions.mean().item(),
+                        "critic/target_mean": targets.mean().item(),
+                        "critic/residual_bias": residual.mean().item(),
+                    }
+                )
+                if target_variance > 0:
+                    self.all_metrics["critic/explained_variance"] = (
+                        1 - residual.var(unbiased=False) / target_variance
+                    ).item()
+
         # remove padding while calculating metrics
         pad_size = data.metadata.get("pad_size", 0)
         num_samples = len(token_level_rewards)
@@ -1808,6 +1863,8 @@ class RayPPOTrainer:
         trainer_state = {
             "global_step": self.global_step,
             "config": asdict(self.cfg),
+            "best_metric": self.best_metric,
+            "best_global_step": self.best_global_step,
         }
         trainer_state_path = os.path.join(global_step_folder, "trainer_state.pt")
         with io.open_file(trainer_state_path, "wb") as f:
@@ -1828,6 +1885,9 @@ class RayPPOTrainer:
         return global_step_folder
 
     def _cleanup_old_checkpoints(self):
+        protected_steps = [
+            step for step in (self.best_global_step, self._previous_best_global_step) if step is not None
+        ]
         if not self._node_ids:
             self._node_ids = self.dispatch.get_node_ids()
         run_on_each_node(
@@ -1835,10 +1895,11 @@ class RayPPOTrainer:
             cleanup_old_checkpoints,
             self.cfg.trainer.ckpt_path,
             self.cfg.trainer.max_ckpts_to_keep,
+            protected_steps,
         )
         # run on driver as well
         # NOTE (sumanthrh): the function will get called twice on the node with driver process, but it's ok because it's idempotent
-        cleanup_old_checkpoints(self.cfg.trainer.ckpt_path, self.cfg.trainer.max_ckpts_to_keep)
+        cleanup_old_checkpoints(self.cfg.trainer.ckpt_path, self.cfg.trainer.max_ckpts_to_keep, protected_steps)
 
     def load_checkpoints(self) -> Tuple[int, str]:
         """
@@ -1912,6 +1973,8 @@ class RayPPOTrainer:
             trainer_state = torch.load(f, map_location="cpu", weights_only=False)
         self._resumed_from_checkpoint = True
         saved_global_step = trainer_state.get("global_step", global_step)
+        self.best_metric = trainer_state.get("best_metric")
+        self.best_global_step = trainer_state.get("best_global_step")
         logger.info("Successfully loaded trainer state")
         if saved_global_step != global_step:
             logger.warning(f"Global step mismatch: path={global_step}, saved={saved_global_step}. Using path value.")
@@ -1961,10 +2024,14 @@ class RayPPOTrainer:
         Dispatch handles offload/backload automatically for all colocation configurations.
         """
         policy_export_dir = os.path.join(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "policy")
+        if os.path.normpath(self.cfg.trainer.export_path) == os.path.normpath(self.cfg.trainer.ckpt_path):
+            policy_export_dir = os.path.join(policy_export_dir, "huggingface")
         self.dispatch.save_hf_model("policy", policy_export_dir, self.tokenizer)
 
         if self.has_critic:
             critic_export_dir = os.path.join(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "critic")
+            if os.path.normpath(self.cfg.trainer.export_path) == os.path.normpath(self.cfg.trainer.ckpt_path):
+                critic_export_dir = os.path.join(critic_export_dir, "huggingface")
             self.dispatch.save_hf_model("critic", critic_export_dir, self.tokenizer)
 
         logger.info("Successfully saved model weights.")

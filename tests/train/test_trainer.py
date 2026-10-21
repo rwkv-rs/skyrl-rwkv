@@ -38,6 +38,84 @@ class DummyDataset:
         return batch
 
 
+@pytest.mark.parametrize("greater_is_better", [True, False])
+def test_best_checkpoint_survives_retention_and_hf_export(tmp_path, dummy_config, monkeypatch, greater_is_better):
+    import json
+    from pathlib import Path
+
+    from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
+
+    cfg = dummy_config.trainer
+    cfg.ckpt_path = cfg.export_path = str(tmp_path)
+    cfg.max_ckpts_to_keep = 1
+    cfg.metric_for_best_model = "eval/all/avg_score"
+    cfg.greater_is_better = greater_is_better
+    trainer = RayPPOTrainer(
+        cfg=dummy_config,
+        tracker=None,
+        tokenizer=None,
+        train_dataset=DummyDataset(),
+        eval_dataset=None,
+        inference_engine_client=None,
+        generator=None,
+    )
+    trainer.dispatch = MagicMock()
+    monkeypatch.setattr("skyrl.train.trainer.run_on_each_node", lambda *args: None)
+
+    def save_checkpoint(role, path, tokenizer):
+        Path(path).mkdir(parents=True, exist_ok=True)
+        (Path(path) / "model_rank_0.pt").write_bytes(b"training weights")
+        (Path(path) / "optim_rank_0.pt").write_bytes(b"optimizer state")
+
+    def export(role, path, tokenizer):
+        strategy = FSDPStrategy.__new__(FSDPStrategy)
+        with strategy._atomic_local_export_dir(path) as directory:
+            (Path(directory) / "model.safetensors").write_bytes(b"exported weights")
+
+    trainer.dispatch.save_checkpoint.side_effect = save_checkpoint
+    trainer.dispatch.save_hf_model.side_effect = export
+
+    def score(value):
+        return value if greater_is_better else -value
+
+    for step, value in [(1, 0.6), (2, 0.5), (3, 0.4)]:
+        trainer.global_step = step
+        trainer._save_best_checkpoint({cfg.metric_for_best_model: score(value)})
+        trainer.save_checkpoints()
+        trainer.save_models()
+    assert {path.name for path in tmp_path.glob("global_step_*")} == {"global_step_1", "global_step_3"}
+    best = json.loads((tmp_path / "best_checkpoint.json").read_text())
+    assert best["global_step"] == 1 and best["value"] == score(0.6)
+    assert (tmp_path / "global_step_1/policy/model_rank_0.pt").exists()
+    assert (tmp_path / "global_step_1/policy/optim_rank_0.pt").exists()
+    assert (tmp_path / "global_step_1/policy/huggingface/model.safetensors").exists()
+    trainer.global_step = 4
+    trainer._save_best_checkpoint({cfg.metric_for_best_model: score(0.7)})
+    trainer.save_checkpoints()
+    assert {path.name for path in tmp_path.glob("global_step_*")} == {"global_step_4"}
+    state = torch.load(tmp_path / "global_step_4/trainer_state.pt", weights_only=False)
+    assert state["best_global_step"] == 4 and state["best_metric"] == score(0.7)
+
+
+def test_eos_zero_is_kept_as_action_in_training_batch():
+    from skyrl.train.dataset.preprocess import (
+        convert_prompts_responses_to_batch_tensors,
+    )
+
+    sequences, attention, response, rewards, loss, logprobs, _, _ = convert_prompts_responses_to_batch_tensors(
+        0,
+        [[11, 12], [21]],
+        [[31, 0], [41, 42, 43]],
+        [[0.0, 1.0], [0.0] * 3],
+        [[1, 1], [1, 1, 1]],
+        [[-0.4, -0.7], [-0.1, -0.2, -0.3]],
+    )
+    assert sequences[0, -1] == 0 and attention[0, -1] == response[0, -1] == loss[0, -1] == 1
+    assert logprobs[0, -1] == pytest.approx(-0.7)
+    assert rewards[0, -1] == 1
+    assert sequences[1, -1] == 43  # A truncated answer does not acquire a synthetic EOS.
+
+
 @pytest.fixture
 def dummy_tokenizer():
     mock_tokenizer = MagicMock()
@@ -204,6 +282,7 @@ def test_calc_advantages_and_returns(mock_compute_adv_and_ret, dummy_config):
 
 def test_calc_gae_adaptive_passes_action_mask_and_keeps_mc_returns(dummy_config):
     dummy_config.trainer.algorithm.advantage_estimator = "gae_adaptive"
+    dummy_config.trainer.algorithm.gae_adaptive.min_length = 0
     trainer = RayPPOTrainer(
         cfg=dummy_config,
         tracker=None,
@@ -220,6 +299,9 @@ def test_calc_gae_adaptive_passes_action_mask_and_keeps_mc_returns(dummy_config)
     assert not data["advantages"][~data["loss_mask"].bool()].any()
     assert data["advantages"][0, 0] == approx(1 - 1 / (1.5 * 2))
     assert data["advantages"][1, 0] == approx((1 - 1 / (1.5 * 3)) ** 2)
+    assert trainer.all_metrics["critic/token_mse"] == approx(1.0)
+    assert trainer.all_metrics["critic/prediction_mean"] == 0
+    assert trainer.all_metrics["critic/target_mean"] == 1
 
 
 @pytest.mark.parametrize("estimator, reward_index", [("gae_adaptive", 1), ("grpo", 3)])

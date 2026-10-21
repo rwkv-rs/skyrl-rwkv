@@ -509,7 +509,8 @@ def test_value_loss_is_global_token_normalized_across_microbatches():
     torch.testing.assert_close(full_gradient, split_gradient)
 
 
-def test_sequence_value_loss_matches_online_critic_across_microbatches():
+@pytest.mark.parametrize("reduction", ["sequence_mean", "seq_mean_token_sum_norm"])
+def test_sequence_value_loss_matches_online_critic_across_microbatches(reduction):
     from skyrl.backends.skyrl_train.utils.ppo_utils import ppo_critic_loss
     from skyrl.train.config import AlgorithmConfig
 
@@ -517,16 +518,88 @@ def test_sequence_value_loss_matches_online_critic_across_microbatches():
     labels = torch.tensor([[1.0, 1.0, 1.0], [0.0, 0.0, 0.0]])
     mask = torch.tensor([[False, False, True], [True, True, True]])
     predictions = parameter.expand_as(labels)
-    native_loss, _ = ppo_critic_loss(predictions, predictions.detach(), labels, AlgorithmConfig(value_clip=None), mask)
+    config = AlgorithmConfig(value_clip=None, critic_loss_reduction=reduction, max_seq_len=8)
+    native_loss, _ = ppo_critic_loss(predictions, predictions.detach(), labels, config, mask)
     native_gradient = torch.autograd.grad(native_loss, parameter)[0]
-    error, count = value_loss(predictions, labels, mask, "sequence_mean")
+    error, count = value_loss(predictions, labels, mask, reduction, max_seq_len=8)
     assert count == 2
     torch.testing.assert_close(0.5 * error / count, native_loss)
     split_error = sum(
-        value_loss(parameter.expand_as(row), row, row_mask, "sequence_mean")[0] for row, row_mask in zip(labels, mask)
+        value_loss(parameter.expand_as(row), row, row_mask, reduction, max_seq_len=8)[0]
+        for row, row_mask in zip(labels, mask)
     )
     split_gradient = torch.autograd.grad(0.5 * split_error / count, parameter)[0]
     torch.testing.assert_close(split_gradient, native_gradient)
+
+
+def test_fixed_critic_normalization_removes_future_length_bias_at_shared_state():
+    from skyrl.backends.skyrl_train.utils.ppo_utils import ppo_critic_loss
+    from skyrl.train.config import AlgorithmConfig
+
+    # Two equally likely futures share only their initial state: success after
+    # one action or failure after ten. Later states already predict their targets.
+    value = torch.tensor(0.5, requires_grad=True)
+    predictions = torch.cat([value.expand(2, 1), torch.zeros(2, 9)], dim=-1)
+    labels = torch.zeros(2, 10)
+    labels[0, 0] = 1
+    mask = torch.ones(2, 10, dtype=torch.bool)
+    mask[0, 1:] = False
+    fixed, _ = ppo_critic_loss(
+        predictions,
+        predictions.detach(),
+        labels,
+        AlgorithmConfig(value_clip=None, critic_loss_reduction="seq_mean_token_sum_norm", max_seq_len=10),
+        mask,
+    )
+    sequence, _ = ppo_critic_loss(predictions, predictions.detach(), labels, AlgorithmConfig(value_clip=None), mask)
+    assert torch.autograd.grad(fixed, value, retain_graph=True)[0].item() == 0
+    assert torch.autograd.grad(sequence, value)[0].item() < 0
+
+
+@pytest.mark.parametrize("budget", [None, 0, -1])
+def test_fixed_value_loss_requires_explicit_positive_budget(monkeypatch, budget):
+    monkeypatch.setattr(main_value, "train", lambda _: pytest.fail("invalid CLI reached training"))
+    args = [
+        "--model",
+        "rwkv7-test",
+        "--train-data",
+        "train.jsonl",
+        "--val-data",
+        "validation.jsonl",
+        "--output-dir",
+        "value",
+        "--loss-reduction",
+        "seq_mean_token_sum_norm",
+    ]
+    if budget is not None:
+        args += ["--max-seq-len", str(budget)]
+    with pytest.raises(SystemExit):
+        main_value.main(args)
+
+
+def test_fixed_value_loss_cli_preserves_input_and_loss_budgets(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main_value, "train", calls.append)
+    main_value.main(
+        [
+            "--model",
+            "rwkv7-test",
+            "--train-data",
+            "train.jsonl",
+            "--val-data",
+            "validation.jsonl",
+            "--output-dir",
+            "value",
+            "--loss-reduction",
+            "seq_mean_token_sum_norm",
+            "--max-seq-len",
+            "8192",
+            "--max-length",
+            "32768",
+        ]
+    )
+    assert calls[0].max_length == 32768
+    assert calls[0].max_seq_len == 8192
 
 
 def test_evaluate_distributed_tail_metrics_use_each_trajectory_once(monkeypatch):

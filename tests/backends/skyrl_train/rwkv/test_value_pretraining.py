@@ -229,7 +229,8 @@ def test_rwkv_critic_checkpoint_round_trip_uses_native_bf16(tmp_path, rwkv_check
 
 @pytest.mark.skipif("use_nora" not in LoraConfig.__dataclass_fields__, reason="requires Joluck/NoRA")
 @pytest.mark.parametrize("rank", [8, 16])
-def test_rwkv_nora_critic_updates_and_exports_full_head(tmp_path, rwkv_checkpoint, monkeypatch, rank):
+@pytest.mark.parametrize("freeze_backbone", [False, True])
+def test_rwkv_nora_critic_updates_and_exports_full_head(tmp_path, rwkv_checkpoint, monkeypatch, rank, freeze_backbone):
     from transformers import RwkvModel
 
     from skyrl.backends.skyrl_train.distributed import fsdp_strategy
@@ -251,7 +252,13 @@ def test_rwkv_nora_critic_updates_and_exports_full_head(tmp_path, rwkv_checkpoin
         lora_rank=rank,
         lora_alpha=rank,
         target_modules=["v_proj", "o_proj"],
+        freeze_backbone=freeze_backbone,
     )
+    if freeze_backbone:
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if "lora_B" in name:
+                    parameter.normal_(std=0.001)
     head = model.get_base_model().value_head
     assert head.weight.dtype == torch.float32
     assert head.weight.requires_grad
@@ -269,7 +276,10 @@ def test_rwkv_nora_critic_updates_and_exports_full_head(tmp_path, rwkv_checkpoin
         (error / count).backward()
         assert torch.isfinite(head.weight.grad).all()
         assert head.weight.grad.abs().sum() > 0
-        assert any(p.grad is not None and p.grad.abs().sum() > 0 for n, p in model.named_parameters() if "lora_B" in n)
+        if not freeze_backbone:
+            assert any(
+                p.grad is not None and p.grad.abs().sum() > 0 for n, p in model.named_parameters() if "lora_B" in n
+            )
         optimizer.step()
         optimizer.zero_grad()
     for name, value in model.named_parameters():
@@ -306,6 +316,55 @@ def test_rwkv_nora_critic_updates_and_exports_full_head(tmp_path, rwkv_checkpoin
         torch.testing.assert_close(value, before_export[name], rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("rank", [0, 8])
+def test_rwkv_head_only_critic_keeps_backbone_and_adapters_fixed(rwkv_checkpoint, monkeypatch, rank):
+    from transformers import RwkvModel
+
+    if rank and "use_nora" not in LoraConfig.__dataclass_fields__:
+        pytest.skip("requires Joluck/NoRA")
+
+    def causal_forward(self, input_ids, use_cache):
+        hidden = self.embed_tokens(input_ids).cumsum(1)
+        for layer in self.layers:
+            hidden = hidden + layer.linear_attn.o_proj(torch.tanh(layer.linear_attn.v_proj(hidden)))
+        return {"last_hidden_state": hidden}
+
+    monkeypatch.setattr(RwkvModel, "forward", causal_forward)
+    model = get_llm_for_sequence_regression(
+        str(rwkv_checkpoint),
+        "critic",
+        use_nora=bool(rank),
+        lora_rank=rank,
+        lora_alpha=rank,
+        target_modules=["v_proj", "o_proj"],
+        freeze_backbone=True,
+    )
+    model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    critic = model.get_base_model() if rank else model
+    backbone = getattr(critic, critic.base_model_prefix)
+    head = critic.value_head
+    before = {name: value.clone() for name, value in backbone.state_dict().items()}
+    head_before = head.weight.detach().clone()
+    assert head.weight.dtype == torch.float32 and head.weight.requires_grad
+    assert all(not parameter.requires_grad for parameter in backbone.parameters())
+    assert all("value_head" in name for name, parameter in model.named_parameters() if parameter.requires_grad)
+    input_gradients = []
+    hook = head.register_forward_pre_hook(lambda module, args: input_gradients.append(args[0].requires_grad))
+    optimizer = torch.optim.SGD((parameter for parameter in model.parameters() if parameter.requires_grad), lr=0.001)
+    batch = RewardDataCollator(0)([{"input_ids": [1, 2, 3, 4], "loss_mask": [0, 0, 1, 1], "returns": [1, 1, 1, 1]}])
+    predictions, labels, mask = main_value.critic_forward(model, batch, "cpu")
+    error, count = value_loss(predictions, labels, mask)
+    (error / count).backward()
+    assert input_gradients == [False]
+    assert torch.isfinite(head.weight.grad).all() and head.weight.grad.abs().sum() > 0
+    assert all(parameter.grad is None for parameter in backbone.parameters())
+    optimizer.step()
+    hook.remove()
+    assert not torch.equal(head.weight, head_before)
+    for name, value in backbone.state_dict().items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("rank", [8, 16, 32, 64])
 def test_value_pretraining_cli_nora_rank_sweep(monkeypatch, rank):
     calls = []
@@ -329,6 +388,7 @@ def test_value_pretraining_cli_nora_rank_sweep(monkeypatch, rank):
     assert args.use_nora and args.rank == rank
     assert args.lora_alpha == rank
     assert args.target_modules == ["r_proj", "k_proj", "v_proj", "o_proj"]
+    assert not args.freeze_backbone
 
 
 def test_value_pretraining_cli_preserves_native_initialization_and_calibration(monkeypatch):
@@ -346,11 +406,13 @@ def test_value_pretraining_cli_preserves_native_initialization_and_calibration(m
             "value",
             "--resume-path",
             "/value/step_96",
+            "--freeze-backbone",
             "--model-config-kwargs",
             '{"value_head_calibration":{"scale":10.0,"bias":-4.0}}',
         ]
     )
     assert calls[0].resume_path == "/value/step_96"
+    assert calls[0].freeze_backbone
     assert calls[0].model_config_kwargs == {"value_head_calibration": {"scale": 10.0, "bias": -4.0}}
 
 

@@ -917,6 +917,9 @@ def _get_critic_model(
                 if num_actions is None:
                     assert return_output
                     return outputs
+                calibration = getattr(self.config, "value_head_calibration", None)
+                if calibration is not None:
+                    values = torch.sigmoid(values.float() * calibration["scale"] + calibration["bias"])
                 action_values = values[:, -num_actions:]
                 return (action_values, outputs) if return_output else action_values
 
@@ -982,6 +985,10 @@ def _get_critic_model(
 
             values = values_BSH.squeeze(-1)[:, :-1]
 
+            calibration = getattr(self.config, "value_head_calibration", None)
+            if calibration is not None:
+                values = torch.sigmoid(values.float() * calibration["scale"] + calibration["bias"])
+
             if num_actions is None:
                 assert return_output
                 return outputs
@@ -1034,6 +1041,13 @@ def get_llm_for_sequence_regression(
     assert model_type == "critic", f"Only model_type critic is supported, got: {model_type}."
 
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True, **model_config_kwargs)
+    calibration = model_config_kwargs.get("value_head_calibration", getattr(config, "value_head_calibration", None))
+    if calibration is not None:
+        scale, bias = float(calibration["scale"]), float(calibration["bias"])
+        if not np.isfinite([scale, bias]).all() or scale < 0:
+            raise ValueError("value_head_calibration requires a finite nonnegative scale and finite bias.")
+        calibration = {"scale": scale, "bias": bias}
+    config.value_head_calibration = calibration
     if use_nora:
         if config.model_type != "rwkv" or lora_rank <= 0:
             raise ValueError("NoRA critic training requires an RWKV model and a positive LoRA rank.")

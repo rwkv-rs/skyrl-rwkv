@@ -9,6 +9,7 @@ training, optimizer, and checkpoint handling reuse SkyRL FSDPStrategy.
 """
 
 import argparse
+import json
 import math
 import os
 import shutil
@@ -199,6 +200,7 @@ def train(args):
             lora_dropout=lora_config.dropout,
             target_modules=lora_config.target_modules,
             use_nora=lora_config.use_nora,
+            model_config_kwargs=args.model_config_kwargs,
         )
         if model.config.model_type != "rwkv":
             model.config.pad_token_id = tokenizer.pad_token_id
@@ -208,6 +210,13 @@ def train(args):
         if args.gradient_checkpointing:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model, optimizer, scheduler = strategy.prepare((model, None, None))
+        if args.resume_path is not None:
+            strategy.load_checkpoint(
+                model,
+                args.resume_path,
+                load_optimizer_states=False,
+                load_lr_scheduler_states=False,
+            )
         if dist.get_rank() == 0 and args.report_to == "wandb":
             import wandb
 
@@ -320,6 +329,8 @@ def train(args):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--resume-path", default=None, help="Initialize weights from a native value checkpoint")
+    parser.add_argument("--model-config-kwargs", type=json.loads, default={})
     parser.add_argument("--train-data", required=True)
     parser.add_argument("--val-data", required=True)
     parser.add_argument("--output-dir", required=True)
@@ -348,6 +359,8 @@ def main(argv=None):
     parser.add_argument("--wandb-project", default="rwkv-value-pretraining")
     parser.add_argument("--run-name", default=None)
     args = parser.parse_args(argv)
+    if not isinstance(args.model_config_kwargs, dict):
+        parser.error("--model-config-kwargs must be a JSON object.")
     if args.max_ckpts_to_keep != -1 and args.max_ckpts_to_keep <= 0:
         parser.error("--max-ckpts-to-keep must be -1 or positive.")
     for name in ("epochs", "batch_size", "gradient_accumulation_steps", "save_steps"):

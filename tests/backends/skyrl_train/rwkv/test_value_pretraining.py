@@ -165,6 +165,26 @@ def test_rwkv_critic_ragged_padding_alignment_and_backward():
     assert not batch["response_mask"][0, :2].any()
 
 
+def test_probability_value_head_preserves_alignment_and_gradient():
+    model = make_critic().to(torch.bfloat16)
+    batch = RewardDataCollator(0)(
+        [
+            {"input_ids": [1, 2, 3], "loss_mask": [0, 1, 1], "returns": [0, 1, 1]},
+            {"input_ids": [4, 5], "loss_mask": [0, 1], "returns": [0, 0]},
+        ]
+    )
+    raw = main_value.critic_forward(model, batch, "cpu")[0].detach()
+    model.config.value_head_calibration = {"scale": 0.25, "bias": -0.5}
+    predictions, labels, mask = main_value.critic_forward(model, batch, "cpu")
+    torch.testing.assert_close(predictions, torch.sigmoid(raw.float() * 0.25 - 0.5))
+    assert predictions.dtype == torch.float32
+    assert ((predictions >= 0) & (predictions <= 1)).all()
+    error, count = value_loss(predictions, labels, mask, "sequence_mean")
+    (error / count).backward()
+    assert torch.isfinite(model.value_head.weight.grad).all()
+    assert model.value_head.weight.grad.abs().sum() > 0
+
+
 @pytest.mark.parametrize("kwargs", [{"remove_microbatch_padding": True}, {"sequence_parallel_size": 2}])
 def test_rwkv_critic_rejects_incompatible_packing(kwargs):
     with pytest.raises(ValueError, match="RWKV does not support"):
@@ -309,6 +329,55 @@ def test_value_pretraining_cli_nora_rank_sweep(monkeypatch, rank):
     assert args.use_nora and args.rank == rank
     assert args.lora_alpha == rank
     assert args.target_modules == ["r_proj", "k_proj", "v_proj", "o_proj"]
+
+
+def test_value_pretraining_cli_preserves_native_initialization_and_calibration(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main_value, "train", calls.append)
+    main_value.main(
+        [
+            "--model",
+            "rwkv7-test",
+            "--train-data",
+            "train.jsonl",
+            "--val-data",
+            "validation.jsonl",
+            "--output-dir",
+            "value",
+            "--resume-path",
+            "/value/step_96",
+            "--model-config-kwargs",
+            '{"value_head_calibration":{"scale":10.0,"bias":-4.0}}',
+        ]
+    )
+    assert calls[0].resume_path == "/value/step_96"
+    assert calls[0].model_config_kwargs == {"value_head_calibration": {"scale": 10.0, "bias": -4.0}}
+
+
+def test_probability_value_config_round_trips_without_changing_head_weights(rwkv_checkpoint):
+    raw = get_llm_for_sequence_regression(str(rwkv_checkpoint), "critic")
+    source = rwkv_checkpoint.parent / "critic-source"
+    raw.save_pretrained(source)
+    calibrated = get_llm_for_sequence_regression(
+        str(source), "critic", model_config_kwargs={"value_head_calibration": {"scale": 10.0, "bias": -4.0}}
+    )
+    assert raw.config.value_head_calibration is None
+    torch.testing.assert_close(raw.value_head.weight, calibrated.value_head.weight, rtol=0, atol=0)
+    output = rwkv_checkpoint.parent / "calibrated"
+    calibrated.save_pretrained(output)
+    restored = get_llm_for_sequence_regression(str(output), "critic")
+    assert restored.config.value_head_calibration == {"scale": 10.0, "bias": -4.0}
+    torch.testing.assert_close(restored.value_head.weight, raw.value_head.weight, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "calibration", [{"scale": -1, "bias": 0}, {"scale": float("nan"), "bias": 0}, {"scale": 1, "bias": float("inf")}]
+)
+def test_probability_value_config_rejects_nonfinite_or_reversed_scores(rwkv_checkpoint, calibration):
+    with pytest.raises(ValueError, match="value_head_calibration"):
+        get_llm_for_sequence_regression(
+            str(rwkv_checkpoint), "critic", model_config_kwargs={"value_head_calibration": calibration}
+        )
 
 
 @pytest.mark.parametrize("option,value", [("--rank", "0"), ("--lora-alpha", "-1"), ("--fsdp-size", "0")])

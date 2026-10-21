@@ -38,6 +38,16 @@ and scheduler. It preserves the adapter computation used during validation;
 merging adapters into BF16 backbone weights can change value predictions.
 A full trainer resume subsequently restores the critic from that training run.
 
+For binary-return critic experiments, the optional HuggingFace config field
+`value_head_calibration={"scale": a, "bias": b}` applies `sigmoid(a * value + b)`
+in FP32 to the scalar head, following ReDiPPO's probability-value convention.
+It applies during both pretraining and online value optimization, and is saved
+in HF config metadata. Its default is `None`, preserving scalar values for
+arbitrary return ranges. With a native checkpoint, pass the same calibration in
+`trainer.critic.model_config_kwargs` as in offline pretraining.
+Offline `main_value.py --model-config-kwargs '<JSON object>' --resume-path <step_N>`
+supports controlled continuation with fresh optimizer/scheduler state.
+
 Online SAO uses the native `gae_adaptive` estimator with `rollout_is` loss. It skips
 observation positions using `response_mask & loss_mask`, uses action-length-adaptive
 policy lambda (`gae_adaptive.alpha=1.5`, lambda one below `gae_adaptive.min_length=50`), and separate critic lambda

@@ -321,6 +321,7 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
             lora_alpha=self.cfg.critic.model.lora.alpha,
             lora_dropout=self.cfg.critic.model.lora.dropout,
             use_nora=self.cfg.critic.model.lora.use_nora,
+            freeze_backbone=self.cfg.critic.freeze_backbone,
             target_modules=self.cfg.critic.model.lora.target_modules,
             exclude_modules=self.cfg.critic.model.lora.exclude_modules,
             value_head_prefix=self.cfg.algorithm.value_head_prefix,
@@ -332,7 +333,7 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
         )
         self._seq_parallel_monkey_patch(model=critic, use_parent_class=True)
 
-        if self.cfg.gradient_checkpointing:
+        if self.cfg.gradient_checkpointing and not self.cfg.critic.freeze_backbone:
             critic.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": self.cfg.gradient_checkpointing_use_reentrant}
             )

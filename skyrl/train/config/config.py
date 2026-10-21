@@ -812,6 +812,9 @@ class CriticConfig(BaseConfig):
     model_config_kwargs: dict = field(default_factory=dict)
     """Pass-through kwargs for the HuggingFace model config (e.g. overriding vocab size)."""
 
+    freeze_backbone: bool = False
+    """Freeze the critic backbone, including loaded LoRA adapters, and optimize only the full value head."""
+
 
 # TODO: Have global config init so that the default value for the ref model path is the policy model path
 @dataclass

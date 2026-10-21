@@ -470,7 +470,8 @@ def test_critic_preserves_rwkv_padding_config(is_rwkv):
 
 
 @pytest.mark.parametrize("resume_path", [None, "/value/step_64"])
-def test_critic_warm_start_keeps_fresh_optimizer_and_scheduler(monkeypatch, resume_path):
+@pytest.mark.parametrize("freeze_backbone", [False, True])
+def test_critic_warm_start_keeps_fresh_optimizer_and_scheduler(monkeypatch, resume_path, freeze_backbone):
     from unittest.mock import MagicMock
 
     from skyrl.backends.skyrl_train.workers.fsdp import fsdp_worker as module
@@ -479,6 +480,7 @@ def test_critic_warm_start_keeps_fresh_optimizer_and_scheduler(monkeypatch, resu
     cfg = SkyRLTrainConfig().trainer
     cfg.gradient_checkpointing = False
     cfg.critic.resume_path = resume_path
+    cfg.critic.freeze_backbone = freeze_backbone
     model = torch.nn.Linear(2, 1)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1)
@@ -490,12 +492,14 @@ def test_critic_warm_start_keeps_fresh_optimizer_and_scheduler(monkeypatch, resu
         module.AutoConfig, "from_pretrained", lambda *args, **kwargs: SimpleNamespace(tie_word_embeddings=False)
     )
     monkeypatch.setattr(module, "should_use_meta_init", lambda **kwargs: False)
-    monkeypatch.setattr(module, "get_llm_for_sequence_regression", lambda *args, **kwargs: model)
+    factory = MagicMock(return_value=model)
+    monkeypatch.setattr(module, "get_llm_for_sequence_regression", factory)
     worker = object.__new__(FSDPCriticWorkerBase)
     worker.cfg = cfg
     worker._seq_parallel_monkey_patch = MagicMock()
     worker._set_expandable_segments = MagicMock()
     worker.init_model("base-checkpoint")
+    assert factory.call_args.kwargs["freeze_backbone"] == freeze_backbone
 
     if resume_path is None:
         strategy.load_checkpoint.assert_not_called()

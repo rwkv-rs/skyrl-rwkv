@@ -171,7 +171,12 @@ def ppo_critic_loss(
         clipfrac = None
         loss = (values - returns) ** 2
 
-    loss = masked_mean(loss, loss_mask, dim=-1).mean()
+    if config.critic_loss_reduction == "seq_mean_token_sum_norm":
+        if loss_mask is not None:
+            loss = loss * loss_mask
+        loss = loss.sum(dim=-1).mean() / config.max_seq_len
+    else:
+        loss = masked_mean(loss, loss_mask, dim=-1).mean()
     return 0.5 * loss, clipfrac
 
 

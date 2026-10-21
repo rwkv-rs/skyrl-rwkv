@@ -1130,6 +1130,14 @@ class AlgorithmConfig(BaseConfig):
       importance sampling, a sequence-level Bernoulli-KL gate, and trajectory-normalized loss.
     - ``"bpo"``: Bellman Policy Optimization's practical complementary-probability mismatch weight.
     """
+    critic_loss_reduction: str = "sequence_mean"
+    """Reduce critic errors by per-sequence token mean or a fixed token budget.
+
+    ``sequence_mean`` preserves the native critic objective.
+    ``seq_mean_token_sum_norm`` sums masked token errors, divides by ``max_seq_len``,
+    then averages sequences. Its state weights do not depend on future response length.
+    This setting is independent of the actor's ``loss_reduction``.
+    """
     loss_reduction: str = "token_mean"
     """Type of loss reduction to use, applied per mini-batch by rescaling advantages:
 
@@ -1199,7 +1207,7 @@ class AlgorithmConfig(BaseConfig):
     dppo: DPPOConfig = field(default_factory=DPPOConfig)
     """Only used when ``policy_loss_type="dppo"``."""
     max_seq_len: Optional[int] = None
-    """Sequence-length normalization constant used for ``seq_mean_token_sum_norm`` loss reduction.
+    """Sequence-length normalization constant used for actor or critic ``seq_mean_token_sum_norm`` loss reduction.
     Must be set explicitly for that reduction mode; otherwise can remain ``None``. This often
     matches the model context window / vLLM ``max_model_len`` when that is the intended budget."""
 

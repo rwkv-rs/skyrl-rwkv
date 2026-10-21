@@ -283,13 +283,13 @@ def train(args):
                     device=device,
                 )
                 dist.all_reduce(counts)
-                count = counts[3] if args.loss_reduction == "sequence_mean" else counts[0]
+                count = counts[0] if args.loss_reduction == "token_mean" else counts[3]
                 error_sum = torch.zeros((), device=device)
                 for batch in batches:
                     predictions, labels, mask = critic_forward(model, batch, device)
-                    error, _ = value_loss(predictions, labels, mask, args.loss_reduction)
-                    # The online PPO critic minimizes half the sequence-mean MSE.
-                    loss_scale = 0.5 if args.loss_reduction == "sequence_mean" else 1.0
+                    error, _ = value_loss(predictions, labels, mask, args.loss_reduction, args.max_seq_len)
+                    # Match the online critic's half-MSE convention for sequence reductions.
+                    loss_scale = 1.0 if args.loss_reduction == "token_mean" else 0.5
                     strategy.backward(error * loss_scale * dist.get_world_size() / count, model, optimizer)
                     error_sum += error.detach()
                 grad_norm = strategy.optimizer_step(optimizer, model, scheduler)
@@ -342,7 +342,12 @@ def main(argv=None):
     parser.add_argument("--max-length", type=int, default=8192)
     parser.add_argument("--save-steps", type=int, default=50)
     parser.add_argument("--eval-before-train", action="store_true")
-    parser.add_argument("--loss-reduction", choices=("token_mean", "sequence_mean"), default="token_mean")
+    parser.add_argument(
+        "--loss-reduction", choices=("token_mean", "sequence_mean", "seq_mean_token_sum_norm"), default="token_mean"
+    )
+    parser.add_argument(
+        "--max-seq-len", type=int, default=None, help="Fixed loss denominator; separate from --max-length"
+    )
     parser.add_argument("--max-ckpts-to-keep", type=int, default=-1, help="Keep the last N checkpoints; -1 keeps all")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gradient-checkpointing", action="store_true")
@@ -365,6 +370,8 @@ def main(argv=None):
     parser.add_argument("--wandb-project", default="rwkv-value-pretraining")
     parser.add_argument("--run-name", default=None)
     args = parser.parse_args(argv)
+    if args.loss_reduction == "seq_mean_token_sum_norm" and (args.max_seq_len is None or args.max_seq_len <= 0):
+        parser.error("--max-seq-len must be explicitly set to a positive value for seq_mean_token_sum_norm.")
     if not isinstance(args.model_config_kwargs, dict):
         parser.error("--model-config-kwargs must be a JSON object.")
     if args.max_ckpts_to_keep != -1 and args.max_ckpts_to_keep <= 0:

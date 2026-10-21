@@ -362,7 +362,7 @@ def main(argv=None):
     )
     parser.add_argument("--rank", type=int, default=8, help="NoRA rank; sweep 8, 16, 32, 64, ...")
     parser.add_argument("--lora-alpha", type=int, default=None, help="NoRA alpha; defaults to rank")
-    parser.add_argument("--target-modules", nargs="+", default=["r_proj", "k_proj", "v_proj", "o_proj"])
+    parser.add_argument("--target-modules", nargs="+", default=["mlp.key", "mlp.value"])
     parser.add_argument(
         "--fsdp-size", type=int, default=-1, help="FSDP shard size; -1 uses all ranks, 1 replicates the base"
     )

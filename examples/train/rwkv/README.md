@@ -233,10 +233,11 @@ uv run --isolated --no-project .venv/bin/torchrun --standalone --nproc-per-node=
 ```
 
 Install the pinned NoRA PEFT fork from "Antidoom FTPO with NoRA" before using
-`--use-nora`. NoRA freezes the original backbone weights and trains adapters on
-`r_proj`, `k_proj`, `v_proj`, and `o_proj`, together with the complete FP32
-`value_head`. It reuses the existing fused FlashRWKV2 projections. Rank defaults
-to 8, alpha defaults to rank, and adapter dropout is zero. `--target-modules`
+`--use-nora`. NoRA freezes the original backbone weights and trains Channel-mixing
+adapters on `mlp.key` and `mlp.value`, together with the complete FP32 `value_head`.
+This keeps the Time-mixing parameters fixed, following SAO's frozen-attention
+design as an RWKV adaptation choice. It reuses the existing fused FlashRWKV2
+projections. Rank defaults to 8, alpha defaults to rank, and adapter dropout is zero. `--target-modules`
 selects the backbone projections; the value head is always trained in full.
 Omitting `--use-nora` retains full-parameter critic training.
 
@@ -344,11 +345,14 @@ Environment metadata selects `open_think` for Math and `fake_think` for the othe
 domains while preserving the generated token IDs. For a 25600-token training
 context and 8192 generated tokens, set `trainer.max_prompt_length=17408`.
 
-Initialize the actor from the rollout checkpoint and the critic from the merged
-offline `best/` export. To continue critic training with NoRA, set
-`trainer.critic.model.lora.use_nora=true`, `rank=8`, `alpha=8`, and
-`target_modules=[r_proj,k_proj,v_proj,o_proj]` under the same `lora` config.
-The critic backbone is frozen; its adapters and full FP32 value head train.
+Initialize the actor from the rollout checkpoint. For a NoRA critic, set
+`trainer.critic.model.path` to its original base and `trainer.critic.resume_path`
+to the selected native offline `step_N` checkpoint, preserving its unmerged
+adapter computation. Set `trainer.critic.model.lora.use_nora=true`, `rank=8`,
+`alpha=8`, and `target_modules=[mlp.key,mlp.value]` under the same `lora` config.
+The original backbone weights stay frozen; Channel-mixing adapters and the full
+FP32 value head train. Native resume requires the same adapter targets and rank
+as the saved run; choose the targets before pretraining a new critic.
 
 ### SAO configuration
 
@@ -591,7 +595,8 @@ detailed training rollout dumps are written under `$OUTPUT_ROOT/exports/dumped_r
 
 `STUDENT_MODEL`, `TEACHER_MODEL`, `DATA_DIR`, `TRAIN_FILE`, `TEST_FILE`, `NUM_GPUS`,
 `MICRO_BATCH_SIZE`, `MICRO_FORWARD_BATCH_SIZE`, `MINI_BATCH_SIZE`, `LR`, `USE_NORA`,
-`LORA_RANK`, `LORA_ALPHA`, `LOGGER`, `RUN_NAME`, and `OUTPUT_ROOT` accept environment overrides.
+`LORA_RANK`, `LORA_ALPHA`, `LORA_TARGET_MODULES`, `LOGGER`, `RUN_NAME`, and `OUTPUT_ROOT`
+accept environment overrides.
 Additional native config overrides are forwarded at the end of the command, for example:
 
 ```bash
@@ -634,8 +639,10 @@ NoRA is selected through
 unchanged. To run full-parameter OPD, set `USE_NORA=false LORA_RANK=0` and choose its
 learning rate explicitly with `LR`.
 
-NoRA uses rank 256, alpha 256, zero dropout, and the same attention and output-head
-targets as AntiDoom: `r_proj`, `k_proj`, `v_proj`, `o_proj`, and `lm_head`.
+NoRA uses rank 256, alpha 256, zero dropout, and adapts Time-mixing, Channel-mixing,
+and the output head: `r_proj`, `k_proj`, `v_proj`, `o_proj`, `mlp.key`, `mlp.value`,
+and `lm_head`. Set `LORA_TARGET_MODULES` or the native
+`trainer.policy.model.lora.target_modules` override to choose the projections.
 The pinned Transformers-RWKV passes the raw A/B parameters and `use_nora` into
 FlashRWKV2's fused BF16 projection forward/backward operators. No Python adapter
 forward is inserted around those fused projections.
@@ -670,8 +677,8 @@ weight-transfer time.
 ### Eight-card sizing
 
 Full-context component measurements on eight 96-GB RTX PRO 6000 GPUs use 25600-token
-sequences, rank-256 NoRA with the attention/output-head targets above, and the pinned
-FlashRWKV2 fused operators. Policy measurements include the native worker's BF16
+sequences, rank-256 NoRA targeting `r_proj`, `k_proj`, `v_proj`, `o_proj`, and
+`lm_head`, and the pinned FlashRWKV2 fused operators. Policy measurements include the native worker's BF16
 autocast region, log-softmax, entropy statistics, backward, and AdamW; teacher
 measurements run without gradients. Throughput is aggregated over all eight ranks;
 memory is the maximum PyTorch allocation across ranks.

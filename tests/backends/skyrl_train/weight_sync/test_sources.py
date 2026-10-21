@@ -105,6 +105,62 @@ class TestFsdpWeightSource:
 
 
 class TestFsdpLoraWeightSource:
+    @pytest.mark.parametrize(
+        "targets",
+        [
+            ["mlp.key", "mlp.value"],
+            ["r_proj", "k_proj", "v_proj", "o_proj", "mlp.key", "mlp.value", "lm_head"],
+        ],
+    )
+    def test_rwkv_channel_mixing_adapters_are_merged_for_sync_and_export(self, targets):
+        from peft import LoraConfig, get_peft_model
+        from transformers import RwkvConfig, RwkvForCausalLM
+
+        from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
+            iter_merged_lora_weights,
+        )
+
+        if "use_nora" not in LoraConfig.__dataclass_fields__:
+            pytest.skip("requires Joluck/NoRA")
+        base = RwkvForCausalLM(
+            RwkvConfig(
+                vocab_size=32,
+                hidden_size=64,
+                intermediate_size=256,
+                num_hidden_layers=1,
+                num_attention_heads=1,
+                decay_low_rank_dim=64,
+                a_low_rank_dim=64,
+                gate_low_rank_dim=64,
+                v_low_rank_dim=64,
+            )
+        ).to(torch.bfloat16)
+        model = get_peft_model(base, LoraConfig(r=8, lora_alpha=8, target_modules=targets, use_nora=True))
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if "lora_B" in name:
+                    parameter.fill_(0.001)
+        before = {name: value.clone() for name, value in model.state_dict().items()}
+        source = FsdpLoraWeightSource(model, torch.float16)
+        _, pairs = _assert_channels_agree(source)
+        streamed = dict(pairs)
+        exported = {name: weight.half() for name, weight in iter_merged_lora_weights(model, model.state_dict())}
+        assert streamed.keys() == exported.keys()
+        assert not any("lora_" in name or "base_layer" in name for name in streamed)
+        for name, weight in streamed.items():
+            torch.testing.assert_close(weight, exported[name], rtol=0, atol=0)
+        for projection in ("key", "value"):
+            layer = getattr(model.get_base_model().model.layers[0].mlp, projection)
+            weight_a = layer.lora_A["default"].weight.float()
+            expected = layer.base_layer.weight.float() + layer.scaling["default"] * (
+                layer.lora_B["default"].weight.float() @ (weight_a / (weight_a.norm(dim=0, keepdim=True) + 1e-6))
+            )
+            name = f"model.layers.0.mlp.{projection}.weight"
+            torch.testing.assert_close(streamed[name], expected.half(), rtol=0, atol=0)
+            assert not torch.equal(streamed[name], layer.base_layer.weight.half())
+        for name, value in model.state_dict().items():
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
     def _model(self):
         from peft import LoraConfig, get_peft_model
 

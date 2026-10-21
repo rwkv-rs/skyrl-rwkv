@@ -780,6 +780,22 @@ response_mask[:, 1:]
 
 验证：RWKV 相关测试分组运行 **69 passed**（数据/预训练 40、model wrapper 29），含采集→builder→训练数据契约、CLI、resume 去重和真实 RWKV HF checkpoint 的 BF16 / value-head 往返。GPU 训练验收尚未完成：本机最小 CUDA 内存查询就触发 OOM；没有据此宣称真实模型训练、收敛或多 GPU FSDP 已通过。数据构建链路已补齐：`examples/train/rwkv/rollout.py --sampling rollout --save-rollouts` 保存全部已评分的精确 token 轨迹；`examples/train/rwkv/build_value_data.py` 流式生成 `train.jsonl`、`validation.jsonl` 和 provenance manifest，按 question UUID 固定分组，不重分词、不做正负样本重平衡。完整 token IDs 按 question 暂存到磁盘，评分后先原子发布 shard，再记录 completed question；resume 不重复追加同一 question。默认剔除空响应、超长样本和没有显式 bootstrap returns 的截断样本，并记录计数，因此 MC 数据目标是满足完成/长度条件的轨迹分布。
 
+### 9.14 RWKV critic 配方审计与 Channel-mixing 修正
+
+2026-10-21，重新对照原论文 §2、§3.2、§4.1、§4.3，以及固定版本的 `miles-values` 和 Fireworks experimental cookbook。两份代码是参考实现，不能视为论文作者公开的完整原始训练配方。
+
+已确认的偏离与证据：
+
+- **可训练模块。** 论文冻结 attention、训练 MoE projections；此前 RWKV critic 的 NoRA 仅选择 `r_proj/k_proj/v_proj/o_proj`，均位于 Time-mixing。现有 Transformers 的 `RwkvFeedForward` 已向 FlashRWKV2 传递 Channel-mixing `mlp.key/mlp.value` 的 A/B 参数及 `use_nora`，并非缺少接口。离线 value 入口和在线示例现改为 Channel-mixing adapters + 全量 FP32 value head；冻结 Time-mixing 是 RWKV 迁移假设，不是论文已证明的 RWKV 结论。OPD 训练 policy，默认包含 Time-mixing、Channel-mixing 与 `lm_head`，不套用 critic 的冻结策略。
+- **原训练数据。** 远端 `rwkv-g1l-1b-temp-6331-sao/value-data/manifest.json` 记录每域正误 1:1、训练 5742 条中 2871 条正例，并剔除 14815 条截断轨迹；采样采用 eval 的 top-p/top-k/penalty，另混入数学 benchmark，部分预算为 24576。在线数据采用 temperature 1、top-p 1、top-k -1、无 penalty、8192 预算。未经采样权重修正，平衡后的回归不估计自然策略分布下的 value。多策略预训练本身可以作为 warm start，但不能据此宣称已对当前 actor 校准。后续 `critic-calibration/value-data` 已改用固定 actor 的自然 rollout，保留预算截断为失败。
+- **两次更新不等于两遍训练。** 原运行 `train_batch_size=128`、`policy_mini_batch_size=128`、`critic_mini_batch_size=64`，共用 `update_epochs_per_batch=1`。Critic 做两次半批更新，每条数据仅使用一次。论文 §4.3 将 K=2 对照明确写为 `critic-train-epoch=2`；`miles-values` 的 `train_critic()` 也用独立 `num_critic_epochs` 重建同批 iterator。最小协议修正应为 critic 独立两遍完整 batch，actor 一遍，并相应计算 critic scheduler 的步数。
+- **更新后 value 的使用。** SkyRL 当前先计算 GAE，再并行更新 critic/actor。Fireworks 的 `sao_config()` 使用两次完整 critic 更新，再刷新 value 计算 actor advantages；但该版本 `miles-values` 传给 actor 的仍是更新前 value。两份参考实现确有差异，不能把刷新策略说成已定位的统一实现 bug。若采用论文描述与 Fireworks 的顺序，应显式选择 post-update value，保留最初的 PPO value anchors/critic targets，且不与 actor 更新并行。
+- **目标与 reduction。** 论文使用平方 value error；`miles-values` 的 MSE head 输出 raw scalar，在线用 clipped MSE，默认 reduction 为逐序列有效 token 平均。ReDiPPO 的 sigmoid + MSE、后续 sigmoid/BCE/L2 读取器、全骨干冻结和校准扫描均是额外选择。固定 `8192` 分母改变了训练权重，应视为独立算法选择，不能称为复现参考实现必需的修复。
+
+原论文没有公开完整的离线 value 数据比例、平衡/截断规则及全部优化细节，因此这些部分只能区分已证实的数据契约问题和迁移假设，不能补写成作者配置。原崩溃前的数据重加权、Time-mixing-only 适配和更新协议偏离，与后续修复过程中加入的 sigmoid/读取器试验也应分别归因。模块选择已修正；更新顺序、独立 critic epochs 和自然分布预训练构成后续最小方案，在确认方案前不启动采样或训练实验。
+
+参考定位：[原论文](https://arxiv.org/html/2607.07508v1#S3.SS2)、[critic 更新循环](https://github.com/yyht/miles-values/blob/51b84b7f14436e056ce64b665adeb5957c5433ca/miles/backends/megatron_utils/actor.py#L466-L523)、[raw value 转换](https://github.com/yyht/miles-values/blob/51b84b7f14436e056ce64b665adeb5957c5433ca/miles/backends/training_utils/loss_hub/logit_processors.py#L17-L25)、[序列 reduction](https://github.com/yyht/miles-values/blob/51b84b7f14436e056ce64b665adeb5957c5433ca/miles/backends/training_utils/cp_utils.py#L92-L155)、[Fireworks SAO 更新顺序](https://github.com/fw-ai/cookbook/blob/a55b26e7c4f3da481a3c9305dd24f42450e5dee2/training/recipes/experiment/ppo_value_head_loop.py#L946-L1002)。
+
 ## 10. 对 SkyRL / RWKV 的启发（迁移判断，不是已实现结论）
 
 1. **先确保数据契约。** rollout 持久保存生成时的 token logprobs；trainer 使用同一 tokens、完整工具上下文及 loss masks。跨版本轨迹不能用某个统一 old checkpoint 冒充逐 token behavior policy。

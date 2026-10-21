@@ -480,6 +480,51 @@ def test_critic_preserves_rwkv_padding_config(is_rwkv):
     assert worker.model.config.pad_token_id == (None if is_rwkv else 0)
 
 
+@pytest.mark.parametrize("resume_path", [None, "/value/step_64"])
+def test_critic_warm_start_keeps_fresh_optimizer_and_scheduler(monkeypatch, resume_path):
+    from unittest.mock import MagicMock
+
+    from skyrl.backends.skyrl_train.workers.fsdp import fsdp_worker as module
+    from skyrl.train.config import SkyRLTrainConfig
+
+    cfg = SkyRLTrainConfig().trainer
+    cfg.gradient_checkpointing = False
+    cfg.critic.resume_path = resume_path
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1)
+    strategy = MagicMock()
+    strategy.prepare.return_value = (model, optimizer, scheduler)
+    strategy.load_checkpoint.return_value = (resume_path, {"client_state": {"global_step": 64}})
+    monkeypatch.setattr(module, "FSDPStrategy", lambda **kwargs: strategy)
+    monkeypatch.setattr(
+        module.AutoConfig, "from_pretrained", lambda *args, **kwargs: SimpleNamespace(tie_word_embeddings=False)
+    )
+    monkeypatch.setattr(module, "should_use_meta_init", lambda **kwargs: False)
+    monkeypatch.setattr(module, "get_llm_for_sequence_regression", lambda *args, **kwargs: model)
+    worker = object.__new__(FSDPCriticWorkerBase)
+    worker.cfg = cfg
+    worker._seq_parallel_monkey_patch = MagicMock()
+    worker._set_expandable_segments = MagicMock()
+    worker.init_model("base-checkpoint")
+
+    if resume_path is None:
+        strategy.load_checkpoint.assert_not_called()
+    else:
+        strategy.load_checkpoint.assert_called_once_with(
+            model=model,
+            optimizer=None,
+            scheduler=None,
+            ckpt_dir=resume_path,
+            load_optimizer_states=False,
+            load_lr_scheduler_states=False,
+        )
+    assert worker.optimizer is optimizer
+    assert worker.scheduler is scheduler
+    assert optimizer.param_groups[0]["lr"] == 0
+    assert not optimizer.state
+
+
 def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):
     config = SimpleNamespace(
         model_type="rwkv",

@@ -30,6 +30,14 @@ prediction, so a low loss on mostly negative outcomes does not imply a useful cr
 It also reports first-action calibration and per-domain statistics when the dataset
 contains `domain`, exposing biases that an aggregate score can hide.
 
+For a pretrained NoRA critic, set `trainer.critic.model.path` to its original base
+model, preserve the same NoRA configuration, and set `trainer.critic.resume_path`
+to the offline `step_N` directory. This loads the native weights through the
+existing FSDP checkpoint loader while retaining the newly configured optimizer
+and scheduler. It preserves the adapter computation used during validation;
+merging adapters into BF16 backbone weights can change value predictions.
+A full trainer resume subsequently restores the critic from that training run.
+
 Online SAO uses the native `gae_adaptive` estimator with `rollout_is` loss. It skips
 observation positions using `response_mask & loss_mask`, uses action-length-adaptive
 policy lambda (`gae_adaptive.alpha=1.5`, lambda one below `gae_adaptive.min_length=50`), and separate critic lambda

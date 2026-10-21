@@ -153,6 +153,7 @@ def build_data(
     *,
     additional_inputs=(),
     balance_rewards=False,
+    truncation_as_terminal=False,
 ):
     """Stream complete scored shards into atomically published train/validation files."""
     inputs = [input_dir, *additional_inputs]
@@ -179,9 +180,9 @@ def build_data(
                     for line in source:
                         row = orjson.loads(line)
                         counts["read_rollouts"] += 1
-                        # A time-limit truncation is not a terminal MC target.
-                        # Keep it only when explicit bootstrapped returns exist.
-                        if row["truncated"] and row.get("returns") is None:
+                        # A time limit needs supplied returns unless the task
+                        # defines its generation budget as terminal failure.
+                        if row["truncated"] and row.get("returns") is None and not truncation_as_terminal:
                             counts["skipped_truncated"] += 1
                             continue
                         prompt, response = row["prompt_ids"], row["response_ids"]
@@ -205,11 +206,15 @@ def build_data(
                         }
                         if row.get("returns") is not None:
                             record["returns"] = row["returns"]
+                        if row["truncated"] and truncation_as_terminal:
+                            record["reward"] = 0.0
+                            record["returns"] = [0.0] * len(record["input_ids"])
+                            counts["truncated_terminal_failures"] += 1
                         ValueDataset._normalize_row(record)
                         split = question_split(row["uuid"], seed, validation_fraction)
                         files[split].write(orjson.dumps(record, option=orjson.OPT_APPEND_NEWLINE))
                         counts[f"{split}_rollouts"] += 1
-                        counts[f"{split}_positive_rewards"] += row["reward"] > 0
+                        counts[f"{split}_positive_rewards"] += record["reward"] > 0
                         counts[f"{split}_action_tokens"] += sum(response_mask)
                         questions[split].add(row["uuid"])
         for split in questions:
@@ -241,6 +246,8 @@ def build_data(
         if balance_rewards:
             manifest["balance_rewards"] = "1:1 within each split and domain, downsampling without replacement"
             manifest["domains"] = domains
+        if truncation_as_terminal:
+            manifest["truncation_as_terminal"] = True
         (staging / "manifest.json").write_bytes(orjson.dumps(manifest, option=orjson.OPT_INDENT_2))
         staging.replace(output_dir)
     print(orjson.dumps(manifest, option=orjson.OPT_INDENT_2).decode())
@@ -255,6 +262,11 @@ def main():
     )
     parser.add_argument(
         "--balance-rewards", action="store_true", help="Keep equal 0/1 outcomes within each split and domain"
+    )
+    parser.add_argument(
+        "--truncation-as-terminal",
+        action="store_true",
+        help="Treat generation-budget truncations as terminal failures with explicit zero returns",
     )
     parser.add_argument(
         "--benchmark-prompts", type=Path, help="Score Antidoom collector output against exported native gold answers"
@@ -284,6 +296,7 @@ def main():
         args.max_length,
         additional_inputs=args.additional_input,
         balance_rewards=args.balance_rewards,
+        truncation_as_terminal=args.truncation_as_terminal,
     )
 
 

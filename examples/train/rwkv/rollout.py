@@ -483,15 +483,22 @@ async def run(args):
                         response.raise_for_status()
                         choice = (await response.json())["choices"][0]
                     ids = choice.get("token_ids") or []
+                    decoded = tokenizer.decode(ids, skip_special_tokens=True)
                     reward, details = compute_strict_score(
-                        tokenizer.decode(ids, skip_special_tokens=True),
+                        decoded,
                         "4",
                         ended_eod=bool(ids and ids[-1] == tokenizer.eos_token_id),
                         truncated=choice.get("finish_reason") in {"length", "max_tokens"},
                     )
-                    if reward != 1.0:
+                    # Incorrect or malformed answers are valid policy samples.
+                    # Check the token/EOS contract independently of answer quality.
+                    if not ids or (choice.get("finish_reason") == "stop" and not details["ended_eod"]):
                         raise RuntimeError(f"Engine acceptance failed: {url}: {details}")
-                    print(f"Engine acceptance passed: {url}, tokens={len(ids)}, EOS={ids[-1]}", flush=True)
+                    print(
+                        f"Engine acceptance passed: {url}, tokens={len(ids)}, "
+                        f"probe_reward={reward}, response={decoded!r}",
+                        flush=True,
+                    )
 
                 await asyncio.gather(*(validate(url) for url in urls))
             config["engine_validation"] = "passed"

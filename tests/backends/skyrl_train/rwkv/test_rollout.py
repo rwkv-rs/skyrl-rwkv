@@ -641,6 +641,28 @@ def test_native_benchmark_value_scoring_preserves_tokens_and_checks_provenance(t
         build_value_data.score_benchmarks(raw, prompts, tmp_path / "mismatched", tmp_path)
 
 
+def test_build_value_data_can_keep_budget_truncations_as_terminal_failures(tmp_path, token_rollout_run):
+    output = tmp_path / "bounded-value-data"
+    manifest = build_value_data.build_data(
+        token_rollout_run, output, validation_fraction=0.5, max_length=8, truncation_as_terminal=True
+    )
+    assert manifest["truncation_as_terminal"]
+    assert manifest["counts"]["truncated_terminal_failures"] == 40
+    rows = [
+        json.loads(line)
+        for split in ("train", "validation")
+        for line in (output / f"{split}.jsonl").read_text().splitlines()
+    ]
+    assert len(rows) == 80
+    assert sum(row["reward"] for row in rows) == 20
+    for row in rows:
+        if row["truncated"]:
+            assert row["reward"] == 0
+            assert row["returns"] == [0.0] * len(row["input_ids"])
+            assert row["input_ids"][-2:] in ([15, 16], [18, 0])
+            assert row["loss_mask"] == [0, 0, 1, 1]
+
+
 def test_build_value_data_preserves_tokens_masks_outcomes_and_uuid_split(tmp_path, token_rollout_run):
     import torch
 
@@ -831,7 +853,8 @@ def test_partial_startup_failure_cleans_only_owned_process_groups(tmp_path, toke
 
 
 @pytest.mark.parametrize("valid_eos", [True, False])
-def test_owned_engine_acceptance_precedes_dataset_generation(tmp_path, tokenizer, monkeypatch, valid_eos):
+@pytest.mark.parametrize("probe_text", [r">reasoning </think> \boxed{4}", r"\boxed{5}"])
+def test_owned_engine_acceptance_precedes_dataset_generation(tmp_path, tokenizer, monkeypatch, valid_eos, probe_text):
     from aiohttp import web
 
     dataset_row(tmp_path, "Knowledge", "Knowledge_1", "q", "4")
@@ -849,7 +872,7 @@ def test_owned_engine_acceptance_precedes_dataset_generation(tmp_path, tokenizer
         async def complete(request):
             payload = await request.json()
             requests.append(payload)
-            text = r">reasoning </think> \boxed{4}"
+            text = probe_text if len(requests) == 1 else r">reasoning </think> \boxed{4}"
             ids = list(text.encode()) + [0 if valid_eos else 1]
             return web.json_response({"choices": [{"token_ids": ids, "finish_reason": "stop"}]})
 

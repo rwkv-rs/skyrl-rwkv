@@ -378,6 +378,26 @@ def test_value_loss_is_global_token_normalized_across_microbatches():
     torch.testing.assert_close(full_gradient, split_gradient)
 
 
+def test_sequence_value_loss_matches_online_critic_across_microbatches():
+    from skyrl.backends.skyrl_train.utils.ppo_utils import ppo_critic_loss
+    from skyrl.train.config import AlgorithmConfig
+
+    parameter = torch.tensor(0.3, requires_grad=True)
+    labels = torch.tensor([[1.0, 1.0, 1.0], [0.0, 0.0, 0.0]])
+    mask = torch.tensor([[False, False, True], [True, True, True]])
+    predictions = parameter.expand_as(labels)
+    native_loss, _ = ppo_critic_loss(predictions, predictions.detach(), labels, AlgorithmConfig(value_clip=None), mask)
+    native_gradient = torch.autograd.grad(native_loss, parameter)[0]
+    error, count = value_loss(predictions, labels, mask, "sequence_mean")
+    assert count == 2
+    torch.testing.assert_close(0.5 * error / count, native_loss)
+    split_error = sum(
+        value_loss(parameter.expand_as(row), row, row_mask, "sequence_mean")[0] for row, row_mask in zip(labels, mask)
+    )
+    split_gradient = torch.autograd.grad(0.5 * split_error / count, parameter)[0]
+    torch.testing.assert_close(split_gradient, native_gradient)
+
+
 def test_evaluate_distributed_tail_metrics_use_each_trajectory_once(monkeypatch):
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
     reductions = []
@@ -407,6 +427,12 @@ def test_evaluate_distributed_tail_metrics_use_each_trajectory_once(monkeypatch)
     assert metrics["eval/token_mse"] == 0.5
     assert metrics["eval/sequence_mse"] == pytest.approx(1 / 3)
     assert metrics["eval/explained_variance"] == 0.0
+    assert metrics["eval/token_constant_mse"] == 0.25
+    assert metrics["eval/token_mse_skill"] == -1.0
+    assert metrics["eval/sequence_constant_mse"] == pytest.approx(2 / 9)
+    assert metrics["eval/sequence_mse_skill"] == pytest.approx(-0.5)
+    assert metrics["eval/sequence_target_mean"] == pytest.approx(1 / 3)
+    assert metrics["eval/sequence_value_mean"] == 0.0
 
 
 def test_evaluate_excludes_dummy_tail_rows_and_preserves_training_mode(monkeypatch):

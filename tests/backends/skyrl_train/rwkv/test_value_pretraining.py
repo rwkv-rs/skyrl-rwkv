@@ -452,3 +452,29 @@ def test_evaluate_excludes_dummy_tail_rows_and_preserves_training_mode(monkeypat
     assert metrics["eval/sequence_mse"] == pytest.approx(1 / 3)
     assert metrics["eval/explained_variance"] == 0.0
     assert model.training
+
+
+def test_evaluate_reports_domain_and_initial_action_calibration(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 1)
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda _: None)
+    model = make_critic()
+    with torch.no_grad():
+        model.value_head.weight.zero_()
+    dataset = [
+        {"input_ids": [1, 2, 3, 4], "loss_mask": [0, 0, 1, 1], "returns": [0, 0, 1, 1]},
+        {"input_ids": [4, 5], "loss_mask": [0, 1], "returns": [0, 0]},
+        {"input_ids": [6, 7], "loss_mask": [0, 1], "returns": [0, 0]},
+    ]
+    metrics = evaluate(
+        model, dataset, RewardDataCollator(0), batch_size=2, device="cpu", domains=["Math", "Math", "Code"]
+    )
+    assert metrics["eval/sequences"] == 3
+    assert metrics["eval/Math/sequences"] == 2
+    assert metrics["eval/Code/sequences"] == 1
+    assert metrics["eval/Math/sequence_mse_skill"] == -1
+    assert metrics["eval/Math/initial_target_mean"] == 0.5
+    assert metrics["eval/Math/initial_value_mean"] == 0
+    assert metrics["eval/Math/initial_mse_skill"] == -1
+    assert metrics["eval/initial_mse"] == pytest.approx(1 / 3)
+    assert metrics["eval/Code/token_mse"] == 0

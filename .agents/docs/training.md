@@ -27,6 +27,8 @@ match the online critic objective across accumulated microbatches, and
 `--eval-before-train` to measure the initialization on the same held-out questions.
 Validation reports token/sequence MSE and MSE skill relative to the optimal constant
 prediction, so a low loss on mostly negative outcomes does not imply a useful critic.
+It also reports first-action calibration and per-domain statistics when the dataset
+contains `domain`, exposing biases that an aggregate score can hide.
 
 Online SAO uses the native `gae_adaptive` estimator with `rollout_is` loss. It skips
 observation positions using `response_mask & loss_mask`, uses action-length-adaptive

@@ -845,6 +845,8 @@ class GAEAdaptiveConfig(BaseConfig):
     """Use ``"adaptive"`` policy lambda or ``"fixed"`` with ``algorithm.lambd``."""
     alpha: float = 1.5
     """Compute policy lambda as ``max(0, 1 - 1 / (alpha * action_length))``."""
+    min_length: int = 50
+    """Use policy lambda one below this action length, matching the SAO reference."""
     critic_lambd: float = 1.0
     """Lambda for critic return targets, independent of policy lambda."""
 
@@ -853,6 +855,8 @@ class GAEAdaptiveConfig(BaseConfig):
             raise ValueError("gae_adaptive.mode must be 'adaptive' or 'fixed'")
         if not math.isfinite(self.alpha) or self.alpha <= 0:
             raise ValueError("gae_adaptive.alpha must be finite and positive")
+        if self.min_length < 0:
+            raise ValueError("gae_adaptive.min_length must be non-negative")
         if not 0 <= self.critic_lambd <= 1:
             raise ValueError("gae_adaptive.critic_lambd must be between zero and one")
 
@@ -1643,6 +1647,11 @@ class TrainerConfig(BaseConfig):
     Accepts a local directory path or a cloud storage path (S3, GCS)."""
     max_ckpts_to_keep: int = -1
     """``-1`` to keep all checkpoints, ``N`` to keep only the last N."""
+    metric_for_best_model: Optional[str] = None
+    """Evaluation metric used to save and retain the best full checkpoint and HF export.
+    ``None`` disables best-checkpoint tracking. The best is retained in addition to recent checkpoints."""
+    greater_is_better: bool = True
+    """Whether larger values of ``metric_for_best_model`` indicate a better checkpoint."""
     ckpt_interval: int = 10
     """Save a full training checkpoint every N steps."""
     hf_save_interval: int = -1

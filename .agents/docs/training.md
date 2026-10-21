@@ -20,7 +20,7 @@ conversation multi-turn token preservation. Online FSDP critics accept
 
 Online SAO uses the native `gae_adaptive` estimator with `rollout_is` loss. It skips
 observation positions using `response_mask & loss_mask`, uses action-length-adaptive
-policy lambda (`gae_adaptive.alpha=1.5`), and separate critic lambda
+policy lambda (`gae_adaptive.alpha=1.5`, lambda one below `gae_adaptive.min_length=50`), and separate critic lambda
 (`gae_adaptive.critic_lambd=1`). Optional `rollout_is.score_centering=true` reuses
 FSDP sampler-support capture and centers the complete DIS-weighted score. Its raw
 support capture requires temperature 1, top-p 1, top-k -1 and no penalties. See the
@@ -39,6 +39,20 @@ sample order. Offline benchmark generation can opt into CUDA graphs with
 Full-sequence RWKV training right-pads internal recurrent inputs to a multiple
 of 16, retaining the native Pretrain kernel instead of the ragged StateTune
 path. Output positions and loss masks retain their original lengths.
+
+SAO logs unscaled critic token/sequence MSE, prediction/target means, residual bias,
+and explained variance when targets vary. These diagnose calibration separately
+from the microbatch-scaled optimization loss. Budget-truncated UltraData answers
+receive zero terminal reward; `generator.apply_overlong_filtering=true` excludes
+them from actor and critic losses for a controlled ablation. Sampled EOS remains
+an action even when its ID equals the padding ID; synthetic EOS stays masked.
+
+Set `trainer.metric_for_best_model=eval/all/avg_score` to save full training state
+and an HF export whenever evaluation improves. `trainer.greater_is_better` defaults
+to true. `best_checkpoint.json` identifies the retained checkpoint; retention keeps
+it in addition to the last `max_ckpts_to_keep` checkpoints, and resume restores
+its score/step. If `export_path` equals `ckpt_path`, HF exports use each model's
+`huggingface/` subdirectory so atomic export cannot overwrite optimizer/RNG state.
 
 ## Running Training
 

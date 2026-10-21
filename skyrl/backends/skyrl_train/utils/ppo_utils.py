@@ -1688,6 +1688,7 @@ def compute_gae_adaptive_advantage_return(
         gae_config = config.gae_adaptive
         if gae_config.mode == "adaptive":
             policy_lambd = (1 - 1 / (gae_config.alpha * lengths)).clamp_min(0)
+            policy_lambd = torch.where(lengths < max(gae_config.min_length, 2), 1.0, policy_lambd)
         else:
             policy_lambd = torch.full_like(lengths, lambd)
         trace_lambdas = torch.stack([policy_lambd, torch.full_like(lengths, gae_config.critic_lambd)])

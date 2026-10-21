@@ -48,6 +48,13 @@ arbitrary return ranges. With a native checkpoint, pass the same calibration in
 Offline `main_value.py --model-config-kwargs '<JSON object>' --resume-path <step_N>`
 supports controlled continuation with fresh optimizer/scheduler state.
 
+For a head-only critic control, use `main_value.py --freeze-backbone` offline or
+`trainer.critic.freeze_backbone=true` online. This freezes the loaded backbone
+and its NoRA/LoRA adapters while training the full FP32 value head. It preserves
+the unmerged adapter computation and does not enable input gradients through
+the frozen backbone. Keep the same native initialization and value calibration
+when comparing it with joint backbone/head training.
+
 Online SAO uses the native `gae_adaptive` estimator with `rollout_is` loss. It skips
 observation positions using `response_mask & loss_mask`, uses action-length-adaptive
 policy lambda (`gae_adaptive.alpha=1.5`, lambda one below `gae_adaptive.min_length=50`), and separate critic lambda

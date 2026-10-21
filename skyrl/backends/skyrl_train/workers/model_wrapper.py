@@ -863,6 +863,7 @@ def _get_critic_model(
             self.sequence_parallel_size = sequence_parallel_size
             self.remove_microbatch_padding = remove_microbatch_padding
             self.is_rwkv = config.model_type == "rwkv"
+            self.freeze_backbone = False
             if self.is_rwkv:
                 if remove_microbatch_padding:
                     raise ValueError("RWKV does not support remove_microbatch_padding=true")
@@ -891,7 +892,8 @@ def _get_critic_model(
             for index, length in enumerate(lengths.tolist()):
                 recurrent_ids[index, :length] = input_ids[index, attention_mask[index].bool()]
             with torch.autocast(device_type=input_ids.device.type, enabled=False):
-                outputs = getattr(self, self.base_model_prefix)(recurrent_ids, use_cache=False)
+                with torch.set_grad_enabled(torch.is_grad_enabled() and not self.freeze_backbone):
+                    outputs = getattr(self, self.base_model_prefix)(recurrent_ids, use_cache=False)
                 hidden_states = outputs["last_hidden_state"]
                 value_head = getattr(self, self.value_head_prefix)
                 recurrent_values = value_head(hidden_states.to(value_head.weight.dtype)).squeeze(-1)
@@ -957,12 +959,13 @@ def _get_critic_model(
                     input_ids_fwd, position_ids_fwd, attention_mask_fwd, self.sequence_parallel_size
                 )
 
-            if self.sequence_parallel_size > 1 and self.config._attn_implementation == "flash_attention_2":
-                outputs = getattr(self, self.base_model_prefix)(input_ids_fwd, position_ids=position_ids_fwd)
-            else:
-                outputs = getattr(self, self.base_model_prefix)(
-                    input_ids_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd
-                )
+            with torch.set_grad_enabled(torch.is_grad_enabled() and not self.freeze_backbone):
+                if self.sequence_parallel_size > 1 and self.config._attn_implementation == "flash_attention_2":
+                    outputs = getattr(self, self.base_model_prefix)(input_ids_fwd, position_ids=position_ids_fwd)
+                else:
+                    outputs = getattr(self, self.base_model_prefix)(
+                        input_ids_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd
+                    )
             last_hidden_states_BSH = outputs["last_hidden_state"]
 
             if self.sequence_parallel_size > 1:
@@ -1017,6 +1020,7 @@ def get_llm_for_sequence_regression(
     exclude_modules=None,
     lora_dropout=0,
     use_nora=False,
+    freeze_backbone=False,
     use_flash_attention_2=False,
     init_value_head: bool = False,
     value_head_prefix="value_head",
@@ -1098,10 +1102,14 @@ def get_llm_for_sequence_regression(
             **kwargs,
         )
 
+    model.freeze_backbone = freeze_backbone
+    backbone = getattr(model, model.base_model_prefix)
+
     # LoRA
     if lora_rank > 0:
-        model.enable_input_require_grads()
-        if use_nora:
+        if not freeze_backbone:
+            model.enable_input_require_grads()
+        if use_nora or freeze_backbone:
             getattr(model, value_head_prefix).float()
         lora_config = LoraConfig(
             r=lora_rank,
@@ -1110,7 +1118,8 @@ def get_llm_for_sequence_regression(
             exclude_modules=exclude_modules,
             lora_dropout=lora_dropout,
             bias="none",
-            **({"use_nora": True, "modules_to_save": [value_head_prefix]} if use_nora else {}),
+            **({"modules_to_save": [value_head_prefix]} if use_nora or freeze_backbone else {}),
+            **({"use_nora": True} if use_nora else {}),
         )
         model = get_peft_model(model, lora_config)
         if use_nora:
@@ -1125,6 +1134,12 @@ def get_llm_for_sequence_regression(
                 if value_head_prefix in name or "embed_tokens" in name:
                     if hasattr(module, "weight"):
                         module = module.to(torch.bfloat16)
+
+    if freeze_backbone:
+        backbone.requires_grad_(False)
+        critic = model.get_base_model() if lora_rank > 0 else model
+        value_head = getattr(critic, value_head_prefix).float()
+        value_head.weight.requires_grad_(True)
 
     # MoE - balancing loss
     model_config = model.config.to_dict()

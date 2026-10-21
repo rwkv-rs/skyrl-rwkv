@@ -200,6 +200,7 @@ def train(args):
             lora_dropout=lora_config.dropout,
             target_modules=lora_config.target_modules,
             use_nora=lora_config.use_nora,
+            freeze_backbone=args.freeze_backbone,
             model_config_kwargs=args.model_config_kwargs,
         )
         if model.config.model_type != "rwkv":
@@ -207,7 +208,7 @@ def train(args):
         trainable_parameters = sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
         total_parameters = sum(parameter.numel() for parameter in model.parameters())
         logger.info(f"Trainable parameters: {trainable_parameters:,} / {total_parameters:,}")
-        if args.gradient_checkpointing:
+        if args.gradient_checkpointing and not args.freeze_backbone:
             model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
         model, optimizer, scheduler = strategy.prepare((model, None, None))
         if args.resume_path is not None:
@@ -349,6 +350,11 @@ def main(argv=None):
         "--group-by-length", action="store_true", help="Group similar lengths across data-parallel ranks"
     )
     parser.add_argument("--use-nora", action="store_true", help="Train NoRA backbone adapters and the full value head")
+    parser.add_argument(
+        "--freeze-backbone",
+        action="store_true",
+        help="Keep loaded backbone/adapters fixed and train only the full value head",
+    )
     parser.add_argument("--rank", type=int, default=8, help="NoRA rank; sweep 8, 16, 32, 64, ...")
     parser.add_argument("--lora-alpha", type=int, default=None, help="NoRA alpha; defaults to rank")
     parser.add_argument("--target-modules", nargs="+", default=["r_proj", "k_proj", "v_proj", "o_proj"])

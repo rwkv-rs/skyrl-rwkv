@@ -18,6 +18,16 @@ Math `open_think` and other domains `fake_think`; use unbatched generation with
 conversation multi-turn token preservation. Online FSDP critics accept
 `trainer.critic.model.lora.use_nora=true`, training adapters and the full head.
 
+Calibrate a critic against a fixed policy with the same `--sampling rollout`
+distribution and generation budget used online. Preserve the observed outcome
+frequencies. For tasks that count budget exhaustion as failure, pass
+`build_value_data.py --truncation-as-terminal` to retain these trajectories with
+explicit zero returns. Use `main_value.py --loss-reduction sequence_mean` to
+match the online critic objective across accumulated microbatches, and
+`--eval-before-train` to measure the initialization on the same held-out questions.
+Validation reports token/sequence MSE and MSE skill relative to the optimal constant
+prediction, so a low loss on mostly negative outcomes does not imply a useful critic.
+
 Online SAO uses the native `gae_adaptive` estimator with `rollout_is` loss. It skips
 observation positions using `response_mask & loss_mask`, uses action-length-adaptive
 policy lambda (`gae_adaptive.alpha=1.5`, lambda one below `gae_adaptive.min_length=50`), and separate critic lambda

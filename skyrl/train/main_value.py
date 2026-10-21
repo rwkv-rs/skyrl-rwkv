@@ -45,7 +45,7 @@ def critic_forward(model, batch, device):
 def evaluate(model, dataset, collator, batch_size, device):
     """Exact held-out metrics; dummy tail rows keep FSDP collective counts equal."""
     model.eval()
-    stats = torch.zeros(8, dtype=torch.float64, device=device)
+    stats = torch.zeros(11, dtype=torch.float64, device=device)
     rank, world_size = dist.get_rank(), dist.get_world_size()
     for start in range(0, len(dataset), world_size * batch_size):
         indices = [start + rank * batch_size + index for index in range(batch_size)]
@@ -69,11 +69,27 @@ def evaluate(model, dataset, collator, batch_size, device):
                 sequence_mse.masked_select(counts > 0).sum(),
                 (counts > 0).sum(),
                 predictions.double().masked_select(mask).sum(),
+                (labels.double().masked_fill(~mask, 0).sum(-1) / counts.clamp_min(1)).sum(),
+                (labels.double().square().masked_fill(~mask, 0).sum(-1) / counts.clamp_min(1)).sum(),
+                (predictions.double().masked_fill(~mask, 0).sum(-1) / counts.clamp_min(1)).sum(),
             ]
         )
     dist.all_reduce(stats)
-    error, count, target_sum, target_sq, residual_sum, sequence_error, sequences, prediction_sum = stats.tolist()
+    (
+        error,
+        count,
+        target_sum,
+        target_sq,
+        residual_sum,
+        sequence_error,
+        sequences,
+        prediction_sum,
+        sequence_target_sum,
+        sequence_target_sq,
+        sequence_prediction_sum,
+    ) = stats.tolist()
     target_var = target_sq / count - (target_sum / count) ** 2
+    sequence_target_var = sequence_target_sq / sequences - (sequence_target_sum / sequences) ** 2
     residual_var = error / count - (residual_sum / count) ** 2
     model.train()
     return {
@@ -82,6 +98,14 @@ def evaluate(model, dataset, collator, batch_size, device):
         "eval/explained_variance": 1 - residual_var / target_var if target_var > 0 else float("nan"),
         "eval/target_mean": target_sum / count,
         "eval/value_mean": prediction_sum / count,
+        "eval/token_constant_mse": target_var,
+        "eval/token_mse_skill": 1 - error / count / target_var if target_var > 0 else float("nan"),
+        "eval/sequence_constant_mse": sequence_target_var,
+        "eval/sequence_mse_skill": (
+            1 - sequence_error / sequences / sequence_target_var if sequence_target_var > 0 else float("nan")
+        ),
+        "eval/sequence_target_mean": sequence_target_sum / sequences,
+        "eval/sequence_value_mean": sequence_prediction_sum / sequences,
     }
 
 
@@ -190,28 +214,38 @@ def train(args):
             dist.barrier()
 
         step = 0
+        if args.eval_before_train:
+            metrics = {}
+            validate_and_save(step, metrics)
+            if dist.get_rank() == 0:
+                logger.info(f"step={step} {metrics}")
+                if run is not None:
+                    run.log(metrics, step=step)
         for epoch in range(args.epochs):
             sampler.set_epoch(epoch)
             iterator = iter(loader)
             while batches := list(islice(iterator, args.gradient_accumulation_steps)):
                 started = time.perf_counter()
-                # FSDP averages rank gradients. Normalize over all action tokens
-                # in the entire accumulation window, not each microbatch/rank.
+                # FSDP averages rank gradients. Normalize over the entire
+                # accumulation window, not each microbatch/rank.
                 counts = torch.tensor(
                     [
                         sum(int(batch["response_mask"].sum()) for batch in batches),
                         sum(int(batch["attention_mask"].sum()) for batch in batches),
                         sum(batch["input_ids"].numel() for batch in batches),
+                        sum(int(batch["response_mask"].any(-1).sum()) for batch in batches),
                     ],
                     device=device,
                 )
                 dist.all_reduce(counts)
-                count = counts[0]
+                count = counts[3] if args.loss_reduction == "sequence_mean" else counts[0]
                 error_sum = torch.zeros((), device=device)
                 for batch in batches:
                     predictions, labels, mask = critic_forward(model, batch, device)
-                    error, _ = value_loss(predictions, labels, mask)
-                    strategy.backward(error * dist.get_world_size() / count, model, optimizer)
+                    error, _ = value_loss(predictions, labels, mask, args.loss_reduction)
+                    # The online PPO critic minimizes half the sequence-mean MSE.
+                    loss_scale = 0.5 if args.loss_reduction == "sequence_mean" else 1.0
+                    strategy.backward(error * loss_scale * dist.get_world_size() / count, model, optimizer)
                     error_sum += error.detach()
                 grad_norm = strategy.optimizer_step(optimizer, model, scheduler)
                 dist.all_reduce(error_sum)
@@ -219,7 +253,8 @@ def train(args):
                 metrics = {
                     "train/mse": (error_sum / count).item(),
                     "train/epoch": epoch + 1,
-                    "train/action_tokens": count.item(),
+                    "train/action_tokens": counts[0].item(),
+                    "train/sequences": counts[3].item(),
                     "train/lr": scheduler.get_last_lr()[0],
                 }
                 seconds = time.perf_counter() - started
@@ -259,6 +294,8 @@ def main(argv=None):
     parser.add_argument("--gradient-accumulation-steps", type=int, default=4)
     parser.add_argument("--max-length", type=int, default=8192)
     parser.add_argument("--save-steps", type=int, default=50)
+    parser.add_argument("--eval-before-train", action="store_true")
+    parser.add_argument("--loss-reduction", choices=("token_mean", "sequence_mean"), default="token_mean")
     parser.add_argument("--max-ckpts-to-keep", type=int, default=-1, help="Keep the last N checkpoints; -1 keeps all")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--gradient-checkpointing", action="store_true")

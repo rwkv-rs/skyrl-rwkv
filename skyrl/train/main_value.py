@@ -42,10 +42,11 @@ def critic_forward(model, batch, device):
 
 
 @torch.no_grad()
-def evaluate(model, dataset, collator, batch_size, device):
+def evaluate(model, dataset, collator, batch_size, device, domains=None):
     """Exact held-out metrics; dummy tail rows keep FSDP collective counts equal."""
     model.eval()
-    stats = torch.zeros(11, dtype=torch.float64, device=device)
+    groups = [None, *sorted(set(domains))] if domains is not None else [None]
+    stats = torch.zeros((len(groups), 15), dtype=torch.float64, device=device)
     rank, world_size = dist.get_rank(), dist.get_world_size()
     for start in range(0, len(dataset), world_size * batch_size):
         indices = [start + rank * batch_size + index for index in range(batch_size)]
@@ -55,58 +56,91 @@ def evaluate(model, dataset, collator, batch_size, device):
                 batch["response_mask"][row] = False
         predictions, labels, mask = critic_forward(model, batch, device)
         residual = (labels.float() - predictions.float()).double()
-        targets = labels.double().masked_select(mask)
-        errors = residual.square().masked_fill(~mask, 0)
-        counts = mask.sum(-1)
-        sequence_mse = errors.sum(-1) / counts.clamp_min(1)
-        stats += torch.stack(
-            [
-                errors.sum(),
-                mask.sum(),
-                targets.sum(),
-                targets.square().sum(),
-                residual.masked_select(mask).sum(),
-                sequence_mse.masked_select(counts > 0).sum(),
-                (counts > 0).sum(),
-                predictions.double().masked_select(mask).sum(),
-                (labels.double().masked_fill(~mask, 0).sum(-1) / counts.clamp_min(1)).sum(),
-                (labels.double().square().masked_fill(~mask, 0).sum(-1) / counts.clamp_min(1)).sum(),
-                (predictions.double().masked_fill(~mask, 0).sum(-1) / counts.clamp_min(1)).sum(),
-            ]
-        )
+        for group_index, domain in enumerate(groups):
+            group_mask = mask
+            if domain is not None:
+                selected = torch.tensor(
+                    [index < len(dataset) and domains[index] == domain for index in indices], device=device
+                )
+                group_mask = mask & selected.unsqueeze(-1)
+            targets = labels.double().masked_select(group_mask)
+            errors = residual.square().masked_fill(~group_mask, 0)
+            counts = group_mask.sum(-1)
+            valid = counts > 0
+            sequence_mse = errors.sum(-1) / counts.clamp_min(1)
+            first_action = group_mask.long().argmax(-1, keepdim=True)
+            initial_predictions = predictions.double().gather(-1, first_action).squeeze(-1).masked_select(valid)
+            initial_targets = labels.double().gather(-1, first_action).squeeze(-1).masked_select(valid)
+            stats[group_index] += torch.stack(
+                [
+                    errors.sum(),
+                    group_mask.sum(),
+                    targets.sum(),
+                    targets.square().sum(),
+                    residual.masked_select(group_mask).sum(),
+                    sequence_mse.masked_select(valid).sum(),
+                    valid.sum(),
+                    predictions.double().masked_select(group_mask).sum(),
+                    (labels.double().masked_fill(~group_mask, 0).sum(-1) / counts.clamp_min(1)).sum(),
+                    (labels.double().square().masked_fill(~group_mask, 0).sum(-1) / counts.clamp_min(1)).sum(),
+                    (predictions.double().masked_fill(~group_mask, 0).sum(-1) / counts.clamp_min(1)).sum(),
+                    (initial_predictions - initial_targets).square().sum(),
+                    initial_predictions.sum(),
+                    initial_targets.sum(),
+                    initial_targets.square().sum(),
+                ]
+            )
     dist.all_reduce(stats)
-    (
-        error,
-        count,
-        target_sum,
-        target_sq,
-        residual_sum,
-        sequence_error,
-        sequences,
-        prediction_sum,
-        sequence_target_sum,
-        sequence_target_sq,
-        sequence_prediction_sum,
-    ) = stats.tolist()
-    target_var = target_sq / count - (target_sum / count) ** 2
-    sequence_target_var = sequence_target_sq / sequences - (sequence_target_sum / sequences) ** 2
-    residual_var = error / count - (residual_sum / count) ** 2
+    metrics = {}
+    for domain, values in zip(groups, stats.tolist()):
+        (
+            error,
+            count,
+            target_sum,
+            target_sq,
+            residual_sum,
+            sequence_error,
+            sequences,
+            prediction_sum,
+            sequence_target_sum,
+            sequence_target_sq,
+            sequence_prediction_sum,
+            initial_error,
+            initial_prediction_sum,
+            initial_target_sum,
+            initial_target_sq,
+        ) = values
+        target_var = target_sq / count - (target_sum / count) ** 2
+        sequence_target_var = sequence_target_sq / sequences - (sequence_target_sum / sequences) ** 2
+        initial_target_var = initial_target_sq / sequences - (initial_target_sum / sequences) ** 2
+        residual_var = error / count - (residual_sum / count) ** 2
+        prefix = "eval" if domain is None else f"eval/{domain}"
+        metrics.update(
+            {
+                f"{prefix}/token_mse": error / count,
+                f"{prefix}/sequence_mse": sequence_error / sequences,
+                f"{prefix}/explained_variance": 1 - residual_var / target_var if target_var > 0 else float("nan"),
+                f"{prefix}/target_mean": target_sum / count,
+                f"{prefix}/value_mean": prediction_sum / count,
+                f"{prefix}/token_constant_mse": target_var,
+                f"{prefix}/token_mse_skill": 1 - error / count / target_var if target_var > 0 else float("nan"),
+                f"{prefix}/sequence_constant_mse": sequence_target_var,
+                f"{prefix}/sequence_mse_skill": (
+                    1 - sequence_error / sequences / sequence_target_var if sequence_target_var > 0 else float("nan")
+                ),
+                f"{prefix}/sequence_target_mean": sequence_target_sum / sequences,
+                f"{prefix}/sequence_value_mean": sequence_prediction_sum / sequences,
+                f"{prefix}/initial_mse": initial_error / sequences,
+                f"{prefix}/initial_mse_skill": (
+                    1 - initial_error / sequences / initial_target_var if initial_target_var > 0 else float("nan")
+                ),
+                f"{prefix}/initial_target_mean": initial_target_sum / sequences,
+                f"{prefix}/initial_value_mean": initial_prediction_sum / sequences,
+                f"{prefix}/sequences": sequences,
+            }
+        )
     model.train()
-    return {
-        "eval/token_mse": error / count,
-        "eval/sequence_mse": sequence_error / sequences,
-        "eval/explained_variance": 1 - residual_var / target_var if target_var > 0 else float("nan"),
-        "eval/target_mean": target_sum / count,
-        "eval/value_mean": prediction_sum / count,
-        "eval/token_constant_mse": target_var,
-        "eval/token_mse_skill": 1 - error / count / target_var if target_var > 0 else float("nan"),
-        "eval/sequence_constant_mse": sequence_target_var,
-        "eval/sequence_mse_skill": (
-            1 - sequence_error / sequences / sequence_target_var if sequence_target_var > 0 else float("nan")
-        ),
-        "eval/sequence_target_mean": sequence_target_sum / sequences,
-        "eval/sequence_value_mean": sequence_prediction_sum / sequences,
-    }
+    return metrics
 
 
 def cleanup_old_checkpoints(checkpoint_base_path, max_checkpoints):
@@ -129,6 +163,7 @@ def train(args):
         collator = RewardDataCollator(tokenizer.pad_token_id)
         train_dataset = ValueDataset(args.train_data, args.max_length)
         val_dataset = ValueDataset(args.val_data, args.max_length)
+        val_domains = list(val_dataset.dataset["domain"]) if "domain" in val_dataset.dataset.column_names else None
         if args.group_by_length:
             sampler = DistributedLengthGroupedSampler(
                 batch_size=args.batch_size * args.gradient_accumulation_steps * dist.get_world_size(),
@@ -190,7 +225,7 @@ def train(args):
 
         def validate_and_save(step, metrics):
             nonlocal best_mse
-            metrics.update(evaluate(model, val_dataset, collator, args.batch_size, device))
+            metrics.update(evaluate(model, val_dataset, collator, args.batch_size, device, domains=val_domains))
             checkpoint = os.path.join(args.output_dir, f"step_{step}")
             strategy.save_checkpoint(
                 model,

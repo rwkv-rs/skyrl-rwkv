@@ -1728,12 +1728,13 @@ class RayPPOTrainer:
         """
         data.metadata["global_step"] = self.global_step
         critic_status = None
+        train_critic = self.has_critic and self.cfg.trainer.critic.optimizer_config.lr != 0
 
         def train_model(role):
             with Timer(f"{role}_train", self.all_timings):
                 return self._execute_training_step(role, data)
 
-        if self.has_critic and self.cfg.trainer.train_critic_and_policy_parallel:
+        if train_critic and self.cfg.trainer.train_critic_and_policy_parallel:
             # Each role has its own workers and optimizer. Propagate the step
             # deadline to the critic thread just as asyncio.to_thread does.
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="critic-train") as executor:
@@ -1741,7 +1742,7 @@ class RayPPOTrainer:
                 policy_status = train_model("policy")
                 critic_status = critic_future.result()
         else:
-            if self.has_critic:
+            if train_critic:
                 critic_status = train_model("critic")
             policy_status = train_model("policy")
 

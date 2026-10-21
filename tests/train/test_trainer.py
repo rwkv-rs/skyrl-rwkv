@@ -921,3 +921,36 @@ def test_parallel_critic_failure_propagates():
     with pytest.raises(RuntimeError, match="critic failed"):
         trainer.train_critic_and_policy(data)
     trainer.dispatch.empty_cache.assert_not_called()
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_zero_critic_lr_preserves_critic_weights_and_optimizer(parallel):
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.cfg = SkyRLTrainConfig()
+    trainer.cfg.trainer.critic.model.path = "critic"
+    trainer.cfg.trainer.critic.optimizer_config.lr = 0
+    trainer.cfg.trainer.train_critic_and_policy_parallel = parallel
+    trainer.global_step = 26
+    trainer.all_timings = {}
+    trainer.all_metrics = {}
+    trainer.dispatch = MagicMock()
+    data = TrainingInputBatch({"sequences": torch.ones((1, 3), dtype=torch.long)})
+    data.metadata = {}
+    parameters = {role: torch.nn.Parameter(torch.tensor(1.0)) for role in ("policy", "critic")}
+    # A restored critic optimizer can retain the checkpoint's nonzero learning rate.
+    optimizers = {role: torch.optim.AdamW([parameter], lr=0.1) for role, parameter in parameters.items()}
+
+    def train_model(role, batch):
+        parameters[role].square().backward()
+        optimizers[role].step()
+        return {"loss": 1.0}
+
+    trainer._execute_training_step = train_model
+    trainer.train_critic_and_policy(data)
+    assert trainer.has_critic
+    assert parameters["policy"].item() < 1.0
+    assert parameters["critic"].item() == 1.0
+    assert parameters["critic"].grad is None
+    assert not optimizers["critic"].state
+    assert trainer.all_metrics == {"policy/loss": 1.0}
+    assert set(trainer.all_timings) == {"policy_train"}

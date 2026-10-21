@@ -228,7 +228,8 @@ class OptimizerConfig(BaseConfig):
     """Optimizer configuration, shared by the policy and critic models."""
 
     lr: float = 1e-6
-    """Learning rate."""
+    """Learning rate. A zero critic learning rate skips its backward and optimizer steps,
+    retaining its value forward passes and checkpoint state."""
     adam_betas: List[float] = field(default_factory=lambda: [0.9, 0.999])
     """Betas for the AdamW optimizer."""
     weight_decay: float = 1e-2

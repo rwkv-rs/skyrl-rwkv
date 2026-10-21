@@ -342,6 +342,12 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
             (critic, None, None),
         )
         assert self.optimizer is not None
+        if self.cfg.critic.resume_path is not None:
+            self.load_checkpoint(
+                self.cfg.critic.resume_path,
+                load_optimizer_states=False,
+                load_lr_scheduler_states=False,
+            )
 
         self._set_expandable_segments(True)
 

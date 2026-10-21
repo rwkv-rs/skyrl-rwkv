@@ -797,6 +797,13 @@ class CriticConfig(BaseConfig):
     """
 
     model: ModelConfig = field(default_factory=ModelConfig)
+    resume_path: Optional[str] = None
+    """Initialize critic weights from a native FSDP checkpoint, keeping a fresh optimizer and scheduler.
+
+    Set ``model.path`` to the checkpoint's original base model and use matching LoRA settings.
+    This preserves unmerged NoRA adapters and the value head from offline pretraining.
+    A subsequent full trainer resume restores its own critic checkpoint instead.
+    """
     optimizer_config: OptimizerConfig = field(default_factory=lambda: OptimizerConfig(lr=5e-6))
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
     """FSDP configuration, applicable when ``trainer.strategy="fsdp"``."""

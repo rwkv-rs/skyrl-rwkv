@@ -41,6 +41,7 @@ fi
 : "${LIGHTEVAL_PROJECT:=$HOME/Projects/MachineLearning/lighteval-rwkv}"
 : "${LORA_RANK:=256}"
 : "${LORA_ALPHA:=$LORA_RANK}"
+: "${LORA_TARGET_MODULES:=[r_proj,k_proj,v_proj,o_proj,mlp.key,mlp.value,lm_head]}"
 : "${MINI_BATCH_SIZE:=512}"
 : "${MICRO_BATCH_SIZE:=4}"
 : "${MICRO_FORWARD_BATCH_SIZE:=4}"
@@ -91,7 +92,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   trainer.policy.model.lora.rank="$LORA_RANK" \
   trainer.policy.model.lora.alpha="$LORA_ALPHA" \
   trainer.policy.model.lora.dropout=0.0 \
-  trainer.policy.model.lora.target_modules="[r_proj,k_proj,v_proj,o_proj,lm_head]" \
+  trainer.policy.model.lora.target_modules="$LORA_TARGET_MODULES" \
   trainer.policy.optimizer_config.lr="$LR" \
   trainer.policy.optimizer_config.num_warmup_steps=0 \
   trainer.policy.optimizer_config.weight_decay=0.01 \

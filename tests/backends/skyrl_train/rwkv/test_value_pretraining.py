@@ -230,7 +230,10 @@ def test_rwkv_critic_checkpoint_round_trip_uses_native_bf16(tmp_path, rwkv_check
 @pytest.mark.skipif("use_nora" not in LoraConfig.__dataclass_fields__, reason="requires Joluck/NoRA")
 @pytest.mark.parametrize("rank", [8, 16])
 @pytest.mark.parametrize("freeze_backbone", [False, True])
-def test_rwkv_nora_critic_updates_and_exports_full_head(tmp_path, rwkv_checkpoint, monkeypatch, rank, freeze_backbone):
+@pytest.mark.parametrize("target_modules", [["v_proj", "o_proj"], ["mlp.key", "mlp.value"]])
+def test_rwkv_nora_critic_updates_and_exports_full_head(
+    tmp_path, rwkv_checkpoint, monkeypatch, rank, freeze_backbone, target_modules
+):
     from transformers import RwkvModel
 
     from skyrl.backends.skyrl_train.distributed import fsdp_strategy
@@ -242,6 +245,7 @@ def test_rwkv_nora_critic_updates_and_exports_full_head(tmp_path, rwkv_checkpoin
         hidden = self.embed_tokens(input_ids).cumsum(1)
         for layer in self.layers:
             hidden = hidden + layer.linear_attn.o_proj(torch.tanh(layer.linear_attn.v_proj(hidden)))
+            hidden = hidden + layer.mlp.value(torch.relu(layer.mlp.key(hidden)).square())
         return {"last_hidden_state": hidden}
 
     monkeypatch.setattr(RwkvModel, "forward", causal_forward)
@@ -251,7 +255,7 @@ def test_rwkv_nora_critic_updates_and_exports_full_head(tmp_path, rwkv_checkpoin
         use_nora=True,
         lora_rank=rank,
         lora_alpha=rank,
-        target_modules=["v_proj", "o_proj"],
+        target_modules=target_modules,
         freeze_backbone=freeze_backbone,
     )
     if freeze_backbone:
@@ -263,10 +267,13 @@ def test_rwkv_nora_critic_updates_and_exports_full_head(tmp_path, rwkv_checkpoin
     assert head.weight.dtype == torch.float32
     assert head.weight.requires_grad
     assert model.peft_config["default"].use_nora
+    assert model.peft_config["default"].target_modules == set(target_modules)
     assert model.peft_config["default"].modules_to_save == ["value_head"]
     frozen_before = {name: value.clone() for name, value in model.named_parameters() if not value.requires_grad}
     trainable_before = {name: value.clone() for name, value in model.named_parameters() if value.requires_grad}
     assert all("lora_" in name or ".value_head.modules_to_save." in name for name in trainable_before)
+    if target_modules == ["mlp.key", "mlp.value"]:
+        assert all(".mlp." in name or ".value_head.modules_to_save." in name for name in trainable_before)
     assert all(module.training for module in model.modules())
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=0.01, weight_decay=0)
     batch = RewardDataCollator(0)([{"input_ids": [1, 2, 3, 4], "loss_mask": [0, 1, 0, 1], "returns": [0, 1, 1, 1]}])
@@ -387,7 +394,7 @@ def test_value_pretraining_cli_nora_rank_sweep(monkeypatch, rank):
     args = calls[0]
     assert args.use_nora and args.rank == rank
     assert args.lora_alpha == rank
-    assert args.target_modules == ["r_proj", "k_proj", "v_proj", "o_proj"]
+    assert args.target_modules == ["mlp.key", "mlp.value"]
     assert not args.freeze_backbone
 
 

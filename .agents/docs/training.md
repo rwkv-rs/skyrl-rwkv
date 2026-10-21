@@ -55,6 +55,16 @@ the unmerged adapter computation and does not enable input gradients through
 the frozen backbone. Keep the same native initialization and value calibration
 when comparing it with joint backbone/head training.
 
+To avoid weighting a state's critic target by the inverse of its future response
+length, set `trainer.algorithm.critic_loss_reduction=seq_mean_token_sum_norm` and
+an explicit positive `trainer.algorithm.max_seq_len` (for example, the response
+budget). This sums masked token errors per sequence, divides by that fixed
+constant, and averages sequences. It retains native sequence-based gradient
+accumulation and data-parallel weighting. The default remains `sequence_mean`,
+independently of the actor reduction. Offline value pretraining uses
+`--loss-reduction seq_mean_token_sum_norm --max-seq-len <constant>` for the same
+half-MSE objective; `--max-length` separately limits input length.
+
 Online SAO uses the native `gae_adaptive` estimator with `rollout_is` loss. It skips
 observation positions using `response_mask & loss_mask`, uses action-length-adaptive
 policy lambda (`gae_adaptive.alpha=1.5`, lambda one below `gae_adaptive.min_length=50`), and separate critic lambda

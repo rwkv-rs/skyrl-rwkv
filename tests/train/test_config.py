@@ -1343,6 +1343,27 @@ class TestMaxSeqLenValidation:
 
         validate_cfg(cfg)
 
+    @pytest.mark.parametrize("budget", [None, 0, -1])
+    def test_critic_fixed_normalization_requires_positive_budget(self, budget):
+        cfg = _make_validated_test_config()
+        cfg.trainer.algorithm.critic_loss_reduction = "seq_mean_token_sum_norm"
+        cfg.trainer.algorithm.max_seq_len = budget
+        with pytest.raises(ValueError, match=r"trainer\.algorithm\.max_seq_len"):
+            validate_cfg(cfg)
+
+    def test_critic_fixed_normalization_is_independent_of_actor(self):
+        cfg = _make_validated_test_config()
+        cfg.trainer.algorithm.critic_loss_reduction = "seq_mean_token_sum_norm"
+        cfg.trainer.algorithm.max_seq_len = 8192
+        validate_cfg(cfg)
+        assert cfg.trainer.algorithm.loss_reduction == "token_mean"
+
+    def test_invalid_critic_reduction_is_rejected(self):
+        cfg = _make_validated_test_config()
+        cfg.trainer.algorithm.critic_loss_reduction = "token_mean"
+        with pytest.raises(ValueError, match="critic_loss_reduction"):
+            validate_cfg(cfg)
+
 
 class TestStepWiseRoutedExpertsValidation:
     @staticmethod

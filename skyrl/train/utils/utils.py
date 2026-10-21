@@ -644,11 +644,18 @@ def validate_cfg(cfg: SkyRLTrainConfig):
         f"Must be one of `['token_mean', 'token_mean_legacy', 'sequence_mean', "
         f"'seq_mean_token_sum_norm', 'prompt_mean']`"
     )
-    if cfg.trainer.algorithm.loss_reduction == "seq_mean_token_sum_norm":
-        if cfg.trainer.algorithm.max_seq_len is None:
+    if cfg.trainer.algorithm.critic_loss_reduction not in ("sequence_mean", "seq_mean_token_sum_norm"):
+        raise ValueError(
+            "`trainer.algorithm.critic_loss_reduction` must be 'sequence_mean' or 'seq_mean_token_sum_norm'."
+        )
+    if "seq_mean_token_sum_norm" in (
+        cfg.trainer.algorithm.loss_reduction,
+        cfg.trainer.algorithm.critic_loss_reduction,
+    ):
+        if cfg.trainer.algorithm.max_seq_len is None or cfg.trainer.algorithm.max_seq_len <= 0:
             raise ValueError(
-                "`trainer.algorithm.max_seq_len` must be set explicitly when "
-                "`trainer.algorithm.loss_reduction='seq_mean_token_sum_norm'`. "
+                "`trainer.algorithm.max_seq_len` must be set explicitly to a positive value when "
+                "the actor or critic loss reduction is 'seq_mean_token_sum_norm'. "
                 "Choose the total sequence-length normalization constant for your setup; "
                 "this often matches the model context window / vLLM `max_model_len` when appropriate."
             )

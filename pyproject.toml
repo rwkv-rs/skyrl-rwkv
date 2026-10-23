@@ -148,7 +148,7 @@ rwkv = [
     "torch==2.13.0; sys_platform == 'linux'",
     "transformers==5.16.0.dev0; sys_platform == 'linux'",
     "vllm; sys_platform == 'linux'",
-    "FlashRWKV2==0.1.0a15; sys_platform == 'linux'",
+    "FlashRWKV2==0.1.0a16; sys_platform == 'linux'",
     "tokenizers; sys_platform == 'linux'",
 ]
 
@@ -340,7 +340,7 @@ override-dependencies = [
     # Widen Bridge's bound without overriding RWKV's direct Git requirement.
     { package = { name = "megatron-bridge" }, dependencies = ["transformers>=5.6.1,<=5.16.1; sys_platform == 'linux'"] },
     # Keep the RWKV Transformers source selected by this project.
-    { package = { name = "vllm", version = "0.23.1rc1.dev5424+g670288acc.rwkv" }, dependencies = ["transformers==5.16.0.dev0; sys_platform == 'linux'"] },
+    { package = { name = "vllm", version = "0.23.1rc1.dev5450+g7e2db182c.rwkv" }, dependencies = ["transformers==5.16.0.dev0; sys_platform == 'linux'"] },
     "megatron-core>=0.16.0; sys_platform == 'linux'",
     "ml_dtypes>=0.5.0; sys_platform == 'linux'",
     # `nixl` hard-depends on both nixl-cu12 and nixl-cu13; drop the cu12 variant
@@ -516,8 +516,8 @@ explicit = true
 [tool.uv.sources]
 skyrl-gym = { path = "./skyrl-gym", editable = true }
 skycap = { path = "./skycap", editable = true }
-transformers = { git = "https://github.com/rwkv-rs/transformers-rwkv", rev = "0a374cb01090d6352d07ca749d84768cf9621f0e", extra = "rwkv" }
-vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "670288acc58bd21dc8628d7d30650f0d25ce4bfa", extra = "rwkv" }
+transformers = { git = "https://github.com/rwkv-rs/transformers-rwkv", rev = "f163615d2a7c60aa1df5c292874d56cbe878219f", extra = "rwkv" }
+vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "7e2db182cc3e89239ff7c867f275bcfcb09cc105", extra = "rwkv" }
 tokenizers = { git = "https://github.com/rwkv-rs/tokenizers-rwkv", rev = "c5d8dde5ff49c70e4656199d5033a84e03c21b2b", subdirectory = "bindings/python", extra = "rwkv" }
 # Match torch's CUDA variant (cu130).
 flashinfer-jit-cache = { index = "flashinfer-cu130", marker = "sys_platform == 'linux'" }

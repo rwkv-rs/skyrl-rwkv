@@ -208,7 +208,7 @@ if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" == 1 ]]; then
         uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" \
         -m vllm.entrypoints.openai.api_server \
         --model "$EVAL_MODEL" --served-model-name "$EVAL_NAME" \
-        --host 127.0.0.1 --port "$port" --dtype float16 \
+        --host 127.0.0.1 --port "$port" --dtype bfloat16 \
         --max-model-len 32768 --max-num-seqs "$EVAL_MAX_NUM_SEQS" \
         --max-num-batched-tokens 32768 --gpu-memory-utilization "$EVAL_GPU_MEMORY_UTILIZATION" \
         --enable-prefix-caching --enable-chunked-prefill \

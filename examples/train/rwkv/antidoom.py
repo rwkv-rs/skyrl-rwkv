@@ -716,7 +716,7 @@ def load_model(model_path, adapter_path=None):
             for name, param in parameters.items():
                 param.copy_(weights[name])
     # BF16 scoring uses the differentiable fused operators under no_grad;
-    # FP16 free generation is handled by vLLM.
+    # free generation is handled by vLLM.
     return model.train()
 
 
@@ -1182,8 +1182,8 @@ def merge_and_save(model, tokenizer, model_path, output, probe_ids, device):
 
     with torch.no_grad():
         # Normalize NoRA in FP32 before using the vanilla LoRA inference path.
-        # Keep these FP32 factors for merging: BF16 base-weight rounding can
-        # erase small updates, whereas rollout uses FP16 projections.
+        # Keep these FP32 factors for merging, then round each merged
+        # projection once to the BF16 weights used by rollout.
         factors = {}
         for layer in model.modules():
             if isinstance(layer, LoraLayer):
@@ -1194,8 +1194,8 @@ def merge_and_save(model, tokenizer, model_path, output, probe_ids, device):
                     layer.use_nora["default"] = False
                 factors[layer] = (weight_a, weight_b)
                 layer.lora_A["default"].weight.data = weight_a
-        model.half().eval()
-        # FP16 inference reads dense Head and ChannelMix weights.
+        model.to(torch.bfloat16).eval()
+        # Merge dense Head and ChannelMix weights before the logits probe.
         head = model.get_output_embeddings()
         dense_layers = [head]
         if model.config.model_type == "rwkv":
@@ -1220,21 +1220,18 @@ def merge_and_save(model, tokenizer, model_path, output, probe_ids, device):
                 actual = F.linear(hidden, head.get_base_layer().weight)
                 torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
                 head_error = (actual - expected).abs().max().item()
-            layer.get_base_layer().weight.data = layer.get_base_layer().weight.data.half()
+            layer.get_base_layer().weight.data = layer.get_base_layer().weight.data.to(torch.bfloat16)
         before = last_logits(model, probe_ids, device)
         for layer, (weight_a, weight_b) in factors.items():
             layer.get_base_layer().weight.data = layer.get_base_layer().weight.data.float()
             layer.lora_A["default"].weight.data = weight_a
             layer.lora_B["default"].weight.data = weight_b
-        merged = model.merge_and_unload(safe_merge=True).half().to(device).eval()
+        merged = model.merge_and_unload(safe_merge=True).to(device, torch.bfloat16).eval()
         after = last_logits(merged, probe_ids, device)
     max_error = (before - after).abs().max().item()
     before_logp, after_logp = F.log_softmax(before, -1), F.log_softmax(after, -1)
     torch.testing.assert_close(after_logp, before_logp, atol=0.15, rtol=0.01)
     kl = (before_logp.exp() * (before_logp - after_logp)).sum(-1).item()
-    # RWKV inference temporarily casts its embedding to BF16; restore FP16
-    # so save_pretrained records the export dtype for dtype="auto" readers.
-    merged.half()
     merged.save_pretrained(output, safe_serialization=True)
     tokenizer.save_pretrained(output)
     for path in [*Path(model_path).glob("*generation_config.json"), *Path(model_path).glob("tokenizer_config.json")]:
@@ -1245,7 +1242,7 @@ def merge_and_save(model, tokenizer, model_path, output, probe_ids, device):
                 "max_logit_error": max_error,
                 "kl_reference_merged": kl,
                 "merge_dtype": "float32",
-                "export_dtype": "float16",
+                "export_dtype": "bfloat16",
                 "head_max_logit_error": head_error,
             }
         )

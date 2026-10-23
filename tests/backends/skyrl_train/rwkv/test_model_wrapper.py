@@ -21,7 +21,10 @@ from skyrl.backends.skyrl_train.utils.sample_support import (
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
 from skyrl.backends.skyrl_train.workers import model_wrapper as model_wrapper_module
-from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import FSDPPolicyWorkerBase
+from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
+    FSDPCriticWorkerBase,
+    FSDPPolicyWorkerBase,
+)
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
 from skyrl.train.config import SamplingParams
 
@@ -64,6 +67,28 @@ class ToyRecurrentCache:
         return ToyRecurrentCache(self.state.clone())
 
 
+@pytest.mark.parametrize("temperature", [1.0, 0.8])
+def test_rwkv_fused_head_view_preserves_autograd(temperature):
+    class HeadView(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, logits):
+            return logits.view_as(logits)
+
+        @staticmethod
+        def backward(ctx, gradient):
+            return gradient
+
+    model = ToyCausalLM()
+    model.forward = lambda ids: {"logits": HeadView.apply(model.lm_head(model.embed_tokens(ids)))}
+    ids = torch.tensor([[1, 2, 3, 4]])
+    expected = torch.log_softmax(model.lm_head(model.embed_tokens(ids)) / temperature, dim=-1)
+    expected = expected[:, :-1].gather(-1, ids[:, 1:].unsqueeze(-1)).squeeze(-1)[:, -2:]
+    actual = HFModelWrapper(model)(ids, num_actions=2, attention_mask=torch.ones_like(ids), temperature=temperature)
+    torch.testing.assert_close(actual, expected)
+    (-actual.mean()).backward()
+    assert torch.isfinite(model.lm_head.weight.grad).all()
+
+
 class ToyRecurrentCausalLM(ToyCausalLM):
     def forward(self, input_ids, past_key_values=None, use_cache=False):
         self.calls.append((input_ids.detach().clone(), {}))
@@ -72,6 +97,63 @@ class ToyRecurrentCausalLM(ToyCausalLM):
             hidden = hidden + past_key_values.state.unsqueeze(1)
         cache = ToyRecurrentCache(hidden[:, -1]) if use_cache else None
         return {"logits": self.lm_head(hidden), "past_key_values": cache}
+
+
+@pytest.mark.parametrize("distributed", [False, True])
+@pytest.mark.parametrize("entropy_requires_grad", [False, True])
+def test_rwkv_response_only_head_preserves_loss_context_gradients_and_entropy(
+    monkeypatch, distributed, entropy_requires_grad
+):
+    class SelectedHeadToyCausalLM(ToyRecurrentCausalLM):
+        def forward(self, input_ids, logits_to_keep=0):
+            self.calls.append((input_ids.detach().clone(), logits_to_keep))
+            hidden = self.embed_tokens(input_ids).cumsum(1)
+            if isinstance(logits_to_keep, torch.Tensor):
+                hidden = hidden.gather(1, logits_to_keep.unsqueeze(-1).expand(-1, -1, hidden.shape[-1]))
+            return {"logits": self.lm_head(hidden)}
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: distributed)
+    torch.manual_seed(42)
+    model = SelectedHeadToyCausalLM()
+    wrapper = HFModelWrapper(model)
+    ids = torch.tensor([[0, 0, 1, 2, 3, 4, 5, 6, 7], [0, 0, 0, 0, 8, 9, 10, 11, 12], [1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    mask = ids.ne(0)
+    response_mask = torch.tensor([[0, 0, 0, 1, 1, 1], [0, 0, 0, 0, 0, 1], [0, 0, 1, 1, 1, 1]])
+
+    def run():
+        lp, output = wrapper(
+            ids,
+            6,
+            attention_mask=mask,
+            response_mask=response_mask,
+            return_output=True,
+            compute_entropy=True,
+            entropy_requires_grad=entropy_requires_grad,
+        )
+        ent = output["entropy"][:, -7:-1]
+        loss = (-(lp * response_mask).sum() + 0.01 * (ent * response_mask).sum()) / response_mask.sum()
+        loss.backward()
+        return lp.detach(), ent.detach(), [p.grad.clone() for p in model.parameters()]
+
+    expected_lp, expected_entropy, expected_grads = run()
+    model.zero_grad(set_to_none=True)
+    model.calls.clear()
+    wrapper.rwkv_response_only_head = True
+    actual_lp, actual_entropy, actual_grads = run()
+    torch.testing.assert_close(actual_lp[response_mask.bool()], expected_lp[response_mask.bool()])
+    torch.testing.assert_close(actual_entropy[response_mask.bool()], expected_entropy[response_mask.bool()])
+    assert actual_lp[~response_mask.bool()].count_nonzero() == 0
+    for actual, expected in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    assert actual_grads[0][1].abs().sum() > 0  # Prompt history still receives gradients.
+    assert all(isinstance(selection, torch.Tensor) and selection.shape[1] <= 4 for _, selection in model.calls)
+
+
+def test_rwkv_response_only_head_requires_response_mask():
+    wrapper = HFModelWrapper(ToyCausalLM(), rwkv_response_only_head=True)
+    ids = torch.tensor([[1, 2, 3]])
+    with pytest.raises(ValueError, match="response_mask"):
+        wrapper(ids, 2, attention_mask=torch.ones_like(ids))
 
 
 def test_rwkv_infctx_preserves_cross_chunk_labels_states_and_gradients():
@@ -167,7 +249,9 @@ def test_rwkv_equal_length_sequences_share_one_forward_bucket():
     actual = wrapper(sequences, num_actions=2, attention_mask=attention_mask)
 
     assert len(model.calls) == 1
-    assert torch.equal(model.calls[0][0], torch.tensor([[1, 2, 3], [4, 5, 6]]))
+    assert model.calls[0][0].shape == (2, 16)
+    assert torch.equal(model.calls[0][0][:, :3], torch.tensor([[1, 2, 3], [4, 5, 6]]))
+    assert not model.calls[0][0][:, 3:].any()
     model.calls.clear()
     expected = expected_action_log_probs(model, sequences, attention_mask, num_actions=2)
     assert torch.allclose(actual, expected)
@@ -189,7 +273,9 @@ def test_rwkv_distributed_forward_uses_one_right_padded_bucket(monkeypatch):
     )
 
     assert len(model.calls) == 1
-    assert torch.equal(model.calls[0][0], torch.tensor([[1, 2, 3, 0], [4, 5, 6, 7]]))
+    assert model.calls[0][0].shape == (2, 16)
+    assert torch.equal(model.calls[0][0][:, :4], torch.tensor([[1, 2, 3, 0], [4, 5, 6, 7]]))
+    assert not model.calls[0][0][:, 4:].any()
     assert torch.equal(output["entropy"][0, :2], torch.zeros(2))
     model.calls.clear()
     expected = expected_action_log_probs(model, sequences, attention_mask, num_actions=2)
@@ -210,7 +296,7 @@ def test_rwkv_ragged_batch_restores_padding_and_entropy_positions():
         return_output=True,
     )
 
-    assert [tuple(call[0].shape) for call in model.calls] == [(1, 3), (2, 5)]
+    assert [tuple(call[0].shape) for call in model.calls] == [(1, 16), (2, 16)]
     assert action_log_probs.shape == (3, 2)
     assert output["entropy"].shape == sequences.shape
     assert torch.equal(output["entropy"][1, :2], torch.zeros(2))
@@ -336,14 +422,14 @@ def test_rwkv_weight_source_matches_metadata_and_fsdp_bf16_forward_dtype(monkeyp
     weights = torch.tensor([1.003, -2.007], dtype=torch.float32)
     model = torch.nn.Module()
     model.register_parameter("weight", torch.nn.Parameter(weights))
-    source = FsdpWeightSource(model, torch.float16, rwkv_effective_bf16=True)
+    source = FsdpWeightSource(model, torch.bfloat16)
     metadata = source.metadata()
     [(name, actual)] = list(source)
 
     assert metadata[0].name == name == "weight"
-    assert metadata[0].dtype == actual.dtype == torch.float16
+    assert metadata[0].dtype == actual.dtype == torch.bfloat16
     assert metadata[0].shape == tuple(actual.shape) == (2,)
-    assert torch.equal(actual, weights.to(torch.bfloat16).to(torch.float16))
+    assert torch.equal(actual, weights.to(torch.bfloat16))
     assert not torch.equal(actual, weights.to(torch.float16))
     [(name, direct)] = list(FsdpWeightSource(model, torch.float16))
     assert torch.equal(direct, weights.to(torch.float16))
@@ -443,6 +529,63 @@ def test_rwkv_policy_does_not_write_tokenizer_padding_into_model_config():
     assert direct_wrapper.model.config.pad_token_id == 0
 
 
+@pytest.mark.parametrize("is_rwkv", [True, False])
+def test_critic_preserves_rwkv_padding_config(is_rwkv):
+    worker = object.__new__(FSDPCriticWorkerBase)
+    worker.model = SimpleNamespace(is_rwkv=is_rwkv, config=SimpleNamespace(pad_token_id=None))
+    worker._set_pad_token_id(0)
+    assert worker.model.config.pad_token_id == (None if is_rwkv else 0)
+
+
+@pytest.mark.parametrize("resume_path", [None, "/value/step_64"])
+@pytest.mark.parametrize("freeze_backbone", [False, True])
+def test_critic_warm_start_keeps_fresh_optimizer_and_scheduler(monkeypatch, resume_path, freeze_backbone):
+    from unittest.mock import MagicMock
+
+    from skyrl.backends.skyrl_train.workers.fsdp import fsdp_worker as module
+    from skyrl.train.config import SkyRLTrainConfig
+
+    cfg = SkyRLTrainConfig().trainer
+    cfg.gradient_checkpointing = False
+    cfg.critic.resume_path = resume_path
+    cfg.critic.freeze_backbone = freeze_backbone
+    model = torch.nn.Linear(2, 1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1)
+    strategy = MagicMock()
+    strategy.prepare.return_value = (model, optimizer, scheduler)
+    strategy.load_checkpoint.return_value = (resume_path, {"client_state": {"global_step": 64}})
+    monkeypatch.setattr(module, "FSDPStrategy", lambda **kwargs: strategy)
+    monkeypatch.setattr(
+        module.AutoConfig, "from_pretrained", lambda *args, **kwargs: SimpleNamespace(tie_word_embeddings=False)
+    )
+    monkeypatch.setattr(module, "should_use_meta_init", lambda **kwargs: False)
+    factory = MagicMock(return_value=model)
+    monkeypatch.setattr(module, "get_llm_for_sequence_regression", factory)
+    worker = object.__new__(FSDPCriticWorkerBase)
+    worker.cfg = cfg
+    worker._seq_parallel_monkey_patch = MagicMock()
+    worker._set_expandable_segments = MagicMock()
+    worker.init_model("base-checkpoint")
+    assert factory.call_args.kwargs["freeze_backbone"] == freeze_backbone
+
+    if resume_path is None:
+        strategy.load_checkpoint.assert_not_called()
+    else:
+        strategy.load_checkpoint.assert_called_once_with(
+            model=model,
+            optimizer=None,
+            scheduler=None,
+            ckpt_dir=resume_path,
+            load_optimizer_states=False,
+            load_lr_scheduler_states=False,
+        )
+    assert worker.optimizer is optimizer
+    assert worker.scheduler is scheduler
+    assert optimizer.param_groups[0]["lr"] == 0
+    assert not optimizer.state
+
+
 def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):
     config = SimpleNamespace(
         model_type="rwkv",
@@ -475,6 +618,7 @@ def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):
     assert wrapper.is_rwkv
     assert "attn_implementation" not in captured_kwargs
     assert not hasattr(config, "_attn_implementation")
+    assert captured_kwargs["torch_dtype"] == torch.float32
 
 
 @pytest.mark.parametrize(

@@ -47,6 +47,95 @@ def _make_validated_test_config():
     return cfg
 
 
+def test_parallel_critic_policy_requires_separate_gpus():
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        ["trainer.train_critic_and_policy_parallel=true", "trainer.placement.colocate_all=false"]
+    )
+    assert cfg.trainer.train_critic_and_policy_parallel
+    with pytest.raises(ValueError, match="requires placement.colocate_all=False"):
+        SkyRLTrainConfig.from_cli_overrides(
+            ["trainer.train_critic_and_policy_parallel=true", "trainer.placement.colocate_all=true"]
+        )
+
+
+def test_gae_adaptive_cli_and_rollout_is_score_centering_capture():
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "trainer.algorithm.advantage_estimator=gae_adaptive",
+            "trainer.algorithm.gae_adaptive.alpha=2.0",
+            "trainer.algorithm.gae_adaptive.critic_lambd=0.9",
+            "trainer.algorithm.policy_loss_type=rollout_is",
+            "trainer.algorithm.rollout_is.score_centering=true",
+            "trainer.algorithm.rollout_is.score_centering_top_k=32",
+            "generator.use_conversation_multi_turn=true",
+            "generator.sampling_params.temperature=1.0",
+            "generator.sampling_params.top_p=1.0",
+            "generator.sampling_params.top_k=-1",
+            "generator.sampling_params.logprobs=1",
+        ]
+    )
+    assert cfg.trainer.algorithm.gae_adaptive.alpha == 2.0
+    assert cfg.trainer.algorithm.gae_adaptive.critic_lambd == 0.9
+    assert cfg.generator.inference_engine.enable_return_sample_support_set
+    assert cfg.generator.inference_engine.sample_support_top_k == 32
+    assert cfg.generator.inference_engine.sample_support_logprobs_mode == "raw_logprobs"
+    assert cfg.generator.sampling_params.top_k == -1
+    default = SkyRLTrainConfig()
+    assert default.trainer.algorithm.advantage_estimator == "grpo"
+    assert not default.generator.inference_engine.enable_return_sample_support_set
+
+
+@pytest.mark.parametrize(
+    "override, message",
+    [
+        ("trainer.algorithm.gae_adaptive.alpha=0", "alpha"),
+        ("trainer.algorithm.gae_adaptive.alpha=.nan", "alpha"),
+        ("trainer.algorithm.gae_adaptive.mode=other", "mode"),
+        ("trainer.algorithm.gae_adaptive.critic_lambd=1.1", "critic_lambd"),
+        ("trainer.algorithm.rollout_is.score_centering_top_k=1", "top_k"),
+    ],
+)
+def test_gae_adaptive_and_rollout_is_config_bounds(override, message):
+    with pytest.raises(ValueError, match=message):
+        SkyRLTrainConfig.from_cli_overrides([override])
+
+
+@pytest.mark.parametrize(
+    "override, message",
+    [
+        ("trainer.algorithm.policy_loss_type=regular", "policy_loss_type"),
+        ("trainer.strategy=megatron", "strategy=fsdp"),
+        ("generator.use_conversation_multi_turn=false", "use_conversation_multi_turn"),
+        ("generator.sampling_params.temperature=0.8", "temperature=1"),
+        ("generator.sampling_params.top_p=0.9", "top_p=1"),
+        ("generator.sampling_params.top_k=32", "top_k=-1"),
+        ("trainer.algorithm.enable_sample_support_replay=true", "cannot be combined"),
+    ],
+)
+def test_rollout_is_score_centering_rejects_incompatible_sampling(override, message):
+    overrides = [
+        "trainer.algorithm.policy_loss_type=rollout_is",
+        "trainer.algorithm.rollout_is.score_centering=true",
+        "generator.use_conversation_multi_turn=true",
+        "generator.sampling_params.temperature=1.0",
+        "generator.sampling_params.top_p=1.0",
+        "generator.sampling_params.top_k=-1",
+        "generator.sampling_params.logprobs=1",
+        override,
+    ]
+    with pytest.raises(ValueError, match=message):
+        SkyRLTrainConfig.from_cli_overrides(overrides)
+
+
+def test_gae_adaptive_validation_requires_critic():
+    cfg = _make_validated_test_config()
+    cfg.trainer.algorithm.advantage_estimator = "gae_adaptive"
+    with pytest.raises(AssertionError, match="critic.model.path"):
+        validate_cfg(cfg)
+    cfg.trainer.critic.model.path = "dummy-critic"
+    validate_cfg(cfg)
+
+
 # Helper dataclasses for testing
 @dataclass
 class _SimpleConfig(BaseConfig):
@@ -187,6 +276,28 @@ def test_runtime_env_forwards_te_block_scale_mode(monkeypatch):
     env_vars = prepare_runtime_environment(example_dummy_config())
 
     assert env_vars["NVTE_FP8_BLOCK_SCALING_FP32_SCALES"] == "1"
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_runtime_env_preserves_wandb_resume_destination(monkeypatch, configured):
+    destination = {
+        "WANDB_RUN_ID": "existing-run",
+        "WANDB_RESUME": "must",
+        "WANDB_ENTITY": "existing-team",
+        "WANDB_PROJECT": "existing-project",
+        "WANDB_MODE": "online",
+        "WANDB_DIR": "/existing/run-directory",
+    }
+    for key, value in destination.items():
+        if configured:
+            monkeypatch.setenv(key, value)
+        else:
+            monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+
+    env_vars = prepare_runtime_environment(example_dummy_config())
+
+    assert {key: env_vars[key] for key in destination if key in env_vars} == (destination if configured else {})
 
 
 def test_runtime_env_supports_fsdp_without_megatron_configs(monkeypatch):
@@ -1254,6 +1365,27 @@ class TestMaxSeqLenValidation:
 
         validate_cfg(cfg)
 
+    @pytest.mark.parametrize("budget", [None, 0, -1])
+    def test_critic_fixed_normalization_requires_positive_budget(self, budget):
+        cfg = _make_validated_test_config()
+        cfg.trainer.algorithm.critic_loss_reduction = "seq_mean_token_sum_norm"
+        cfg.trainer.algorithm.max_seq_len = budget
+        with pytest.raises(ValueError, match=r"trainer\.algorithm\.max_seq_len"):
+            validate_cfg(cfg)
+
+    def test_critic_fixed_normalization_is_independent_of_actor(self):
+        cfg = _make_validated_test_config()
+        cfg.trainer.algorithm.critic_loss_reduction = "seq_mean_token_sum_norm"
+        cfg.trainer.algorithm.max_seq_len = 8192
+        validate_cfg(cfg)
+        assert cfg.trainer.algorithm.loss_reduction == "token_mean"
+
+    def test_invalid_critic_reduction_is_rejected(self):
+        cfg = _make_validated_test_config()
+        cfg.trainer.algorithm.critic_loss_reduction = "token_mean"
+        with pytest.raises(ValueError, match="critic_loss_reduction"):
+            validate_cfg(cfg)
+
 
 class TestStepWiseRoutedExpertsValidation:
     @staticmethod
@@ -1449,6 +1581,14 @@ def test_lora_disk_sync_mode_is_default_and_unconstrained():
     cfg = _make_validated_test_config()
     assert cfg.trainer.policy.model.lora.sync_mode == "disk"
     validate_inference_engine_cfg(cfg)
+
+
+@pytest.mark.parametrize("overrides", [["trainer.policy.model.lora.rank=0"], ["trainer.strategy=megatron"]])
+def test_nora_requires_fsdp_and_positive_rank(overrides):
+    with pytest.raises(ValueError, match="use_nora=True requires"):
+        SkyRLTrainConfig.from_cli_overrides(
+            ["trainer.policy.model.lora.rank=8", "trainer.policy.model.lora.use_nora=true", *overrides]
+        )
 
 
 class TestMegatronRouterReplayValidation:

@@ -7,12 +7,10 @@ import hashlib
 import json
 import multiprocessing
 import os
-import re
 import resource
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 from collections import Counter, defaultdict
 from collections.abc import Mapping
@@ -24,8 +22,8 @@ from typing import Any
 import orjson
 
 from skyrl_gym.envs.gsm8k.utils import compute_strict_score
+from skyrl_gym.envs.ultradata.env import DOMAINS, answer_text, run_code, text_score
 
-DOMAINS = ("Math", "Code", "Long_Context", "Knowledge")
 STATUSES = ("correct", "wrong", "unanswered")
 ROLLOUTS_PER_QUESTION = 64
 SCORING_VERSION = 2
@@ -45,122 +43,6 @@ SAMPLING_PARAMS = {
     "frequency_penalty": 0.1,
     "penalty_decay": 0.988,
 }
-
-
-def answer_text(raw: str) -> str:
-    text = raw.split("</think>", 1)[1] if "</think>" in raw else raw
-    text = text.strip()
-    return text[1:].lstrip() if text.startswith(">") else text
-
-
-def text_score(raw: str, gold: str, query: str) -> bool:
-    text = answer_text(raw)
-    value = None
-    start = text.rfind("\\boxed")
-    if start >= 0:
-        left = text.find("{", start)
-        if left >= 0:
-            depth = 0
-            for index in range(left, len(text)):
-                depth += text[index] == "{"
-                depth -= text[index] == "}"
-                if depth == 0:
-                    value = text[left + 1 : index]
-                    break
-    if value is None:
-        markers = r"(?:final\s+answer|correct\s+answer|answer|答案|最终答案|正确答案)\s*(?:is|是|为|[:：=])"
-        matches = list(re.finditer(markers + r"\s*(.+)", text, re.IGNORECASE))
-        value = matches[-1].group(1) if matches else text.splitlines()[-1] if text else ""
-
-    candidates = [value.strip()]
-    options = {
-        match.group(1).upper(): match.group(2).strip()
-        for match in re.finditer(r"(?m)^\s*([A-Ja-j]|\d{1,2})\s*[-.):、]\s*(.+?)\s*$", query)
-    }
-    labels = list(
-        re.finditer(
-            r"(?:^\s*[\[(]?|(?:option|choice|statement|选项)\s*(?:is\s*)?)([A-J]|\d{1,2})(?=\s*[).:：]|\s*$|\s+(?:is|would|是|为))",
-            value,
-            re.IGNORECASE,
-        )
-    )
-    if labels and (label := labels[-1].group(1).upper()) in options:
-        candidates.append(options[label])
-
-    target = re.sub(r"\\boxed\s*\{([^{}]*)\}", r"\1", str(gold)).casefold().replace("−", "-")
-    target = " ".join(target.strip(" `*_\t\r\n.,;:。；：").split())
-    return bool(target) and any(
-        target
-        == " ".join(
-            re.sub(r"\\boxed\s*\{([^{}]*)\}", r"\1", str(candidate))
-            .casefold()
-            .replace("−", "-")
-            .strip(" `*_\t\r\n.,;:。；：")
-            .split()
-        )
-        for candidate in candidates
-    )
-
-
-def run_code(raw: str, gold: dict[str, Any]) -> tuple[bool, str]:
-    text = answer_text(raw)
-    matches = list(re.finditer(r"\x60\x60\x60\s*([\w+.-]*)\s*\n(.*?)\n\x60\x60\x60", text, re.DOTALL))
-    language = matches[0].group(1).casefold() if matches else "python"
-    program = "\n".join(match.group(2) for match in matches) if matches else text
-    if language in {"py", "python", "python3", ""}:
-        command_prefix, suffix = ["/usr/bin/python3"], ".py"
-    elif language in {"cpp", "c++", "cc", "cxx"}:
-        command_prefix, suffix = [], ".cpp"
-    else:
-        return False, "unsupported_language"
-    if not program.strip():
-        return False, "empty_program"
-    try:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory)
-            path.chmod(0o755)
-            source = path / ("solution" + suffix)
-            source.write_text(program, encoding="utf-8")
-            source.chmod(0o644)
-            if suffix == ".cpp":
-                executable = path / "solution"
-                subprocess.run(
-                    ["g++", "-O2", "-std=c++17", str(source), "-o", str(executable)],
-                    check=True,
-                    capture_output=True,
-                    timeout=30,
-                )
-                command_prefix = [str(executable)]
-            command = (
-                ["sudo", "-n", "-u", "nobody", "-H", "timeout", "10", *command_prefix, str(source)]
-                if suffix == ".py"
-                else ["sudo", "-n", "-u", "nobody", "-H", "timeout", "10", *command_prefix]
-            )
-            env = {"PATH": "/usr/bin:/bin", "HOME": directory}
-            for stdin, expected in zip(gold["inputs"], gold["outputs"], strict=True):
-                result = subprocess.run(
-                    command,
-                    input=str(stdin),
-                    text=True,
-                    cwd=directory,
-                    capture_output=True,
-                    timeout=10,
-                    env=env,
-                    check=False,
-                )
-                if result.returncode == 124:
-                    return False, "timeout"
-                if result.returncode:
-                    return False, "runtime_error"
-                if result.stdout.rstrip() != str(expected).rstrip():
-                    return False, "wrong_output"
-        return True, "ok"
-    except subprocess.TimeoutExpired:
-        return False, "timeout"
-    except subprocess.CalledProcessError:
-        return False, "compile_error"
-    except (OSError, UnicodeError, KeyError):
-        return False, "execution_error"
 
 
 def rows(
@@ -429,7 +311,7 @@ async def start_servers(
             "--tensor-parallel-size",
             "1",
             "--dtype",
-            "float16",
+            "bfloat16",
             "--generation-config",
             "vllm",
             "--skip-tokenizer-init",
@@ -486,6 +368,8 @@ async def run(args):
     import aiohttp
     from transformers import AutoTokenizer
 
+    if args.samples_per_prompt <= 0:
+        raise ValueError("--samples-per-prompt must be positive")
     if args.resume and args.output is None:
         raise ValueError("--resume requires --output")
     if args.output is None:
@@ -513,7 +397,7 @@ async def run(args):
         "model": args.model,
         "save_rollouts": args.save_rollouts,
         "limit": args.limit,
-        "rollouts_per_question": ROLLOUTS_PER_QUESTION,
+        "rollouts_per_question": args.samples_per_prompt,
         "scoring_version": SCORING_VERSION,
         "max_tokens": args.max_tokens,
         "max_model_len": args.max_model_len,
@@ -599,15 +483,22 @@ async def run(args):
                         response.raise_for_status()
                         choice = (await response.json())["choices"][0]
                     ids = choice.get("token_ids") or []
+                    decoded = tokenizer.decode(ids, skip_special_tokens=True)
                     reward, details = compute_strict_score(
-                        tokenizer.decode(ids, skip_special_tokens=True),
+                        decoded,
                         "4",
                         ended_eod=bool(ids and ids[-1] == tokenizer.eos_token_id),
                         truncated=choice.get("finish_reason") in {"length", "max_tokens"},
                     )
-                    if reward != 1.0:
+                    # Incorrect or malformed answers are valid policy samples.
+                    # Check the token/EOS contract independently of answer quality.
+                    if not ids or (choice.get("finish_reason") == "stop" and not details["ended_eod"]):
                         raise RuntimeError(f"Engine acceptance failed: {url}: {details}")
-                    print(f"Engine acceptance passed: {url}, tokens={len(ids)}, EOS={ids[-1]}", flush=True)
+                    print(
+                        f"Engine acceptance passed: {url}, tokens={len(ids)}, "
+                        f"probe_reward={reward}, response={decoded!r}",
+                        flush=True,
+                    )
 
                 await asyncio.gather(*(validate(url) for url in urls))
             config["engine_validation"] = "passed"
@@ -633,7 +524,7 @@ async def run(args):
             while (row := await data_queue.get()) is not None:
                 prompt_ids = row.pop("_prompt_ids")
                 if row["_prompt_too_long"]:
-                    await score_queue.put((row, [{"text": ""}] * ROLLOUTS_PER_QUESTION))
+                    await score_queue.put((row, [{"text": ""}] * args.samples_per_prompt))
                     progress["oversized_questions"] += 1
                     continue
                 body = orjson.dumps(
@@ -648,8 +539,8 @@ async def run(args):
                 )
                 question = {
                     "row": row,
-                    "choices": [None] * ROLLOUTS_PER_QUESTION,
-                    "remaining": ROLLOUTS_PER_QUESTION,
+                    "choices": [None] * args.samples_per_prompt,
+                    "remaining": args.samples_per_prompt,
                     "body": body,
                 }
                 if args.save_rollouts:
@@ -660,7 +551,7 @@ async def run(args):
                 # Keep the 64 copies together for prefix reuse; choose the least loaded engine.
                 index = min(range(len(urls)), key=lambda i: (queues[i].qsize() + active[i], (i - position) % len(urls)))
                 position = (index + 1) % len(urls)
-                for sample_index in range(ROLLOUTS_PER_QUESTION):
+                for sample_index in range(args.samples_per_prompt):
                     await queues[index].put((question, sample_index))
             for queue, count in zip(queues, workers, strict=True):
                 for _ in range(count):
@@ -832,6 +723,7 @@ parser.add_argument("--resume", action="store_true", help="Resume completed ques
 parser.add_argument(
     "--save-rollouts", action="store_true", help="Persist all scored token trajectories for value pretraining"
 )
+parser.add_argument("--samples-per-prompt", type=int, default=ROLLOUTS_PER_QUESTION)
 parser.add_argument("--sampling", choices=("eval", "rollout"), default="eval", help="Sampling recipe (default: eval)")
 parser.add_argument(
     "--base-url", help="Comma-separated external engines; otherwise launch one TP1 engine per visible GPU"

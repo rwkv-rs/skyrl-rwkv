@@ -20,6 +20,7 @@ pytestmark = pytest.mark.vllm
 
 from skyrl.backends.skyrl_train.weight_sync import sources as sources_mod  # noqa: E402
 from skyrl.backends.skyrl_train.weight_sync.sources import (  # noqa: E402
+    FsdpLoraWeightSource,
     FsdpWeightSource,
     LoraAdapterWeightSource,
     MegatronWeightSource,
@@ -101,6 +102,112 @@ class TestFsdpWeightSource:
         monkeypatch.setattr(sources_mod, "materialize_full_tensor", _spy)
         list(FsdpWeightSource(_model(), torch.bfloat16))
         assert gathered == [(2, 3), (3,)]
+
+
+class TestFsdpLoraWeightSource:
+    @pytest.mark.parametrize(
+        "targets",
+        [
+            ["mlp.key", "mlp.value"],
+            ["r_proj", "k_proj", "v_proj", "o_proj", "mlp.key", "mlp.value", "lm_head"],
+        ],
+    )
+    def test_rwkv_channel_mixing_adapters_are_merged_for_sync_and_export(self, targets):
+        from peft import LoraConfig, get_peft_model
+        from transformers import RwkvConfig, RwkvForCausalLM
+
+        from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
+            iter_merged_lora_weights,
+        )
+
+        base = RwkvForCausalLM(
+            RwkvConfig(
+                vocab_size=32,
+                hidden_size=64,
+                intermediate_size=256,
+                num_hidden_layers=1,
+                num_attention_heads=1,
+                decay_low_rank_dim=64,
+                a_low_rank_dim=64,
+                gate_low_rank_dim=64,
+                v_low_rank_dim=64,
+            )
+        ).to(torch.bfloat16)
+        model = get_peft_model(base, LoraConfig(r=8, lora_alpha=8, target_modules=targets, use_nora=True))
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if "lora_B" in name:
+                    parameter.fill_(0.001)
+        before = {name: value.clone() for name, value in model.state_dict().items()}
+        source = FsdpLoraWeightSource(model, torch.float16)
+        _, pairs = _assert_channels_agree(source)
+        streamed = dict(pairs)
+        exported = {name: weight.half() for name, weight in iter_merged_lora_weights(model, model.state_dict())}
+        assert streamed.keys() == exported.keys()
+        assert not any("lora_" in name or "base_layer" in name for name in streamed)
+        for name, weight in streamed.items():
+            torch.testing.assert_close(weight, exported[name], rtol=0, atol=0)
+        for projection in ("key", "value"):
+            layer = getattr(model.get_base_model().model.layers[0].mlp, projection)
+            weight_a = layer.lora_A["default"].weight.float()
+            expected = layer.base_layer.weight.float() + layer.scaling["default"] * (
+                layer.lora_B["default"].weight.float() @ (weight_a / (weight_a.norm(dim=0, keepdim=True) + 1e-6))
+            )
+            name = f"model.layers.0.mlp.{projection}.weight"
+            torch.testing.assert_close(streamed[name], expected.half(), rtol=0, atol=0)
+            assert not torch.equal(streamed[name], layer.base_layer.weight.half())
+        for name, value in model.state_dict().items():
+            torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+
+    def _model(self):
+        from peft import LoraConfig, get_peft_model
+
+        base = torch.nn.Sequential(torch.nn.Linear(3, 4, bias=False)).to(torch.bfloat16)
+        model = get_peft_model(base, LoraConfig(r=2, lora_alpha=2, target_modules=["0"]))
+        layer = model.get_base_model()[0]
+        layer.use_nora = {"default": True}
+        with torch.no_grad():
+            layer.base_layer.weight.fill_(1.0)
+            layer.lora_A["default"].weight.copy_(torch.tensor([[3.0, 0.0, 1.0], [4.0, 2.0, 0.0]]))
+            layer.lora_B["default"].weight.fill_(0.001)
+        return model, layer
+
+    def test_normalized_merge_preserves_small_updates_and_live_parameters(self):
+        model, layer = self._model()
+        before = {name: value.clone() for name, value in model.state_dict().items()}
+        source = FsdpLoraWeightSource(model, torch.float16)
+        meta, pairs = _assert_channels_agree(source)
+        assert [item.name for item in meta] == ["0.weight"]
+        weight_a = layer.lora_A["default"].weight.float()
+        expected = layer.base_layer.weight.float() + layer.lora_B["default"].weight.float() @ (
+            weight_a / (weight_a.norm(dim=0, keepdim=True) + 1e-6)
+        )
+        torch.testing.assert_close(pairs[0][1], expected.half())
+        assert not torch.equal(pairs[0][1], layer.base_layer.weight.half())
+        for name, value in model.state_dict().items():
+            torch.testing.assert_close(value, before[name])
+
+    def test_prefix_and_next_sync_use_updated_adapter(self):
+        model, layer = self._model()
+        source = FsdpLoraWeightSource(model, torch.float16, weight_prefix="language_model.")
+        assert [item.name for item in source.metadata()] == ["language_model.0.weight"]
+        first = dict(source)["language_model.0.weight"]
+        with torch.no_grad():
+            layer.lora_B["default"].weight.mul_(2)
+        second = dict(source)["language_model.0.weight"]
+        assert not torch.equal(first, second)
+
+    def test_gathered_hf_export_matches_streamed_weights(self):
+        from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
+            iter_merged_lora_weights,
+        )
+
+        model, _ = self._model()
+        exported = {name: weight.half() for name, weight in iter_merged_lora_weights(model, model.state_dict())}
+        streamed = dict(FsdpLoraWeightSource(model, torch.float16))
+        assert exported.keys() == streamed.keys()
+        for name in exported:
+            torch.testing.assert_close(exported[name], streamed[name])
 
 
 class _FakeBridge:

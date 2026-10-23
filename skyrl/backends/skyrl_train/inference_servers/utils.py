@@ -37,7 +37,7 @@ from skyrl.train.config import (
 
 logger = logging.getLogger(__name__)
 
-# vLLM logprobs mode for every SkyRL-launched engine: logprobs of the sampling distribution.
+# Default vLLM logprobs mode: logprobs of the sampling distribution.
 VLLM_LOGPROBS_MODE = "processed_logprobs"
 
 
@@ -123,17 +123,45 @@ def _apply_serialized_fp8_weight_sync_defaults(
     engine_kwargs["hf_overrides"] = hf_overrides
 
 
-def _validate_logprobs_mode(engine_kwargs: Dict[str, Any], *, context: str) -> None:
-    """Raises if *engine_kwargs* sets ``logprobs_mode`` to anything but ``VLLM_LOGPROBS_MODE``."""
-    logprobs_mode = engine_kwargs.get("logprobs_mode", VLLM_LOGPROBS_MODE)
-    if logprobs_mode != VLLM_LOGPROBS_MODE:
-        raise ValueError(f"{context}.logprobs_mode must be {VLLM_LOGPROBS_MODE!r}, got {logprobs_mode!r}.")
+def _get_vllm_logprobs_mode(cfg: SkyRLTrainConfig) -> str:
+    """Allow RWKV Rapid-Sampling's raw logprobs for an unmodified rollout distribution."""
+    if cfg.generator.inference_engine.engine_init_kwargs.get("logprobs_mode") != "raw_logprobs":
+        return VLLM_LOGPROBS_MODE
+
+    from transformers import AutoConfig
+
+    model_config = AutoConfig.from_pretrained(cfg.trainer.policy.model.path, trust_remote_code=True)
+    if model_config.model_type != "rwkv":
+        raise ValueError("raw_logprobs requires an RWKV model with an unmodified rollout distribution")
+    sampling = get_config_as_dict(cfg.generator.sampling_params)
+    sampling.update(sampling.pop("additional_kwargs") or {})
+    neutral_values = dict(
+        temperature=1.0,
+        top_p=1.0,
+        top_k=-1,
+        min_p=0.0,
+        repetition_penalty=1.0,
+        presence_penalty=0.0,
+        frequency_penalty=0.0,
+    )
+    if any(sampling.get(key, value) != value for key, value in neutral_values.items()) or any(
+        sampling.get(key) for key in ("logit_bias", "allowed_token_ids", "logits_processors", "structured_outputs")
+    ):
+        raise ValueError("RWKV raw_logprobs requires an unmodified rollout distribution")
+    return "raw_logprobs"
+
+
+def _validate_logprobs_mode(engine_kwargs: Dict[str, Any], *, context: str, expected: str = VLLM_LOGPROBS_MODE) -> None:
+    """Reject engine overrides that change the selected logprob semantics."""
+    logprobs_mode = engine_kwargs.get("logprobs_mode", expected)
+    if logprobs_mode != expected:
+        raise ValueError(f"{context}.logprobs_mode must be {expected!r}, got {logprobs_mode!r}.")
 
 
 def _uses_lora_weight_sync(cfg: SkyRLTrainConfig) -> bool:
     """Return True when the trainer syncs LoRA adapters (not merged weights).
 
-    FSDP always syncs LoRA adapters when ``lora.rank > 0``.
+    FSDP syncs adapters for ordinary LoRA, and complete merged weights for NoRA.
     Megatron merges LoRA into the base weights by default
     (``merge_lora=True``), so the inference engine should not enable LoRA.
     """
@@ -141,7 +169,7 @@ def _uses_lora_weight_sync(cfg: SkyRLTrainConfig) -> bool:
         return False
     if cfg.trainer.strategy == "megatron":
         return not cfg.trainer.policy.megatron_config.lora_config.merge_lora
-    return True
+    return not cfg.trainer.policy.model.lora.use_nora
 
 
 def resolve_policy_model_name(cfg: SkyRLTrainConfig) -> str:
@@ -200,6 +228,7 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
     args: Namespace = parser.parse_args(args=[])
 
     ie_cfg = cfg.generator.inference_engine
+    logprobs_mode = _get_vllm_logprobs_mode(cfg)
     overrides = dict(
         model=cfg.trainer.policy.model.path,
         tensor_parallel_size=ie_cfg.tensor_parallel_size,
@@ -235,9 +264,8 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
         # models with custom modeling code (MiMo, Qwen3.5, DeepSeek-V3, ...) require it to load.
         # Overridable via generator.inference_engine.engine_init_kwargs.trust_remote_code below.
         trust_remote_code=True,
-        # Logprobs are computed from the sampling distribution (after temperature and top-k/top-p).
-        # Other values from engine kwargs are rejected by _validate_logprobs_mode.
-        logprobs_mode=VLLM_LOGPROBS_MODE,
+        # RWKV raw logprobs equal sampling logprobs for an unmodified rollout distribution.
+        logprobs_mode=logprobs_mode,
     )
     # Sample-support capture asks for one logprob per diagnostic candidate.  The
     # width is independent of sampling_params.top_k so diagnostics do not alter
@@ -249,7 +277,7 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
             else cfg.generator.sampling_params.top_k
         )
         overrides["max_logprobs"] = support_top_k
-        if cfg.trainer.algorithm.flashreinforce.score_centering:
+        if cfg.trainer.algorithm.flashreinforce.score_centering or cfg.trainer.algorithm.rollout_is.score_centering:
             overrides["logprobs_mode"] = ie_cfg.sample_support_logprobs_mode
     for key, value in overrides.items():
         setattr(args, key, value)
@@ -304,7 +332,9 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
         logger.info(f"vLLM speculative decoding enabled: speculative_config={spec_cfg}")
 
     engine_kwargs = get_config_as_dict(ie_cfg.engine_init_kwargs)
-    _validate_logprobs_mode(engine_kwargs, context="generator.inference_engine.engine_init_kwargs")
+    _validate_logprobs_mode(
+        engine_kwargs, context="generator.inference_engine.engine_init_kwargs", expected=logprobs_mode
+    )
     _apply_serialized_fp8_weight_sync_defaults(
         ie_cfg,
         engine_kwargs,
@@ -377,7 +407,11 @@ def get_pd_cli_args(
     args = copy.deepcopy(cli_args)
 
     if role_init_kwargs:
-        _validate_logprobs_mode(role_init_kwargs, context=f"generator.inference_engine.{role}_init_kwargs")
+        _validate_logprobs_mode(
+            role_init_kwargs,
+            context=f"generator.inference_engine.{role}_init_kwargs",
+            expected=getattr(args, "logprobs_mode", VLLM_LOGPROBS_MODE),
+        )
         for key, value in role_init_kwargs.items():
             setattr(args, key, value)
 

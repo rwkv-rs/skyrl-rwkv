@@ -55,6 +55,14 @@ class BasePPOExp:
             use_fast=not self.cfg.trainer.disable_fast_tokenizer,
             padding_side="left",
         )
+        from transformers import AutoConfig, GenerationConfig
+
+        model_config = AutoConfig.from_pretrained(self.cfg.trainer.policy.model.path, trust_remote_code=True)
+        if model_config.model_type == "rwkv":
+            generation_config = GenerationConfig.from_pretrained(self.cfg.trainer.policy.model.path)
+            for sampling_params in (self.cfg.generator.sampling_params, self.cfg.generator.eval_sampling_params):
+                if sampling_params.stop is None:
+                    sampling_params.stop = generation_config.stop_strings
         self.train_dataset = self.get_train_dataset()
         self.eval_dataset = self.get_eval_dataset()
         self.colocate_pg = self.get_colocate_pg()
@@ -168,7 +176,12 @@ class BasePPOExp:
         Returns:
             The trainer.
         """
-        return RayPPOTrainer(
+        trainer_cls = RayPPOTrainer
+        if cfg.trainer.fully_async.enabled:
+            from skyrl.train.fully_async_trainer import FullyAsyncRayPPOTrainer
+
+            trainer_cls = FullyAsyncRayPPOTrainer
+        return trainer_cls(
             cfg=cfg,
             tracker=tracker,
             tokenizer=tokenizer,

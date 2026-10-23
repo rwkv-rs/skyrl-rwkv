@@ -339,6 +339,7 @@ class FSDPStrategy(DistributedStrategy):
         from safetensors.torch import save_file
 
         from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
+            collect_lora_params,
             layered_summon_lora_params,
         )
 
@@ -349,11 +350,15 @@ class FSDPStrategy(DistributedStrategy):
             io.makedirs(lora_save_path, exist_ok=True)
             peft_config = asdict(model.peft_config.get("default", {}))
             if peft_config:
-                peft_config["task_type"] = peft_config["task_type"].value
+                if peft_config["task_type"] is not None:
+                    peft_config["task_type"] = peft_config["task_type"].value
                 peft_config["peft_type"] = peft_config["peft_type"].value
                 peft_config["target_modules"] = list(peft_config["target_modules"])
 
-        lora_params = layered_summon_lora_params(model)
+        if model.peft_config["default"].modules_to_save:
+            lora_params = collect_lora_params(model)
+        else:
+            lora_params = layered_summon_lora_params(model)
 
         if self.is_rank_0():
             save_file(lora_params, os.path.join(lora_save_path, "adapter_model.safetensors"))
@@ -393,7 +398,12 @@ class FSDPStrategy(DistributedStrategy):
         # Define paths for saving individual rank files
         rank = self.get_rank()
         world_size = self.world_size
-        replicated_rwkv = isinstance(model, HFModelWrapper) and model.is_rwkv and self.fsdp_config.fsdp_size == 1
+        is_rwkv = (
+            model.is_rwkv
+            if isinstance(model, HFModelWrapper)
+            else getattr(getattr(save_model, "config", None), "model_type", None) == "rwkv"
+        )
+        replicated_rwkv = is_rwkv and self.fsdp_config.fsdp_size == 1
 
         with io.local_work_dir(ckpt_dir) as work_dir:
             model_path = os.path.join(work_dir, f"model_world_size_{world_size}_rank_{rank}.pt")
@@ -697,7 +707,14 @@ class FSDPStrategy(DistributedStrategy):
         }
 
     # TODO (erictang000): Test in multi-node setting
-    def save_hf_model(self, model: Union[HFModelWrapper, nn.Module], output_dir: str, tokenizer=None, **kwargs) -> None:
+    def save_hf_model(
+        self,
+        model: Union[HFModelWrapper, nn.Module],
+        output_dir: str,
+        tokenizer=None,
+        output_dtype: torch.dtype = torch.bfloat16,
+        **kwargs,
+    ) -> None:
         """Save model in HuggingFace safetensors format using FSDP's full state dict gathering"""
 
         # Step 1: Create output directory (rank 0 only)
@@ -718,12 +735,25 @@ class FSDPStrategy(DistributedStrategy):
 
         # Step 4: Save on rank 0 only
         if self.is_rank_0():
+            if self.model_config is not None and self.model_config.lora.use_nora:
+                from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
+                    iter_merged_lora_weights,
+                )
+
+                output_state_dict = {
+                    name: weight.to(output_dtype).contiguous()
+                    for name, weight in iter_merged_lora_weights(model_to_save, output_state_dict)
+                }
+                model_to_save = model_to_save.get_base_model()
             with self._atomic_local_export_dir(output_dir) as work_dir:
                 # Save the model in HuggingFace format using safetensors
                 model_to_save.save_pretrained(work_dir, state_dict=output_state_dict, safe_serialization=True, **kwargs)
 
                 # Fix and save the config
                 config_to_save = self._fix_fsdp_config(model_to_save.config)
+                if self.model_config is not None and self.model_config.lora.use_nora:
+                    config_to_save = copy.deepcopy(config_to_save)
+                    config_to_save.dtype = output_dtype
                 config_to_save.save_pretrained(work_dir)
 
                 # Save tokenizer if provided

@@ -173,7 +173,9 @@ def test_selects_whole_benchmarks_by_truncation(tmp_path):
     assert (output / "benchmarks.toml").read_text() == 'maths = ["aime25", "aime24"]\n'
 
 
-def test_exports_every_native_doc_and_keeps_gpqa_problem_identity(tmp_path, monkeypatch):
+@pytest.mark.parametrize("include_answers", [False, True])
+@pytest.mark.parametrize("benchmark_names", [("gpqa:main", "gpqa:diamond"), ("gsm8k", "gsm_plus")])
+def test_exports_every_native_doc_and_keeps_problem_identity(tmp_path, monkeypatch, include_answers, benchmark_names):
     native_calls = []
 
     class Task:
@@ -182,9 +184,9 @@ def test_exports_every_native_doc_and_keeps_gpqa_problem_identity(tmp_path, monk
             self.full_name = name + "|0"
             self.dataset_config = SimpleNamespace(version=1, hf_repo="Idavidrein/gpqa")
             self.evaluation_split = ["train"]
-            self.rows = [{"Question": question} for _ in queries]
+            self.rows = [{"Question": question, "seed_question": "same original question"} for _ in queries]
             self.docs = [
-                SimpleNamespace(query=query, id=str(index), choices=["cached-gold"])
+                SimpleNamespace(query=query, id=str(index), choices=["cached-gold"], get_golds=lambda: ["cached-gold"])
                 for index, query in enumerate(queries)
             ]
 
@@ -192,14 +194,14 @@ def test_exports_every_native_doc_and_keeps_gpqa_problem_identity(tmp_path, monk
             native_calls.append((self.name, max_samples))
             return self.docs
 
-    tasks = {
-        name: Task(name, ["Q\nA) one\nB) two", "Other question"], "same original question")
-        for name in ("gpqa:main", "gpqa:diamond")
-    }
+    queries = ["Q\nA) one\nB) two", "Other question"]
+    if benchmark_names[0] == "gsm8k":
+        queries = ["Question: same original question\n", "Question: same original question\n"]
+    tasks = {name: Task(name, queries, "same original question") for name in benchmark_names}
 
     class Registry:
         def __init__(self, **kwargs):
-            assert kwargs["tasks"] == "gpqa:main,gpqa:diamond"
+            assert kwargs["tasks"] == ",".join(benchmark_names)
 
         def load_tasks(self):
             return tasks
@@ -223,6 +225,7 @@ def test_exports_every_native_doc_and_keeps_gpqa_problem_identity(tmp_path, monk
                     {
                         "name": name,
                         "field": "knowledge",
+                        "prompt_template": "assistant" if name.startswith("gsm") else "bot",
                         "cot_mode": "CoT",
                         "evidence": [{"max_generated_tokens": 24576}],
                     }
@@ -232,15 +235,24 @@ def test_exports_every_native_doc_and_keeps_gpqa_problem_identity(tmp_path, monk
         )
     )
     output = tmp_path / "prompts"
-    antidoom.export_benchmarks(SimpleNamespace(benchmarks=path, lighteval_project=tmp_path, output=output, seed=42))
+    antidoom.export_benchmarks(
+        SimpleNamespace(
+            benchmarks=path,
+            lighteval_project=tmp_path,
+            output=output,
+            seed=42,
+            include_answers=include_answers,
+        )
+    )
     rows = list(antidoom.read_jsonl(output / "prompts.jsonl"))
     assert len(rows) == 4
-    assert native_calls == [("gpqa:main", None), ("gpqa:diamond", None)]
+    assert native_calls == [(name, None) for name in benchmark_names]
     assert {row["source"]["doc_id"] for row in rows} == {"0", "1"}
     assert len({row["source"]["problem_key"] for row in rows}) == 1
-    assert all(row["source"]["prompt_template"] == "bot" for row in rows)
-    assert "cached-gold" not in (output / "prompts.jsonl").read_text()
-    assert set(rows[0]) == {"query", "source"}
+    expected_template = "assistant" if benchmark_names[0] == "gsm8k" else "bot"
+    assert all(row["source"]["prompt_template"] == expected_template for row in rows)
+    assert ("cached-gold" in (output / "prompts.jsonl").read_text()) == include_answers
+    assert set(rows[0]) == ({"query", "source", "gold_answers"} if include_answers else {"query", "source"})
 
 
 @pytest.mark.parametrize("pubmed_evaluated", [False, True])
@@ -684,10 +696,7 @@ def test_prepare_groups_siblings_and_keeps_original_validation_prompts(tmp_path,
     "use_nora",
     [
         False,
-        pytest.param(
-            True,
-            marks=pytest.mark.skipif("use_nora" not in LoraConfig.__dataclass_fields__, reason="requires Joluck/NoRA"),
-        ),
+        True,
     ],
 )
 @pytest.mark.parametrize("adapt_head", [False, True])
@@ -774,8 +783,8 @@ def test_adapter_reference_reload_and_merged_logits_after_optimizer_step(tmp_pat
     actual = antidoom.last_logits(merged, prompt_ids, "cpu")
     torch.testing.assert_close(actual, adapted, atol=0.003, rtol=0.01)
     assert not any("lora_" in name for name, _ in merged.named_parameters())
-    assert merged.dtype == torch.float16
+    assert merged.dtype == torch.bfloat16
     reloaded = LlamaForCausalLM.from_pretrained(output, dtype="auto").eval()
-    assert reloaded.dtype == torch.float16
+    assert reloaded.dtype == torch.bfloat16
     torch.testing.assert_close(antidoom.last_logits(reloaded, prompt_ids, "cpu"), actual)
     assert json.loads((output / "merge_metrics.json").read_text())["merge_dtype"] == "float32"

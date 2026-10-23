@@ -27,6 +27,7 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     register_policy_loss,
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
+from skyrl.train.config import AlgorithmConfig, GAEAdaptiveConfig
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -35,6 +36,125 @@ def shutdown_hook():
     # repopulate registries after this module finishes
     PolicyLossRegistry.repopulate_registry()
     AdvantageEstimatorRegistry.repopulate_registry()
+
+
+@pytest.mark.parametrize("gamma", [1.0, 0.9])
+@pytest.mark.parametrize("mode", ["adaptive", "fixed"])
+def test_gae_adaptive_matches_compressed_action_reference(gamma, mode):
+    """Observation insertion and padding cannot change either action trace."""
+    values = torch.tensor([[0.2, 999.0, -0.3, 999.0, 0.4], [999.0, 0.5, 999.0, 0.1, 999.0]])
+    rewards = torch.tensor([[0.1, 999.0, 0.2, 999.0, 1.0], [999.0, -0.1, 999.0, 0.0, 999.0]])
+    mask = torch.tensor([[1, 0, 1, 0, 1], [0, 1, 0, 1, 0]])
+    config = AlgorithmConfig(gae_adaptive=GAEAdaptiveConfig(mode=mode, alpha=1.5, min_length=0, critic_lambd=0.8))
+    adv, ret = compute_advantages_and_returns(
+        rewards,
+        torch.ones_like(mask),
+        np.array(["a", "b"]),
+        "gae_adaptive",
+        config,
+        values=values,
+        loss_mask=mask,
+        gamma=gamma,
+        lambd=0.6,
+    )
+    for row in range(2):
+        active = mask[row].bool()
+        compressed_values = values[row, active].double()
+        compressed_rewards = rewards[row, active].double()
+        length = int(active.sum())
+        actor_lambda = 1 - 1 / (1.5 * length) if mode == "adaptive" else 0.6
+        for trace_lambda, result, add_value in [(actor_lambda, adv, False), (0.8, ret, True)]:
+            expected = torch.zeros(length, dtype=torch.float64)
+            deltas = compressed_rewards - compressed_values
+            deltas[:-1] += gamma * compressed_values[1:]
+            for t in range(length):
+                powers = (gamma * trace_lambda) ** torch.arange(length - t, dtype=torch.float64)
+                expected[t] = (deltas[t:] * powers).sum()
+            if add_value:
+                expected += compressed_values
+            torch.testing.assert_close(result[row, active], expected.float())
+        assert not adv[row, ~active].any()
+        assert not ret[row, ~active].any()
+
+
+def test_gae_adaptive_critic_mc_targets_independent_of_actor_lambda():
+    rewards = torch.tensor([[0.0, 0.0, 1.0], [0.0, 0.0, -1.0]])
+    values = torch.tensor([[0.1, 0.2, 0.3], [0.0, -0.2, -0.5]], requires_grad=True)
+    mask = torch.ones_like(rewards)
+    results = []
+    for alpha in (0.5, 1.5):
+        results.append(
+            compute_advantages_and_returns(
+                rewards,
+                mask,
+                np.array(["a", "b"]),
+                "gae_adaptive",
+                AlgorithmConfig(gae_adaptive=GAEAdaptiveConfig(alpha=alpha, min_length=0)),
+                values=values,
+                loss_mask=mask,
+            )
+        )
+    assert not torch.allclose(results[0][0], results[1][0])
+    for adv, ret in results:
+        torch.testing.assert_close(ret, torch.tensor([[1.0] * 3, [-1.0] * 3]))
+        assert not adv.requires_grad and not ret.requires_grad
+
+
+def test_gae_adaptive_single_action_and_fully_masked_rows():
+    rewards = torch.tensor([[99.0, 1.0], [99.0, 99.0]])
+    values = torch.tensor([[99.0, 0.2], [99.0, 99.0]])
+    mask = torch.tensor([[0, 1], [0, 0]])
+    adv, ret = compute_advantages_and_returns(
+        rewards,
+        mask,
+        np.array(["a", "pad"]),
+        "gae_adaptive",
+        AlgorithmConfig(),
+        values=values,
+        loss_mask=mask,
+    )
+    torch.testing.assert_close(adv, torch.tensor([[0.0, 0.8], [0.0, 0.0]]))
+    torch.testing.assert_close(ret, torch.tensor([[0.0, 1.0], [0.0, 0.0]]))
+
+
+@pytest.mark.parametrize("length", [1, 2, 49, 50, 51])
+def test_gae_adaptive_short_trajectory_matches_sao_reference(length):
+    rewards = torch.zeros(1, length)
+    rewards[0, -1] = 1
+    mask = torch.ones_like(rewards)
+    advantages, returns = compute_advantages_and_returns(
+        rewards,
+        mask,
+        np.array(["answer"]),
+        "gae_adaptive",
+        AlgorithmConfig(),
+        values=torch.zeros_like(rewards),
+        loss_mask=mask,
+    )
+    lambd = 1.0 if length < 50 else 1 - 1 / (1.5 * length)
+    expected = lambd ** torch.arange(length - 1, -1, -1, dtype=torch.float64)
+    torch.testing.assert_close(advantages[0], expected.float())
+    torch.testing.assert_close(returns, torch.ones_like(returns))
+
+
+def test_gae_adaptive_long_trace_with_bf16_values_keeps_fp32_targets():
+    length = 8192
+    rewards = torch.zeros(1, length)
+    rewards[0, -1] = 1
+    values = torch.zeros_like(rewards, dtype=torch.bfloat16)
+    mask = torch.ones_like(rewards)
+    adv, ret = compute_advantages_and_returns(
+        rewards,
+        mask,
+        np.array(["long"]),
+        "gae_adaptive",
+        AlgorithmConfig(),
+        values=values,
+        loss_mask=mask,
+    )
+    assert adv.dtype == ret.dtype == torch.float32
+    assert adv[0, 0] == pytest.approx((1 - 1 / (1.5 * length)) ** (length - 1), rel=1e-6)
+    torch.testing.assert_close(ret, torch.ones_like(ret))
 
 
 @pytest.fixture

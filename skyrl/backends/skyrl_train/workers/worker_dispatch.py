@@ -9,7 +9,8 @@ The trainer interacts with the worker dispatch if all models are always on GPU.
 """
 
 import time
-from dataclasses import dataclass
+from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from loguru import logger
@@ -239,6 +240,26 @@ class WorkerDispatch:
         for model in self._actor_groups:
             self.mark_as_offloaded(model)
 
+    @contextmanager
+    def offload_for_evaluation(self):
+        """Lend trainer GPUs to evaluation, then restore their model/optimizer state."""
+        states = {name: replace(state) for name, state in self._gpu_state.items()}
+        try:
+            for name, state in states.items():
+                if state.model_on_gpu or state.optimizer_on_gpu:
+                    self._offload_inactive_model(name)
+            yield
+        finally:
+            for name, state in states.items():
+                current = self._gpu_state[name]
+                backload_model = state.model_on_gpu and not current.model_on_gpu
+                backload_optimizer = state.optimizer_on_gpu and not current.optimizer_on_gpu
+                if backload_model or backload_optimizer:
+                    self._actor_groups[name].backload_to_gpu(
+                        backload_model=backload_model, backload_optimizer=backload_optimizer
+                    )
+                self._gpu_state[name] = state
+
     def mark_as_offloaded(self, model: str) -> None:
         """Mark a specific model as offloaded without changing others."""
         if model not in self._actor_groups:
@@ -454,7 +475,7 @@ class WorkerDispatch:
         self._save_memory_snapshot(model, "forward_backward")
         return WorkerOutput.cat(self._actor_groups[model].actor_infos, statuses)
 
-    def optim_step(self, model: str, model_id: Optional[str] = None) -> Optional[float]:
+    def optim_step(self, model: str, model_id: Optional[str] = None, gradient_scale: float = 1.0) -> Optional[float]:
         """Run optimizer step. For single-tenant training, the model should already be on GPU from forward_backward.
 
         For multi-tenant LoRA training, ``model_id`` is used to ensure the correct adapter is used.
@@ -465,7 +486,8 @@ class WorkerDispatch:
         """
         self._ensure_on_gpu(model, need_optimizer=True, need_model=True)
         self.ensure_active_adapter(model, model_id)
-        refs = self._actor_groups[model].async_run_ray_method("pass_through", "optim_step")
+        kwargs = {"gradient_scale": gradient_scale} if gradient_scale != 1.0 else {}
+        refs = self._actor_groups[model].async_run_ray_method("pass_through", "optim_step", **kwargs)
         grad_norms = deadline.ray_get(refs, "optim_step")
 
         self._save_memory_snapshot(model, "optim_step")
@@ -680,6 +702,13 @@ class WorkerDispatch:
             all_node_ids.extend(node_ids)
         return list(set(all_node_ids))
 
+    def get_worker_gpu_locations(self, model: str) -> List[Tuple[str, int]]:
+        """Return each worker's node and physical GPU for colocated inference."""
+        group = self._actor_groups[model]
+        nodes = deadline.ray_get(group.async_run_ray_method("pass_through", "get_ray_node_id"), "get_ray_node_id")
+        gpus = deadline.ray_get(group.async_run_ray_method("pass_through", "get_gpu_id"), "get_gpu_id")
+        return list(dict.fromkeys((node, int(gpu)) for node, gpu in zip(nodes, gpus, strict=True)))
+
     # ----------------------------------
     # Weight sync methods
     # ----------------------------------
@@ -856,9 +885,7 @@ class WorkerDispatch:
                     start = time.perf_counter()
                     await self._inference_engine_client.pause_generation()
                     self.last_pause_generation_seconds = time.perf_counter() - start
-                    async with cleanup_preserving_primary(
-                        _resume_generation_timed, "resume_generation"
-                    ):
+                    async with cleanup_preserving_primary(_resume_generation_timed, "resume_generation"):
                         await self._inference_engine_client.sleep_for_weight_sync(offload_kv=offload_kv)
                         await self._inference_engine_client.wake_for_weight_sync(tags=["weights"])
                         _broadcast_and_finish()
@@ -884,9 +911,7 @@ class WorkerDispatch:
                     start = time.perf_counter()
                     await self._inference_engine_client.pause_generation()
                     self.last_pause_generation_seconds = time.perf_counter() - start
-                    async with cleanup_preserving_primary(
-                        _resume_generation_timed, "resume_generation"
-                    ):
+                    async with cleanup_preserving_primary(_resume_generation_timed, "resume_generation"):
                         _broadcast_and_finish()
 
         # Advance the policy version so prefix-cache salting isolates blocks from the previous weights

@@ -79,6 +79,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             lora_alpha=self.cfg.policy.model.lora.alpha,
             lora_dropout=self.cfg.policy.model.lora.dropout,
             lora_init_method=self.cfg.policy.model.lora.init_method,
+            use_nora=self.cfg.policy.model.lora.use_nora,
             target_modules=self.cfg.policy.model.lora.target_modules,
             exclude_modules=self.cfg.policy.model.lora.exclude_modules,
             sequence_parallel_size=self.cfg.policy.sequence_parallel_size,
@@ -89,6 +90,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             language_model_only=self.cfg.policy.language_model_only,
             logprobs_chunk_size=self.cfg.logprobs_chunk_size,
             rwkv_chunk_size=self.cfg.rwkv_chunk_size,
+            rwkv_response_only_head=self.cfg.rwkv_response_only_head,
         )
         if (
             wrapped_model.is_rwkv
@@ -159,9 +161,15 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
 
             return make_fsdp_weight_source(self.model.model, dtype, weight_prefix)
 
-        from skyrl.backends.skyrl_train.weight_sync.sources import FsdpWeightSource
+        from skyrl.backends.skyrl_train.weight_sync.sources import (
+            FsdpLoraWeightSource,
+            FsdpWeightSource,
+        )
 
-        return FsdpWeightSource(self.model.model, dtype, weight_prefix, rwkv_effective_bf16=self.model.is_rwkv)
+        if self.cfg.policy.model.lora.use_nora:
+            return FsdpLoraWeightSource(self.model.model, dtype, weight_prefix)
+
+        return FsdpWeightSource(self.model.model, dtype, weight_prefix)
 
     async def _save_lora_adapters_and_sync(
         self,
@@ -236,7 +244,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         # Check if this is a LoRA model
         peft_model = getattr(self.model.model, "_fsdp_wrapped_module", self.model.model)
 
-        if self._is_lora:
+        if self._is_lora and not self.cfg.policy.model.lora.use_nora:
             assert hasattr(peft_model, "peft_config"), "LoRA model should have peft_config"
 
             # Multi-tenant: per-adapter subdir + per-adapter vLLM name.
@@ -291,6 +299,7 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
         strategy = FSDPStrategy(
             fsdp_config=self.cfg.critic.fsdp_config,
             optimizer_config=self.cfg.critic.optimizer_config,
+            model_config=self.cfg.critic.model,
             fsdp_strategy=self.cfg.strategy,
             seed=self.cfg.seed,
             micro_train_batch_size_per_gpu=self.cfg.micro_train_batch_size_per_gpu,
@@ -312,6 +321,8 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
             lora_rank=self.cfg.critic.model.lora.rank,
             lora_alpha=self.cfg.critic.model.lora.alpha,
             lora_dropout=self.cfg.critic.model.lora.dropout,
+            use_nora=self.cfg.critic.model.lora.use_nora,
+            freeze_backbone=self.cfg.critic.freeze_backbone,
             target_modules=self.cfg.critic.model.lora.target_modules,
             exclude_modules=self.cfg.critic.model.lora.exclude_modules,
             value_head_prefix=self.cfg.algorithm.value_head_prefix,
@@ -323,7 +334,7 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
         )
         self._seq_parallel_monkey_patch(model=critic, use_parent_class=True)
 
-        if self.cfg.gradient_checkpointing:
+        if self.cfg.gradient_checkpointing and not self.cfg.critic.freeze_backbone:
             critic.gradient_checkpointing_enable(
                 gradient_checkpointing_kwargs={"use_reentrant": self.cfg.gradient_checkpointing_use_reentrant}
             )
@@ -333,11 +344,18 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
             (critic, None, None),
         )
         assert self.optimizer is not None
+        if self.cfg.critic.resume_path is not None:
+            self.load_checkpoint(
+                self.cfg.critic.resume_path,
+                load_optimizer_states=False,
+                load_lr_scheduler_states=False,
+            )
 
         self._set_expandable_segments(True)
 
     def _set_pad_token_id(self, pad_token_id):
-        self.model.config.pad_token_id = pad_token_id
+        if not self.model.is_rwkv:
+            self.model.config.pad_token_id = pad_token_id
 
     def forward(
         self,
@@ -379,6 +397,7 @@ class FSDPRefWorkerBase(RefWorkerBase):
             meta_init=use_meta,
             language_model_only=self.cfg.ref.language_model_only,
             logprobs_chunk_size=self.cfg.logprobs_chunk_size,
+            rwkv_response_only_head=self.cfg.rwkv_response_only_head,
         )
         self._seq_parallel_monkey_patch(model=wrapped_model.model)
 

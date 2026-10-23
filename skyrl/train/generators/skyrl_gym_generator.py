@@ -451,7 +451,11 @@ class SkyRLGymGenerator(GeneratorInterface):
             chat_history = copy.deepcopy(prompt)
 
             # init() returns the first prompt to be given to the model, and optional metadata dict
-            chat_history, _ = await self._run_in_executor_if_available(env.init, chat_history)
+            chat_history, env_metadata = await self._run_in_executor_if_available(env.init, chat_history)
+            chat_template_kwargs = {
+                **self.generator_cfg.chat_template_kwargs,
+                **env_metadata.get("chat_template_kwargs", {}),
+            }
             initial_chat_history_length = len(chat_history)
             initial_input_ids = self.tokenizer.apply_chat_template(
                 chat_history,
@@ -461,7 +465,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                 chat_template=self.custom_chat_template if retokenize_chat_history else None,
                 tokenize=True,
                 return_dict=False,
-                **self.generator_cfg.chat_template_kwargs,
+                **chat_template_kwargs,
             )
 
             initial_prompt_length = len(initial_input_ids)
@@ -532,7 +536,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                         add_generation_prompt=True,
                         tokenize=True,
                         return_dict=False,
-                        **self.generator_cfg.chat_template_kwargs,
+                        **chat_template_kwargs,
                     )
                     agent_loop_state.loss_mask = []
                     agent_loop_state.rollout_logprobs = None
@@ -792,7 +796,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                     return_dict=True,
                     return_assistant_tokens_mask=True,
                     tokenize=True,
-                    **self.generator_cfg.chat_template_kwargs,
+                    **chat_template_kwargs,
                 )
                 loss_mask = response_encodings["assistant_masks"]
                 response_ids = response_encodings["input_ids"]

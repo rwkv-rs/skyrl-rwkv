@@ -1,8 +1,11 @@
 import asyncio
+import json
 import math
 import os
 import shutil
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -142,6 +145,9 @@ class RayPPOTrainer:
         self.all_metrics = {}
         self.all_timings = {}
         self.global_step = 0
+        self.best_metric = None
+        self.best_global_step = None
+        self._previous_best_global_step = None
 
         self._vllm_metrics_scraper: Optional[VLLMMetricsScraper] = (
             VLLMMetricsScraper() if cfg.generator.inference_engine.enable_ray_prometheus_stats else None
@@ -272,7 +278,7 @@ class RayPPOTrainer:
         Returns:
             A dictionary of evaluation metrics.
         """
-        return await evaluate(
+        metrics = await evaluate(
             eval_dataloader=self.eval_dataloader,
             generator=self.generator,
             cfg=self.cfg,
@@ -282,6 +288,32 @@ class RayPPOTrainer:
             tracker=self.tracker,
             vllm_metrics_scraper=vllm_metrics_scraper,
         )
+        if self.cfg.trainer.metric_for_best_model is not None:
+            await asyncio.to_thread(self._save_best_checkpoint, metrics)
+        return metrics
+
+    def _save_best_checkpoint(self, metrics: Dict[str, float]) -> None:
+        """Save an evaluated best using the native checkpoint and HF export paths."""
+        metric = self.cfg.trainer.metric_for_best_model
+        value = metrics[metric]
+        if not math.isfinite(value):
+            return
+        improved = self.best_metric is None or (
+            value > self.best_metric if self.cfg.trainer.greater_is_better else value < self.best_metric
+        )
+        if not improved:
+            return
+        self._previous_best_global_step = self.best_global_step
+        self.best_metric, self.best_global_step = value, self.global_step
+        checkpoint_path = self.save_checkpoints()
+        self.save_models()
+        with io.open_file(os.path.join(self.cfg.trainer.ckpt_path, "best_checkpoint.json"), "w") as handle:
+            json.dump(
+                {"metric": metric, "value": value, "global_step": self.global_step, "checkpoint_path": checkpoint_path},
+                handle,
+            )
+        self._previous_best_global_step = None
+        logger.info(f"Saved best checkpoint at step {self.global_step}: {metric}={value}")
 
     async def train(self):
         """
@@ -917,7 +949,9 @@ class RayPPOTrainer:
         self.dispatch.init_weight_sync_state(self.inference_engine_client)
         logger.info("Initialized weight sync state for policy model and inference engines.")
 
-    def convert_to_training_input(self, generator_output: GeneratorOutput, uids: List[str]) -> TrainingInputBatch:
+    def convert_to_training_input(
+        self, generator_output: GeneratorOutput, uids: List[str], *, train_batch_size: Optional[int] = None
+    ) -> TrainingInputBatch:
         """Converts lists to a padded batch of tensors for training
 
         Args:
@@ -1021,11 +1055,15 @@ class RayPPOTrainer:
 
         # 4. Compute mini-batch boundaries for train_critic_and_policy(). It excludes the ones
         # we will add in pad_training_input_batch().
-        train_batch_size = self.cfg.trainer.train_batch_size
+        policy_mini_batch_size = self.cfg.trainer.policy_mini_batch_size
+        if train_batch_size is None:
+            train_batch_size = self.cfg.trainer.train_batch_size
+        else:
+            policy_mini_batch_size = train_batch_size
         n_samples_per_prompt = self.cfg.generator.n_samples_per_prompt
         is_stepwise = self.cfg.generator.step_wise_trajectories
         training_input.metadata["policy_mini_batch_boundaries"] = compute_prompt_mini_batch_boundaries(
-            uids, self.cfg.trainer.policy_mini_batch_size, train_batch_size, is_stepwise, n_samples_per_prompt
+            uids, policy_mini_batch_size, train_batch_size, is_stepwise, n_samples_per_prompt
         )
         # Per-prompt boundaries (used by the `prompt_mean` loss reduction). Policy-only,
         # since advantage normalization only applies to the policy.
@@ -1193,9 +1231,12 @@ class RayPPOTrainer:
                     for i, mask in enumerate(generator_output["loss_masks"])
                 ]
             # Response-level rewards: rewards is List[float], convert to per-token rewards
-            for reward, response in zip(rewards, responses):
+            for reward, response, loss_mask in zip(rewards, responses, generator_output["loss_masks"]):
                 per_token_reward = [0.0] * len(response)
-                per_token_reward[-1] = float(reward)
+                reward_index = -1
+                if self.cfg.trainer.algorithm.advantage_estimator == "gae_adaptive" and any(loss_mask):
+                    reward_index = max(i for i, active in enumerate(loss_mask) if active)
+                per_token_reward[reward_index] = float(reward)
                 per_token_rewards.append(per_token_reward)
 
         n_samples_per_prompt = self.cfg.generator.n_samples_per_prompt
@@ -1292,7 +1333,8 @@ class RayPPOTrainer:
         else:
             advantage_kwargs = (
                 {"loss_mask": data["loss_mask"]}
-                if self.cfg.trainer.algorithm.advantage_estimator in ("flashreinforce", "flash_reinforce", "bpo")
+                if self.cfg.trainer.algorithm.advantage_estimator
+                in ("flashreinforce", "flash_reinforce", "bpo", "gae_adaptive")
                 else {}
             )
             if flash_advantage:
@@ -1311,6 +1353,31 @@ class RayPPOTrainer:
             )
         data["returns"] = returns
         data["advantages"] = advantages
+
+        if self.cfg.trainer.algorithm.advantage_estimator == "gae_adaptive":
+            active = data["response_mask"].bool() & data["loss_mask"].bool()
+            if active.any():
+                predictions = data["values"].float()[active]
+                targets = returns[active]
+                residual = targets - predictions
+                target_variance = targets.var(unbiased=False)
+                sequence_errors = ((returns - data["values"].float()).square() * active).sum(-1)
+                sequence_counts = active.sum(-1)
+                self.all_metrics.update(
+                    {
+                        "critic/token_mse": residual.square().mean().item(),
+                        "critic/sequence_mse": (sequence_errors / sequence_counts.clamp_min(1))[sequence_counts > 0]
+                        .mean()
+                        .item(),
+                        "critic/prediction_mean": predictions.mean().item(),
+                        "critic/target_mean": targets.mean().item(),
+                        "critic/residual_bias": residual.mean().item(),
+                    }
+                )
+                if target_variance > 0:
+                    self.all_metrics["critic/explained_variance"] = (
+                        1 - residual.var(unbiased=False) / target_variance
+                    ).item()
 
         # remove padding while calculating metrics
         pad_size = data.metadata.get("pad_size", 0)
@@ -1387,10 +1454,17 @@ class RayPPOTrainer:
             # the packing — and resulting logprobs/values — match what forward_backward recomputes.
             all_chunk_refs = self.dispatch.stage_data(model, data_fwd_pass, mini_batch_boundaries)
             combined_outputs: List[Dict[str, Any]] = []
-            for chunk_refs in all_chunk_refs:
+            for (start, end), chunk_refs in zip(mini_batch_boundaries, all_chunk_refs, strict=True):
                 mb_output = self.dispatch.forward_from_staged(model, chunk_refs)
-                combined_outputs.extend(mb_output.loss_fn_outputs)
-            return loss_fn_outputs_to_tensor(combined_outputs, key=key)
+                # stage_data pads each mini-batch independently for DP. Remove
+                # those synthetic rows before concatenation, or every following
+                # mini-batch's scores shift relative to its sampled tokens.
+                combined_outputs.extend(mb_output.loss_fn_outputs[: end - start])
+            result = loss_fn_outputs_to_tensor(combined_outputs, key=key)
+            # The input may also have trailing full-batch padding. Keep its
+            # tensor shape without inserting padding between real mini-batches.
+            padding = result.new_zeros((len(data_fwd_pass) - len(result), *result.shape[1:]))
+            return torch.cat((result, padding), dim=0)
 
         output = self.dispatch.forward(model, data_fwd_pass)
         return loss_fn_outputs_to_tensor(output.loss_fn_outputs, key=key)
@@ -1443,6 +1517,8 @@ class RayPPOTrainer:
             - `["values"]`: Float[torch.Tensor, "batch_size response_len"]
         """
         fwd_keys = ["sequences", "attention_mask"]
+        if self.cfg.trainer.rwkv_response_only_head:
+            fwd_keys.append("response_mask")
         if training_input.get("rollout_expert_indices") is not None:
             fwd_keys.append("rollout_expert_indices")
         if training_input.get("router_padding_mask") is not None:
@@ -1683,13 +1759,23 @@ class RayPPOTrainer:
         """
         data.metadata["global_step"] = self.global_step
         critic_status = None
+        train_critic = self.has_critic and self.cfg.trainer.critic.optimizer_config.lr != 0
 
-        # Unified training interface for both FSDP and Megatron
-        if self.has_critic:
-            with Timer("critic_train", self.all_timings):
-                critic_status = self._execute_training_step("critic", data)
-        with Timer("policy_train", self.all_timings):
-            policy_status = self._execute_training_step("policy", data)
+        def train_model(role):
+            with Timer(f"{role}_train", self.all_timings):
+                return self._execute_training_step(role, data)
+
+        if train_critic and self.cfg.trainer.train_critic_and_policy_parallel:
+            # Each role has its own workers and optimizer. Propagate the step
+            # deadline to the critic thread just as asyncio.to_thread does.
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="critic-train") as executor:
+                critic_future = executor.submit(copy_context().run, train_model, "critic")
+                policy_status = train_model("policy")
+                critic_status = critic_future.result()
+        else:
+            if train_critic:
+                critic_status = train_model("critic")
+            policy_status = train_model("policy")
 
         # Update metrics
         if critic_status is not None:
@@ -1809,6 +1895,8 @@ class RayPPOTrainer:
         trainer_state = {
             "global_step": self.global_step,
             "config": asdict(self.cfg),
+            "best_metric": self.best_metric,
+            "best_global_step": self.best_global_step,
         }
         trainer_state_path = os.path.join(global_step_folder, "trainer_state.pt")
         with io.open_file(trainer_state_path, "wb") as f:
@@ -1829,6 +1917,9 @@ class RayPPOTrainer:
         return global_step_folder
 
     def _cleanup_old_checkpoints(self):
+        protected_steps = [
+            step for step in (self.best_global_step, self._previous_best_global_step) if step is not None
+        ]
         if not self._node_ids:
             self._node_ids = self.dispatch.get_node_ids()
         run_on_each_node(
@@ -1836,10 +1927,11 @@ class RayPPOTrainer:
             cleanup_old_checkpoints,
             self.cfg.trainer.ckpt_path,
             self.cfg.trainer.max_ckpts_to_keep,
+            protected_steps,
         )
         # run on driver as well
         # NOTE (sumanthrh): the function will get called twice on the node with driver process, but it's ok because it's idempotent
-        cleanup_old_checkpoints(self.cfg.trainer.ckpt_path, self.cfg.trainer.max_ckpts_to_keep)
+        cleanup_old_checkpoints(self.cfg.trainer.ckpt_path, self.cfg.trainer.max_ckpts_to_keep, protected_steps)
 
     def load_checkpoints(self) -> Tuple[int, str]:
         """
@@ -1913,6 +2005,8 @@ class RayPPOTrainer:
             trainer_state = torch.load(f, map_location="cpu", weights_only=False)
         self._resumed_from_checkpoint = True
         saved_global_step = trainer_state.get("global_step", global_step)
+        self.best_metric = trainer_state.get("best_metric")
+        self.best_global_step = trainer_state.get("best_global_step")
         logger.info("Successfully loaded trainer state")
         if saved_global_step != global_step:
             logger.warning(f"Global step mismatch: path={global_step}, saved={saved_global_step}. Using path value.")
@@ -1962,10 +2056,14 @@ class RayPPOTrainer:
         Dispatch handles offload/backload automatically for all colocation configurations.
         """
         policy_export_dir = os.path.join(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "policy")
+        if os.path.normpath(self.cfg.trainer.export_path) == os.path.normpath(self.cfg.trainer.ckpt_path):
+            policy_export_dir = os.path.join(policy_export_dir, "huggingface")
         self.dispatch.save_hf_model("policy", policy_export_dir, self.tokenizer)
 
         if self.has_critic:
             critic_export_dir = os.path.join(self.cfg.trainer.export_path, f"global_step_{self.global_step}", "critic")
+            if os.path.normpath(self.cfg.trainer.export_path) == os.path.normpath(self.cfg.trainer.ckpt_path):
+                critic_export_dir = os.path.join(critic_export_dir, "huggingface")
             self.dispatch.save_hf_model("critic", critic_export_dir, self.tokenizer)
 
         logger.info("Successfully saved model weights.")

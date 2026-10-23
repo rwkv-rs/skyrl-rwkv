@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-# Native OPD on DAPO-Math, with AIME 2024 evaluation.
-# Teacher: rwkv7-g1k-13.3b-20260930-ctx25600.
+# Native OPD on local UltraData, with AIME 2024 evaluation.
+# Teacher: rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora.
 # Student: rwkv7-g1k-1.5b-20260930-ctx25600.
 
 if [[ -f .env ]]; then
@@ -13,37 +13,130 @@ if [[ -f .env ]]; then
 fi
 
 : "${STUDENT_MODEL:=$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600}"
-: "${TEACHER_MODEL:=$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600}"
-: "${DATA_DIR:=$HOME/data/dapo}"
-: "${TRAIN_FILE:=$DATA_DIR/dapo-math-17k-cleaned.parquet}"
-: "${TEST_FILE:=$DATA_DIR/aime-2024-cleaned.parquet}"
+: "${TEACHER_MODEL:=$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora}"
+: "${MAX_GENERATE_LENGTH:=8192}"
+: "${DATA_DIR:=$HOME/data/ultradata-opd}"
+: "${TRAIN_FILE:=$DATA_DIR/train.parquet}"
+: "${TEST_FILE:=$HOME/data/dapo/aime-2024-cleaned.parquet}"
 : "${NUM_GPUS:=8}"
-: "${MICRO_BATCH_SIZE:=1}"
+
+# Optional native async rollout/learner placement. Fixed modes keep whole logical batches.
+: "${ASYNC_MODE:=disabled}"
+: "${ASYNC_STREAMING_BATCH_SIZE:=0}"
+: "${MINI_BATCH_SIZE:=512}"
+ASYNC_ENABLED=false
+COLOCATE_ALL=true
+ASYNC_STALENESS=1
+if [[ "$ASYNC_MODE" != disabled ]]; then
+  ASYNC_ENABLED=true
+  COLOCATE_ALL=false
+  : "${NUM_POLICY_GPUS:=$((NUM_GPUS - 1))}"
+  : "${NUM_INFERENCE_GPUS:=1}"
+  if [[ "$ASYNC_MODE" == zero_stale ]]; then
+    ASYNC_STALENESS=0
+  fi
+fi
+: "${NUM_POLICY_GPUS:=$NUM_GPUS}"
+: "${NUM_INFERENCE_GPUS:=$NUM_GPUS}"
+: "${ASYNC_GENERATION_WORKERS:=$MINI_BATCH_SIZE}"
+: "${USE_NORA:=true}"
+: "${USE_STOPD:=false}"
+: "${USE_TOPD:=false}"
+: "${TOPD_BALANCE_BATCH:=false}"
+: "${RWKV_RESPONSE_ONLY_HEAD:=false}"
+: "${PROXIMAL_TEACHER_ALPHA:=1.0}"
+: "${N_SAMPLES_PER_PROMPT:=1}"
+: "${UPDATE_EPOCHS_PER_BATCH:=1}"
+: "${POLICY_MINI_BATCH_SIZE:=${MINI_BATCH_SIZE:-512}}"
+: "${POLICY_LOSS_TYPE:=importance_sampling}"
+: "${LOSS_REDUCTION:=token_mean}"
+if [[ "$USE_TOPD" == true ]]; then
+  : "${TOPD_GROUP_SIZE:=8}"
+  N_SAMPLES_PER_PROMPT="$TOPD_GROUP_SIZE"
+  POLICY_LOSS_TYPE=regular
+  if [[ "$USE_STOPD" == true ]]; then
+    POLICY_LOSS_TYPE=topd_stopd
+  fi
+  LOSS_REDUCTION=prompt_mean
+  PROXIMAL_TEACHER_ALPHA="${TOPD_ALPHA:-0.2}"
+  POLICY_MINI_BATCH_SIZE="${TOPD_MINI_BATCH_SIZE:-32}"
+fi
+ASYNC_OPD=false
+if [[ "$ASYNC_ENABLED" == true && "$ASYNC_MODE" != zero_stale ]]; then
+  ASYNC_OPD=true
+  if [[ "$USE_TOPD" == true ]]; then
+    if [[ "$USE_STOPD" != true ]]; then POLICY_LOSS_TYPE=async_topd; fi
+  else
+    POLICY_LOSS_TYPE=async_opd
+  fi
+fi
+: "${LIGHTEVAL_PROJECT:=$HOME/Projects/MachineLearning/lighteval-rwkv}"
+: "${LORA_RANK:=256}"
+: "${LORA_ALPHA:=$LORA_RANK}"
+: "${LORA_TARGET_MODULES:=[r_proj,k_proj,v_proj,o_proj,mlp.key,mlp.value,lm_head]}"
+: "${MICRO_BATCH_SIZE:=4}"
+: "${MICRO_FORWARD_BATCH_SIZE:=4}"
+: "${LR:=2e-6}"
 : "${LOGGER:=wandb}"
-: "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-dapo-opd-from-rwkv7-g1k-13.3b-20260930-ctx25600}"
+: "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-ultradata-opd-nora-from-rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
-export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+# Share the exact interpreter/cache identity with torchrun across worktrees.
+export UV_PROJECT_ENVIRONMENT="$(realpath .venv)"
+# Workers inherit this prepared environment, including AntiDoom's PEFT fork.
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 # FlashRWKV2 uses get_default_build_root() (XDG_CACHE_HOME), not TORCH_EXTENSIONS_DIR.
 export XDG_CACHE_HOME="$HOME/.cache/skyrl-rwkv"
 export TORCH_EXTENSIONS_DIR="$XDG_CACHE_HOME/torch_extensions"
+# Bound idle Ray workers and host allocator arenas on the eight-GPU node.
+if [[ -z "${RAY_OVERRIDE_RESOURCES:-}" ]]; then
+  export RAY_OVERRIDE_RESOURCES='{"CPU": 32}'
+fi
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-2}"
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
+
+if [[ "${1:-}" == --prepare-flashrwkv2 ]]; then
+  shift
+  if (( $# )); then
+    printf 'Unexpected arguments to --prepare-flashrwkv2\n' >&2
+    exit 2
+  fi
+  export MAX_JOBS="${MAX_JOBS:-2}"
+  uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" examples/train/rwkv/prepare_flashrwkv2.py
+  exit 0
+fi
 
 # Check the exact native cache key before loading.
-uv run --isolated --no-project .venv/bin/python examples/train/rwkv/prepare_flashrwkv2.py --check
+uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" examples/train/rwkv/prepare_flashrwkv2.py --check
 
-uv run --isolated --no-project .venv/bin/python -m examples.train.on_policy_distillation.main_on_policy_distill \
+uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" -m examples.train.on_policy_distillation.main_on_policy_distill \
   data.train_data="['$TRAIN_FILE']" \
   data.val_data="['$TEST_FILE']" \
   trainer.algorithm.advantage_estimator=no_op \
-  trainer.algorithm.policy_loss_type=importance_sampling \
+  trainer.algorithm.async_opd="$ASYNC_OPD" \
+  trainer.algorithm.policy_loss_type="$POLICY_LOSS_TYPE" \
+  trainer.algorithm.loss_reduction="$LOSS_REDUCTION" \
   trainer.algorithm.use_kl_in_reward=true \
   trainer.algorithm.use_kl_loss=false \
+  trainer.algorithm.stopd.enabled="$USE_STOPD" \
+  trainer.algorithm.topd.enabled="$USE_TOPD" \
+  trainer.algorithm.topd.balance_batch="$TOPD_BALANCE_BATCH" \
+  trainer.algorithm.proximal_teacher_alpha="$PROXIMAL_TEACHER_ALPHA" \
+  trainer.algorithm.lighteval.project="$LIGHTEVAL_PROJECT" \
+  trainer.algorithm.lighteval.context_length=25600 \
   trainer.policy.model.path="$STUDENT_MODEL" \
   trainer.ref.model.path="$TEACHER_MODEL" \
   trainer.policy.model_config_kwargs.wkv_mode=fp32io16 \
   trainer.ref.model_config_kwargs.wkv_mode=fp32io16 \
-  trainer.policy.optimizer_config.lr=1e-5 \
+  trainer.policy.model.lora.use_nora="$USE_NORA" \
+  trainer.policy.model.lora.rank="$LORA_RANK" \
+  trainer.policy.model.lora.alpha="$LORA_ALPHA" \
+  trainer.policy.model.lora.dropout=0.0 \
+  trainer.policy.model.lora.target_modules="$LORA_TARGET_MODULES" \
+  trainer.policy.optimizer_config.lr="$LR" \
+  trainer.policy.optimizer_config.offload_after_step=false \
   trainer.policy.optimizer_config.num_warmup_steps=0 \
-  trainer.policy.optimizer_config.weight_decay=0.1 \
+  trainer.policy.optimizer_config.weight_decay=0.01 \
+  trainer.policy.optimizer_config.max_grad_norm=1.0 \
   trainer.strategy=fsdp \
   trainer.bf16=true \
   trainer.flash_attn=false \
@@ -52,25 +145,38 @@ uv run --isolated --no-project .venv/bin/python -m examples.train.on_policy_dist
   trainer.ref.sequence_parallel_size=1 \
   trainer.policy.use_torch_compile=false \
   trainer.gradient_checkpointing=true \
+  trainer.rwkv_response_only_head="$RWKV_RESPONSE_ONLY_HEAD" \
+  trainer.policy.fsdp_config.fsdp_size=1 \
+  trainer.policy.fsdp_config.reshard_after_forward=false \
+  trainer.policy.fsdp_config.sync_gradients_each_microbatch=false \
+  trainer.ref.fsdp_config.fsdp_size="$NUM_POLICY_GPUS" \
+  trainer.ref.fsdp_config.reshard_after_forward=false \
   trainer.update_ref_every_epoch=false \
-  trainer.placement.colocate_all=true \
-  trainer.placement.policy_num_gpus_per_node="$NUM_GPUS" \
-  trainer.placement.ref_num_gpus_per_node="$NUM_GPUS" \
-  trainer.epochs=20 \
-  trainer.max_training_steps=50 \
-  trainer.update_epochs_per_batch=1 \
-  trainer.train_batch_size=64 \
-  trainer.policy_mini_batch_size=64 \
+  trainer.fully_async.enabled="$ASYNC_ENABLED" \
+  trainer.fully_async.mode="${ASYNC_MODE/disabled/fully_async}" \
+  trainer.fully_async.max_staleness_steps="$ASYNC_STALENESS" \
+  trainer.fully_async.num_parallel_generation_workers="$ASYNC_GENERATION_WORKERS" \
+  trainer.fully_async.streaming_batch_size="$ASYNC_STREAMING_BATCH_SIZE" \
+  trainer.fully_async.clear_kv_cache_on_weight_sync=true \
+  trainer.placement.colocate_all="$COLOCATE_ALL" \
+  trainer.placement.policy_num_gpus_per_node="$NUM_POLICY_GPUS" \
+  trainer.placement.ref_num_gpus_per_node="$NUM_POLICY_GPUS" \
+  trainer.epochs=1 \
+  trainer.max_training_steps=null \
+  trainer.update_epochs_per_batch="$UPDATE_EPOCHS_PER_BATCH" \
+  trainer.train_batch_size="$MINI_BATCH_SIZE" \
+  trainer.policy_mini_batch_size="$POLICY_MINI_BATCH_SIZE" \
   trainer.micro_train_batch_size_per_gpu="$MICRO_BATCH_SIZE" \
-  trainer.micro_forward_batch_size_per_gpu="$MICRO_BATCH_SIZE" \
+  trainer.micro_forward_batch_size_per_gpu="$MICRO_FORWARD_BATCH_SIZE" \
   trainer.eval_batch_size=64 \
   trainer.eval_before_train=true \
   trainer.dump_train_results=true \
   trainer.num_logger_train_samples=20 \
+  trainer.num_logger_eval_samples=20 \
   trainer.eval_interval=50 \
   trainer.ckpt_interval=50 \
   trainer.hf_save_interval=50 \
-  trainer.max_prompt_length=2048 \
+  trainer.max_prompt_length=17408 \
   trainer.resume_mode=null \
   trainer.logger="$LOGGER" \
   trainer.project_name=skyrl-rwkv \
@@ -79,23 +185,31 @@ uv run --isolated --no-project .venv/bin/python -m examples.train.on_policy_dist
   trainer.ckpt_path="$OUTPUT_ROOT/checkpoints" \
   trainer.export_path="$OUTPUT_ROOT/exports" \
   generator.inference_engine.backend=vllm \
-  generator.inference_engine.model_dtype=float16 \
+  generator.inference_engine.model_dtype=bfloat16 \
+  generator.inference_engine.served_model_name="${STUDENT_MODEL##*/}" \
+  generator.inference_engine.router_init_kwargs.policy=round_robin \
+  generator.inference_engine.engine_init_kwargs.logprobs_mode=raw_logprobs \
+  generator.inference_engine.engine_init_kwargs.kv_cache_memory_bytes=2147483648 \
+  generator.inference_engine.engine_init_kwargs.max_model_len=25600 \
+  generator.inference_engine.engine_init_kwargs.compilation_config='{"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}' \
   generator.inference_engine.run_engines_locally=true \
-  generator.inference_engine.num_engines="$NUM_GPUS" \
+  generator.inference_engine.num_engines="$NUM_INFERENCE_GPUS" \
   generator.inference_engine.tensor_parallel_size=1 \
   generator.inference_engine.weight_sync_backend=nccl \
-  generator.inference_engine.enforce_eager=true \
+  generator.inference_engine.enforce_eager=false \
   generator.inference_engine.gpu_memory_utilization=0.8 \
+  generator.inference_engine.max_num_seqs=128 \
   generator.batched=false \
-  generator.n_samples_per_prompt=1 \
+  generator.n_samples_per_prompt="$N_SAMPLES_PER_PROMPT" \
   generator.eval_n_samples_per_prompt=32 \
   generator.chat_template_kwargs="{rwkv_prompt_template: bot, rwkv_generation_prompt: open_think}" \
-  generator.sampling_params.max_generate_length=8192 \
+  generator.sampling_params.max_generate_length="$MAX_GENERATE_LENGTH" \
+  generator.sampling_params.logprobs=1 \
   generator.sampling_params.temperature=1.0 \
   generator.sampling_params.top_p=1.0 \
   generator.sampling_params.top_k=-1 \
   generator.sampling_params.additional_kwargs="{presence_penalty: 0.0, frequency_penalty: 0.0, penalty_decay: 1.0}" \
-  generator.eval_sampling_params.max_generate_length=8192 \
+  generator.eval_sampling_params.max_generate_length=25600 \
   generator.eval_sampling_params.temperature=0.96 \
   generator.eval_sampling_params.top_p=0.76 \
   generator.eval_sampling_params.top_k=32 \

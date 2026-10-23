@@ -8,6 +8,7 @@ can be constructed from a Hydra DictConfig via SkyRLTrainConfig.from_dict_config
 import copy
 import dataclasses
 import json
+import math
 import os
 import typing
 from abc import ABC
@@ -104,6 +105,12 @@ class SkyRLLoraConfig(BaseConfig):
     """Scaling factor for LoRA updates."""
     dropout: float = 0.0
     """Dropout probability applied to LoRA layers, to help prevent overfitting."""
+    use_nora: bool = False
+    """Use AntiDoom's normalized LoRA implementation with the NoRA PEFT fork.
+
+    RWKV FSDP only. Requires positive ``rank``. Weight sync and HF exports merge the
+    normalized adapter into complete weights; inference does not load an adapter.
+    """
     lora_sync_path: str = "/tmp/skyrl_lora_sync"
     """Directory where LoRA adapter weights are saved and synchronized between the training and inference processes.
     Must be accessible to all workers in distributed setups. Unused when ``sync_mode="memory"``."""
@@ -201,7 +208,8 @@ class OptimizerConfig(BaseConfig):
     """Optimizer configuration, shared by the policy and critic models."""
 
     lr: float = 1e-6
-    """Learning rate."""
+    """Learning rate. A zero critic learning rate skips its backward and optimizer steps,
+    retaining its value forward passes and checkpoint state."""
     adam_betas: List[float] = field(default_factory=lambda: [0.9, 0.999])
     """Betas for the AdamW optimizer."""
     weight_decay: float = 1e-2
@@ -738,6 +746,13 @@ class CriticConfig(BaseConfig):
     """
 
     model: ModelConfig = field(default_factory=ModelConfig)
+    resume_path: Optional[str] = None
+    """Initialize critic weights from a native FSDP checkpoint, keeping a fresh optimizer and scheduler.
+
+    Set ``model.path`` to the checkpoint's original base model and use matching LoRA settings.
+    This preserves unmerged NoRA adapters and the value head from offline pretraining.
+    A subsequent full trainer resume restores its own critic checkpoint instead.
+    """
     optimizer_config: OptimizerConfig = field(default_factory=lambda: OptimizerConfig(lr=5e-6))
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
     """FSDP configuration, applicable when ``trainer.strategy="fsdp"``."""
@@ -745,6 +760,9 @@ class CriticConfig(BaseConfig):
     """Ulysses sequence parallel size (https://arxiv.org/abs/2309.14509)."""
     model_config_kwargs: dict = field(default_factory=dict)
     """Pass-through kwargs for the HuggingFace model config (e.g. overriding vocab size)."""
+
+    freeze_backbone: bool = False
+    """Freeze the critic backbone, including loaded LoRA adapters, and optimize only the full value head."""
 
 
 # TODO: Have global config init so that the default value for the ref model path is the policy model path
@@ -828,6 +846,48 @@ class FlashReinforceConfig(BaseConfig):
             raise ValueError("flashreinforce.score_centering_weight_clip must be positive")
         if self.score_centering_eps <= 0:
             raise ValueError("flashreinforce.score_centering_eps must be positive")
+
+
+@dataclass
+class GAEAdaptiveConfig(BaseConfig):
+    """Skip-observation GAE with separate policy and critic trace parameters."""
+
+    mode: str = "adaptive"
+    """Use ``"adaptive"`` policy lambda or ``"fixed"`` with ``algorithm.lambd``."""
+    alpha: float = 1.5
+    """Compute policy lambda as ``max(0, 1 - 1 / (alpha * action_length))``."""
+    min_length: int = 50
+    """Use policy lambda one below this action length, matching the SAO reference."""
+    critic_lambd: float = 1.0
+    """Lambda for critic return targets, independent of policy lambda."""
+
+    def __post_init__(self) -> None:
+        if self.mode not in {"adaptive", "fixed"}:
+            raise ValueError("gae_adaptive.mode must be 'adaptive' or 'fixed'")
+        if not math.isfinite(self.alpha) or self.alpha <= 0:
+            raise ValueError("gae_adaptive.alpha must be finite and positive")
+        if self.min_length < 0:
+            raise ValueError("gae_adaptive.min_length must be non-negative")
+        if not 0 <= self.critic_lambd <= 1:
+            raise ValueError("gae_adaptive.critic_lambd must be between zero and one")
+
+
+@dataclass
+class RolloutISConfig(BaseConfig):
+    """Optional Score-Centering for the double-sided rollout importance weight."""
+
+    score_centering: bool = False
+    """Center the DIS-weighted score using the captured sampler support."""
+    score_centering_top_k: int = 128
+    """Number of sampler candidates recorded independently of sampling top-k."""
+    score_centering_eps: float = 1e-6
+    """Probability-mass floor used by the top-k/tail correction."""
+
+    def __post_init__(self) -> None:
+        if self.score_centering_top_k <= 1:
+            raise ValueError("rollout_is.score_centering_top_k must be greater than one")
+        if not math.isfinite(self.score_centering_eps) or self.score_centering_eps <= 0:
+            raise ValueError("rollout_is.score_centering_eps must be finite and positive")
 
 
 @dataclass
@@ -964,7 +1024,7 @@ class OffPolicyCorrectionConfig(BaseConfig):
 @dataclass
 class AlgorithmConfig(BaseConfig):
     advantage_estimator: str = "grpo"
-    """``"grpo"``, ``"gae"``, ``"rloo"``, ``"reinforce++"``, ``"flashreinforce"``, ``"bpo"``, or custom via ``AdvantageEstimatorRegistry``."""
+    """``"grpo"``, ``"gae"``, ``"gae_adaptive"``, ``"rloo"``, ``"reinforce++"``, ``"flashreinforce"``, ``"bpo"``, or custom via ``AdvantageEstimatorRegistry``."""
     kl_ctrl: KLCtrlConfig = field(default_factory=KLCtrlConfig)
     """Only used when ``use_kl_in_reward=True`` (not applied when ``use_kl_loss=True``).
     Uses ``kl_loss_coef`` as the initial KL coefficient."""
@@ -1019,6 +1079,14 @@ class AlgorithmConfig(BaseConfig):
       importance sampling, a sequence-level Bernoulli-KL gate, and trajectory-normalized loss.
     - ``"bpo"``: Bellman Policy Optimization's practical complementary-probability mismatch weight.
     """
+    critic_loss_reduction: str = "sequence_mean"
+    """Reduce critic errors by per-sequence token mean or a fixed token budget.
+
+    ``sequence_mean`` preserves the native critic objective.
+    ``seq_mean_token_sum_norm`` sums masked token errors, divides by ``max_seq_len``,
+    then averages sequences. Its state weights do not depend on future response length.
+    This setting is independent of the actor's ``loss_reduction``.
+    """
     loss_reduction: str = "token_mean"
     """Type of loss reduction to use, applied per mini-batch by rescaling advantages:
 
@@ -1046,7 +1114,9 @@ class AlgorithmConfig(BaseConfig):
     effectively identical are still treated as zero-variance; this is a no-op for integer rewards (e.g.
     0/1) where the spread is either 0 or >= 1. Set to 0.0 for exact equality."""
     lambd: float = 1.0
-    """Lambda parameter for GAE."""
+    """Lambda for GAE and for the policy in fixed-mode adaptive GAE."""
+    gae_adaptive: GAEAdaptiveConfig = field(default_factory=GAEAdaptiveConfig)
+    """Only used when ``advantage_estimator="gae_adaptive"``."""
     gamma: float = 1.0
     """Gamma (discount) parameter for GAE."""
     eps_clip_low: float = 0.2
@@ -1069,6 +1139,8 @@ class AlgorithmConfig(BaseConfig):
     """Only used when ``policy_loss_type="sapo"``."""
     flashreinforce: FlashReinforceConfig = field(default_factory=FlashReinforceConfig)
     """Only used when ``policy_loss_type="flashreinforce"``."""
+    rollout_is: RolloutISConfig = field(default_factory=RolloutISConfig)
+    """Only used when ``policy_loss_type="rollout_is"``."""
     bpo: BPOConfig = field(default_factory=BPOConfig)
     """Only used when ``policy_loss_type="bpo"``."""
     value_clip: float = 0.2
@@ -1084,7 +1156,7 @@ class AlgorithmConfig(BaseConfig):
     dppo: DPPOConfig = field(default_factory=DPPOConfig)
     """Only used when ``policy_loss_type="dppo"``."""
     max_seq_len: Optional[int] = None
-    """Sequence-length normalization constant used for ``seq_mean_token_sum_norm`` loss reduction.
+    """Sequence-length normalization constant used for actor or critic ``seq_mean_token_sum_norm`` loss reduction.
     Must be set explicitly for that reduction mode; otherwise can remain ``None``. This often
     matches the model context window / vLLM ``max_model_len`` when that is the intended budget."""
 
@@ -1101,6 +1173,16 @@ class FullyAsyncConfig(BaseConfig):
 
     enabled: bool = False
     """Indicates whether fully async training is enabled"""
+    mode: str = "fully_async"
+    """Execution protocol: ``fully_async`` consumes completed groups and permits in-flight
+    weight updates; ``one_step_off`` preserves logical batches and publishes only after
+    the next rollout batch closes; ``zero_stale`` closes the current batch before updating.
+    The latter two protocols preserve sampled STOPD budgets independently of completion order.
+    """
+    streaming_batch_size: int = 0
+    """Groups per ready learner batch in ``zero_stale`` mode; 0 waits for the complete batch.
+    Streaming accumulates gradients before one optimizer step at the logical batch barrier.
+    """
     max_staleness_steps: int = 4
     """Maximum off-policy steps allowed. If a trajectory group is scheduled at step *i* and trained at step *j*,
     then ``j - i <= max_staleness_steps``. Larger values increase throughput but also off-policy-ness."""
@@ -1141,6 +1223,15 @@ class FullyAsyncConfig(BaseConfig):
     simulate_weight_sync_seconds: float = 0.0
     """Wall-clock seconds generation stays paused to stand in for the (skipped) weight broadcast.
     0.0 = pause then immediately resume."""
+
+    def __post_init__(self):
+        if self.mode not in ("fully_async", "one_step_off", "zero_stale"):
+            raise ValueError("fully_async.mode must be fully_async, one_step_off, or zero_stale")
+        expected_staleness = {"one_step_off": 1, "zero_stale": 0}.get(self.mode)
+        if expected_staleness is not None and self.max_staleness_steps != expected_staleness:
+            raise ValueError(f"{self.mode} requires max_staleness_steps={expected_staleness}")
+        if self.streaming_batch_size < 0 or (self.streaming_batch_size and self.mode != "zero_stale"):
+            raise ValueError("streaming_batch_size must be nonnegative and requires zero_stale mode")
 
 
 # ---------------------------------------------------------------------------
@@ -1375,7 +1466,8 @@ class InferenceEngineConfig(BaseConfig):
     """Pass-through kwargs for the vLLM engine.
     Names must match the engine's args. Applied last, so they silently override config-derived
     engine args (e.g. ``tensor_parallel_size``). The exception is ``logprobs_mode``, which is
-    always ``"processed_logprobs"``; any other value is rejected.
+    ``"processed_logprobs"`` by default. RWKV Rapid-Sampling accepts an explicit
+    ``"raw_logprobs"`` override only with an unmodified rollout distribution.
 
     For HuggingFace config overrides such as RoPE scaling, use
     ``engine_init_kwargs.hf_overrides.rope_parameters`` and set the matching trainer-side override
@@ -1402,8 +1494,8 @@ class InferenceEngineConfig(BaseConfig):
     """Pass-through kwargs for the vLLM engine, applied only to prefill engines when
     ``enable_pd=True``. Mutually exclusive with ``engine_init_kwargs``: provide role-specific
     kwargs (including shared ones like ``kv_transfer_config``) via ``prefill_init_kwargs`` /
-    ``decode_init_kwargs`` instead. As with ``engine_init_kwargs``, ``logprobs_mode`` must be
-    ``"processed_logprobs"``."""
+    ``decode_init_kwargs`` instead. As with ``engine_init_kwargs``, ``logprobs_mode`` must
+    match the mode selected by ``engine_init_kwargs`` (``"processed_logprobs"`` by default)."""
     decode_init_kwargs: Dict[str, Any] = field(default_factory=dict)
     """Pass-through kwargs for the vLLM engine, applied only to decode engines when
     ``enable_pd=True``. Mutually exclusive with ``engine_init_kwargs`` (see ``prefill_init_kwargs``)."""
@@ -1593,6 +1685,11 @@ class TrainerConfig(BaseConfig):
     Accepts a local directory path or a cloud storage path (S3, GCS)."""
     max_ckpts_to_keep: int = -1
     """``-1`` to keep all checkpoints, ``N`` to keep only the last N."""
+    metric_for_best_model: Optional[str] = None
+    """Evaluation metric used to save and retain the best full checkpoint and HF export.
+    ``None`` disables best-checkpoint tracking. The best is retained in addition to recent checkpoints."""
+    greater_is_better: bool = True
+    """Whether larger values of ``metric_for_best_model`` indicate a better checkpoint."""
     ckpt_interval: int = 10
     """Save a full training checkpoint every N steps."""
     hf_save_interval: int = -1
@@ -1637,6 +1734,10 @@ class TrainerConfig(BaseConfig):
     """Like ``policy_mini_batch_size``, but for the critic model.
     The critic generally tolerates off-policy updates better than the policy, so setting this lower than
     ``policy_mini_batch_size`` (i.e. more critic updates) is usually preferable."""
+    train_critic_and_policy_parallel: bool = False
+    """Train the critic and policy concurrently on their separate GPU groups.
+    Requires ``placement.colocate_all=False``. Both updates use the previously computed
+    returns and advantages, and complete before the next rollout weight synchronization."""
     micro_train_batch_size_per_gpu: int = 1
     """Micro batch size during the training step, common to both policy and critic.
     Each mini batch is split into micro batches of this size, and gradients are accumulated over them."""
@@ -1653,7 +1754,9 @@ class TrainerConfig(BaseConfig):
     NOTE: this is a *soft* cap. Sequences are never split across microbatches, so a single sequence
     longer than ``max_tokens_per_microbatch`` is placed alone in its own microbatch that exceeds the
     cap (no error, no truncation). The true peak microbatch size is therefore
-    ``max(max_tokens_per_microbatch, longest_sequence_in_batch)``."""
+    ``max(max_tokens_per_microbatch, longest_sequence_in_batch)``.
+    RWKV groups similar lengths and bounds ``batch_size * longest_sequence`` instead,
+    because its recurrent kernels process a right-padded microbatch."""
     recompute_old_logprobs_per_minibatch: bool = True
     """When True, recomputes policy/ref model logprobs (and critic values) per mini-batch using
     the same mini-batch + DP partition as the training step. When False, a single full-batch forward is run.
@@ -1729,6 +1832,12 @@ class TrainerConfig(BaseConfig):
     Positive values checkpoint each chunk while preserving differentiable recurrent
     states across the complete sequence. This does not truncate or detach the history.
     """
+    rwkv_response_only_head: bool = False
+    """Project only response prediction positions in the non-chunked RWKV dense head.
+
+    Keeps the complete recurrent history and its gradients. Prompt/padding logits
+    and entropy are omitted; returned response logprobs and entropy keep their layout.
+    """
     vocab_entropy_chunk_size: Optional[int] = 0
     """Chunk size along the sequence dimension when computing Megatron vocab entropy.
     ``0`` auto-sizes from the local vocab shard size and ``vocab_entropy_chunk_memory_mb``.
@@ -1751,6 +1860,13 @@ class TrainerConfig(BaseConfig):
         # ref model defaults to the policy model
         if self.ref.model.path is None:
             self.ref.model.path = self.policy.model.path
+
+        if self.train_critic_and_policy_parallel and self.placement.colocate_all:
+            raise ValueError("train_critic_and_policy_parallel requires placement.colocate_all=False.")
+
+        if self.policy.model.lora.use_nora:
+            if self.strategy != "fsdp" or self.policy.model.lora.rank <= 0:
+                raise ValueError("use_nora=True requires trainer.strategy=fsdp and a positive policy LoRA rank.")
 
         if self.log_example_interval > 0:
             print(
@@ -1988,6 +2104,25 @@ class SkyRLTrainConfig(BaseConfig):
             self.trainer.algorithm.temperature = self.generator.sampling_params.temperature
 
         flashreinforce = self.trainer.algorithm.flashreinforce
+        rollout_is = self.trainer.algorithm.rollout_is
+        if rollout_is.score_centering:
+            if self.trainer.algorithm.policy_loss_type != "rollout_is":
+                raise ValueError("rollout_is.score_centering requires policy_loss_type=rollout_is")
+            if self.trainer.strategy != "fsdp":
+                raise ValueError("rollout_is.score_centering currently requires trainer.strategy=fsdp")
+            if not self.generator.use_conversation_multi_turn:
+                raise ValueError("rollout_is.score_centering requires generator.use_conversation_multi_turn=True")
+            if self.generator.sampling_params.logprobs is None:
+                raise ValueError("rollout_is.score_centering requires generator.sampling_params.logprobs")
+            if (
+                self.generator.sampling_params.temperature != 1.0
+                or self.generator.sampling_params.top_p != 1.0
+                or self.generator.sampling_params.top_k != -1
+            ):
+                raise ValueError("rollout_is.score_centering requires temperature=1, top_p=1, top_k=-1")
+            self.generator.inference_engine.enable_return_sample_support_set = True
+            self.generator.inference_engine.sample_support_top_k = rollout_is.score_centering_top_k
+            self.generator.inference_engine.sample_support_logprobs_mode = "raw_logprobs"
         if flashreinforce.score_centering:
             if self.trainer.algorithm.policy_loss_type not in ("flashreinforce", "flash_reinforce"):
                 raise ValueError("flashreinforce.score_centering requires policy_loss_type=flashreinforce")
@@ -2023,7 +2158,7 @@ class SkyRLTrainConfig(BaseConfig):
                     "use_conversation_multi_turn=False appends a synthetic loss-active EOS without captured support"
                 )
 
-            if flashreinforce.score_centering:
+            if flashreinforce.score_centering or rollout_is.score_centering:
                 raise ValueError("sample-support replay cannot be combined with raw Score-Centering")
             if self.generator.sampling_params.top_k <= 1:
                 raise ValueError("sample-support replay requires generator.sampling_params.top_k > 1")

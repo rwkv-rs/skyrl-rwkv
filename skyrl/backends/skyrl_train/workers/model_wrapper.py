@@ -41,7 +41,11 @@ from skyrl.backends.skyrl_train.utils.sample_support_replay import (
 from skyrl.backends.skyrl_train.utils.torch_utils import (
     chunked_entropy_from_logits,
     logprobs_from_logits,
+    logprobs_from_logits_vllm,
 )
+
+# RwkvCache._chunk_length: full-sequence kernels operate on 16-token chunks.
+RWKV_CHUNK_LENGTH = 16
 
 
 @dataclass(frozen=True)
@@ -145,6 +149,7 @@ class HFModelWrapper(nn.Module):
         lora_alpha (int, optional): Alpha parameter for LoRA. Defaults to 16.
         lora_dropout (float, optional): Dropout rate for LoRA layers. Defaults to 0.
         lora_init_method (str, optional): Initialization method for LoRA layers. Defaults to "kaiming".
+        use_nora (bool, optional): Use AntiDoom's normalized LoRA for RWKV. Defaults to False.
         target_modules (list, optional): List of target modules for applying LoRA. Defaults to None.
         exclude_modules (list, optional): List of modules to exclude from applying LoRA. Defaults to None.
         device_map (dict, optional): Device mapping for loading the model onto specific devices. Defaults to None.
@@ -164,6 +169,7 @@ class HFModelWrapper(nn.Module):
         lora_alpha=16,
         lora_dropout=0,
         lora_init_method="kaiming",
+        use_nora=False,
         target_modules=None,
         exclude_modules=None,
         device_map=None,
@@ -177,6 +183,7 @@ class HFModelWrapper(nn.Module):
         language_model_only: bool = False,
         logprobs_chunk_size: int = 1024,
         rwkv_chunk_size: int = 0,
+        rwkv_response_only_head: bool = False,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -185,6 +192,7 @@ class HFModelWrapper(nn.Module):
         self.attn_implementation = "flash_attention_2" if use_flash_attention_2 else "sdpa"
         self.remove_microbatch_padding = remove_microbatch_padding
         self.is_vlm = False
+        target_dtype = torch.bfloat16 if bf16 else torch.float32
 
         if isinstance(pretrain_or_model, str):
             if load_in_4bit:
@@ -207,6 +215,8 @@ class HFModelWrapper(nn.Module):
 
             model_config = AutoConfig.from_pretrained(pretrain_or_model, trust_remote_code=True, **model_config_kwargs)
             is_rwkv_config = model_config.model_type == "rwkv"
+            if use_nora and not is_rwkv_config:
+                raise ValueError("use_nora=True is supported by the RWKV FSDP policy.")
 
             if language_model_only:
                 logger.info("[VLM] language_model_only=True, skipping vision encoder initialization")
@@ -228,7 +238,6 @@ class HFModelWrapper(nn.Module):
             if meta_init:
                 with torch.device("meta"):
                     self.model = model_class.from_config(model_config, trust_remote_code=True)
-                target_dtype = torch.bfloat16 if bf16 else torch.float32
                 # Cast just params + persistent buffers to the target dtype;
                 # leave non-persistent buffers at their init dtype. For example, transformers
                 # builds `Qwen3RotaryEmbedding.inv_freq` via a RoPE init that hardcodes
@@ -249,7 +258,7 @@ class HFModelWrapper(nn.Module):
                     config=model_config,
                     trust_remote_code=True,
                     quantization_config=nf4_config,
-                    torch_dtype=torch.bfloat16 if bf16 else torch.float32,
+                    torch_dtype=target_dtype,
                     device_map=device_map,
                 )
                 if not is_rwkv_config:
@@ -292,8 +301,14 @@ class HFModelWrapper(nn.Module):
                     lora_dropout=lora_dropout,
                     bias="none",
                     init_lora_weights=True if lora_init_method == "kaiming" else lora_init_method,
+                    **({"use_nora": True} if use_nora else {}),
                 )
                 self.model = get_peft_model(self.model, lora_config)
+                if use_nora:
+                    # PEFT's new root starts in train mode, while from_pretrained
+                    # leaves rank 0's inner model in eval mode. Align all layers
+                    # so their gradient checkpointing is active on every rank.
+                    self.model.train()
 
                 if load_in_4bit:
                     for name, module in self.model.named_modules():
@@ -341,6 +356,7 @@ class HFModelWrapper(nn.Module):
 
         self.logprobs_chunk_size = logprobs_chunk_size
         self.rwkv_chunk_size = rwkv_chunk_size
+        self.rwkv_response_only_head = rwkv_response_only_head
 
         # TODO (sumanthrh): do the same for `logprobs_from_logits` and test.
         # Credits: https://www.tylerromero.com/posts/2025-02-selective-log-softmax/#efficient-solution
@@ -362,7 +378,7 @@ class HFModelWrapper(nn.Module):
             with torch.autocast(device_type=ids.device.type, enabled=False):
                 result = self.model(ids, past_key_values=previous_cache, use_cache=True)
             logits = result["logits"] / temperature
-            token_logprobs = logprobs_from_logits(logits, targets, inplace_backward=True)
+            token_logprobs = logprobs_from_logits_vllm(logits, targets)
             token_entropy = (
                 self.chunked_entropy_from_logits_fn(
                     logits,
@@ -404,10 +420,14 @@ class HFModelWrapper(nn.Module):
         sample_support: Optional[PackedTensor] = None,
         sample_support_logprobs: Optional[PackedTensor] = None,
         enable_score_centering: bool = False,
+        response_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run independent recurrent streams without left padding."""
         batch_size, padded_length = sequences.shape
         valid_lengths = attention_mask.sum(dim=-1)
+        response_only = self.rwkv_response_only_head and not enable_score_centering
+        if response_only and response_mask is None:
+            raise ValueError("rwkv_response_only_head requires response_mask")
         log_probs = None
         entropy = None
         score_centering_train_logprobs = None
@@ -437,6 +457,8 @@ class HFModelWrapper(nn.Module):
 
         for bucket_lengths, bucket_indices in buckets:
             bucket_length = int(bucket_lengths.max().item())
+            if not self.rwkv_chunk_size:
+                bucket_length = (bucket_length + RWKV_CHUNK_LENGTH - 1) // RWKV_CHUNK_LENGTH * RWKV_CHUNK_LENGTH
             if self.rwkv_chunk_size and torch.distributed.is_available() and torch.distributed.is_initialized():
                 # Each FSDP rank must enter the same number of chunk forwards and recomputations.
                 global_length = bucket_lengths.max().clone()
@@ -491,19 +513,32 @@ class HFModelWrapper(nn.Module):
             # RWKV's training kernels require native BF16 throughout the model.
             # CUDA autocast promotes LayerNorm to FP32, so disable an enclosing
             # trainer/ref autocast region while the recurrent model runs.  The
-            # BF16 CausalLM head is also selected by ``training=True``; RWKV has
-            # no dropout, so a reference-policy forward can temporarily use that
-            # path while remaining under the caller's no-grad context.
+            # reference path can temporarily use training mode under no_grad
+            # (RWKV has no dropout).
             was_training = self.model.training
+            head_kwargs = {}
+            if response_only:
+                # The target at response position t is predicted at input t-1.
+                # Retain complete recurrent inputs, selecting only the head rows.
+                response_lengths = torch.minimum(response_mask[bucket_indices].bool().sum(-1), bucket_lengths - 1)
+                head_length = max(int(response_lengths.max().item()), 1)
+                offsets = torch.arange(head_length, device=sequences.device).unsqueeze(0)
+                head_positions = (bucket_lengths - response_lengths - 1).unsqueeze(-1) + offsets
+                head_positions = torch.minimum(head_positions, (bucket_lengths - 1).unsqueeze(-1))
+                head_valid = offsets < response_lengths.unsqueeze(-1)
+                head_kwargs["logits_to_keep"] = head_positions
+                bucket_labels = bucket_labels.gather(1, head_positions)
             if not was_training:
                 self.model.train()
             try:
                 with torch.autocast(device_type=bucket_sequences.device.type, enabled=False):
-                    bucket_output = self.model(bucket_sequences)
+                    bucket_output = self.model(bucket_sequences, **head_kwargs)
             finally:
                 self.model.train(was_training)
             bucket_logits = bucket_output["logits"]
-            bucket_logits.div_(temperature)
+            # FlashRWKV2's fused head returns a custom-autograd view.
+            if temperature != 1.0:
+                bucket_logits = bucket_logits / temperature
             if enable_score_centering:
                 bucket_head_logprobs, bucket_sampler_logprobs = _score_centering_support_head_logprobs(
                     bucket_logits,
@@ -511,17 +546,20 @@ class HFModelWrapper(nn.Module):
                     sample_support,
                     sample_support_logprobs,
                 )
-            bucket_log_probs = logprobs_from_logits(
-                bucket_logits,
-                bucket_labels,
-                inplace_backward=True,
-            )
-            bucket_log_probs = torch.stack(
-                [
-                    nn.functional.pad(row[: int(length.item())], (padded_length - int(length.item()), 0))
-                    for row, length in zip(bucket_log_probs, bucket_lengths, strict=True)
-                ]
-            )
+            # Match vLLM-RWKV's rollout logprobs bitwise for identical logits.
+            bucket_log_probs = logprobs_from_logits_vllm(bucket_logits, bucket_labels)
+            if response_only:
+                output_positions = (padded_length - bucket_lengths).unsqueeze(-1) + head_positions
+                bucket_log_probs = bucket_log_probs.new_zeros((len(bucket_indices), padded_length)).scatter_add(
+                    1, output_positions, bucket_log_probs * head_valid
+                )
+            else:
+                bucket_log_probs = torch.stack(
+                    [
+                        nn.functional.pad(row[: int(length.item())], (padded_length - int(length.item()), 0))
+                        for row, length in zip(bucket_log_probs, bucket_lengths, strict=True)
+                    ]
+                )
             if log_probs is None:
                 log_probs = bucket_log_probs.new_zeros((batch_size, padded_length))
             log_probs = log_probs.index_copy(0, bucket_indices, bucket_log_probs)
@@ -566,12 +604,17 @@ class HFModelWrapper(nn.Module):
                     attention_mask=None,
                     chunk_size=self.logprobs_chunk_size,
                 )
-                bucket_entropy = torch.stack(
-                    [
-                        nn.functional.pad(row[: int(length.item())], (padded_length - int(length.item()), 0))
-                        for row, length in zip(bucket_entropy, bucket_lengths, strict=True)
-                    ]
-                )
+                if response_only:
+                    bucket_entropy = bucket_entropy.new_zeros((len(bucket_indices), padded_length)).scatter_add(
+                        1, output_positions, bucket_entropy * head_valid
+                    )
+                else:
+                    bucket_entropy = torch.stack(
+                        [
+                            nn.functional.pad(row[: int(length.item())], (padded_length - int(length.item()), 0))
+                            for row, length in zip(bucket_entropy, bucket_lengths, strict=True)
+                        ]
+                    )
                 if entropy is None:
                     entropy = bucket_entropy.new_zeros((batch_size, padded_length))
                 entropy = entropy.index_copy(0, bucket_indices, bucket_entropy)
@@ -611,6 +654,7 @@ class HFModelWrapper(nn.Module):
         loss_mask: Optional[torch.Tensor] = None,
         enable_sample_support_replay: bool = False,
         enable_score_centering: bool = False,
+        response_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Returns action log probs"""
         if self.is_rwkv:
@@ -627,6 +671,7 @@ class HFModelWrapper(nn.Module):
                 sample_support=sample_support,
                 sample_support_logprobs=sample_support_logprobs,
                 enable_score_centering=enable_score_centering,
+                response_mask=response_mask,
             )
 
         has_image_inputs = pixel_values is not None or image_grid_thw is not None
@@ -842,6 +887,7 @@ def _get_critic_model(
             self.sequence_parallel_size = sequence_parallel_size
             self.remove_microbatch_padding = remove_microbatch_padding
             self.is_rwkv = config.model_type == "rwkv"
+            self.freeze_backbone = False
             if self.is_rwkv:
                 if remove_microbatch_padding:
                     raise ValueError("RWKV does not support remove_microbatch_padding=true")
@@ -864,13 +910,17 @@ def _get_critic_model(
             Tail padding cannot affect earlier states in a causal recurrent model.
             """
             lengths = attention_mask.sum(-1)
-            recurrent_ids = input_ids.new_zeros((input_ids.shape[0], int(lengths.max().item())))
+            length = int(lengths.max().item())
+            length = (length + RWKV_CHUNK_LENGTH - 1) // RWKV_CHUNK_LENGTH * RWKV_CHUNK_LENGTH
+            recurrent_ids = input_ids.new_zeros((input_ids.shape[0], length))
             for index, length in enumerate(lengths.tolist()):
                 recurrent_ids[index, :length] = input_ids[index, attention_mask[index].bool()]
             with torch.autocast(device_type=input_ids.device.type, enabled=False):
-                outputs = getattr(self, self.base_model_prefix)(recurrent_ids, use_cache=False)
+                with torch.set_grad_enabled(torch.is_grad_enabled() and not self.freeze_backbone):
+                    outputs = getattr(self, self.base_model_prefix)(recurrent_ids, use_cache=False)
                 hidden_states = outputs["last_hidden_state"]
-                recurrent_values = getattr(self, self.value_head_prefix)(hidden_states).squeeze(-1)
+                value_head = getattr(self, self.value_head_prefix)
+                recurrent_values = value_head(hidden_states.to(value_head.weight.dtype)).squeeze(-1)
             values = recurrent_values.new_zeros(input_ids.shape)
             for index, length in enumerate(lengths.tolist()):
                 values[index, attention_mask[index].bool()] = recurrent_values[index, :length]
@@ -893,6 +943,9 @@ def _get_critic_model(
                 if num_actions is None:
                     assert return_output
                     return outputs
+                calibration = getattr(self.config, "value_head_calibration", None)
+                if calibration is not None:
+                    values = torch.sigmoid(values.float() * calibration["scale"] + calibration["bias"])
                 action_values = values[:, -num_actions:]
                 return (action_values, outputs) if return_output else action_values
 
@@ -930,12 +983,13 @@ def _get_critic_model(
                     input_ids_fwd, position_ids_fwd, attention_mask_fwd, self.sequence_parallel_size
                 )
 
-            if self.sequence_parallel_size > 1 and self.config._attn_implementation == "flash_attention_2":
-                outputs = getattr(self, self.base_model_prefix)(input_ids_fwd, position_ids=position_ids_fwd)
-            else:
-                outputs = getattr(self, self.base_model_prefix)(
-                    input_ids_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd
-                )
+            with torch.set_grad_enabled(torch.is_grad_enabled() and not self.freeze_backbone):
+                if self.sequence_parallel_size > 1 and self.config._attn_implementation == "flash_attention_2":
+                    outputs = getattr(self, self.base_model_prefix)(input_ids_fwd, position_ids=position_ids_fwd)
+                else:
+                    outputs = getattr(self, self.base_model_prefix)(
+                        input_ids_fwd, attention_mask=attention_mask_fwd, position_ids=position_ids_fwd
+                    )
             last_hidden_states_BSH = outputs["last_hidden_state"]
 
             if self.sequence_parallel_size > 1:
@@ -957,6 +1011,10 @@ def _get_critic_model(
                 values_BSH = pad_input(values_BSH.squeeze(0), indices=nnz_indices, batch=batch_size, seqlen=seqlen)
 
             values = values_BSH.squeeze(-1)[:, :-1]
+
+            calibration = getattr(self.config, "value_head_calibration", None)
+            if calibration is not None:
+                values = torch.sigmoid(values.float() * calibration["scale"] + calibration["bias"])
 
             if num_actions is None:
                 assert return_output
@@ -985,6 +1043,8 @@ def get_llm_for_sequence_regression(
     target_modules=None,
     exclude_modules=None,
     lora_dropout=0,
+    use_nora=False,
+    freeze_backbone=False,
     use_flash_attention_2=False,
     init_value_head: bool = False,
     value_head_prefix="value_head",
@@ -1009,6 +1069,16 @@ def get_llm_for_sequence_regression(
     assert model_type == "critic", f"Only model_type critic is supported, got: {model_type}."
 
     config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True, **model_config_kwargs)
+    calibration = model_config_kwargs.get("value_head_calibration", getattr(config, "value_head_calibration", None))
+    if calibration is not None:
+        scale, bias = float(calibration["scale"]), float(calibration["bias"])
+        if not np.isfinite([scale, bias]).all() or scale < 0:
+            raise ValueError("value_head_calibration requires a finite nonnegative scale and finite bias.")
+        calibration = {"scale": scale, "bias": bias}
+    config.value_head_calibration = calibration
+    if use_nora:
+        if config.model_type != "rwkv" or lora_rank <= 0:
+            raise ValueError("NoRA critic training requires an RWKV model and a positive LoRA rank.")
     if config.model_type == "rwkv":
         # FlashRWKV2 requires native BF16, including evaluation and FSDP master weights.
         bf16 = True
@@ -1054,9 +1124,15 @@ def get_llm_for_sequence_regression(
             **kwargs,
         )
 
+    model.freeze_backbone = freeze_backbone
+    backbone = getattr(model, model.base_model_prefix)
+
     # LoRA
     if lora_rank > 0:
-        model.enable_input_require_grads()
+        if not freeze_backbone:
+            model.enable_input_require_grads()
+        if use_nora or freeze_backbone:
+            getattr(model, value_head_prefix).float()
         lora_config = LoraConfig(
             r=lora_rank,
             lora_alpha=lora_alpha,
@@ -1064,8 +1140,12 @@ def get_llm_for_sequence_regression(
             exclude_modules=exclude_modules,
             lora_dropout=lora_dropout,
             bias="none",
+            **({"modules_to_save": [value_head_prefix]} if use_nora or freeze_backbone else {}),
+            **({"use_nora": True} if use_nora else {}),
         )
         model = get_peft_model(model, lora_config)
+        if use_nora:
+            model.train()
 
         if load_in_4bit:
             for name, module in model.named_modules():
@@ -1076,6 +1156,12 @@ def get_llm_for_sequence_regression(
                 if value_head_prefix in name or "embed_tokens" in name:
                     if hasattr(module, "weight"):
                         module = module.to(torch.bfloat16)
+
+    if freeze_backbone:
+        backbone.requires_grad_(False)
+        critic = model.get_base_model() if lora_rank > 0 else model
+        value_head = getattr(critic, value_head_prefix).float()
+        value_head.weight.requires_grad_(True)
 
     # MoE - balancing loss
     model_config = model.config.to_dict()

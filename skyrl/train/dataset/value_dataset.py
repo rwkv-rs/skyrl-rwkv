@@ -97,11 +97,16 @@ class RewardDataCollator:
         }
 
 
-def value_loss(predictions, labels, response_mask):
-    """FP32 masked squared-error sum and action count, for global normalization.
+def value_loss(predictions, labels, response_mask, loss_reduction="token_mean", max_seq_len=None):
+    """FP32 squared-error sum and count for global token or sequence normalization.
 
     Keep raw scalar outputs to match SkyRL's online MSE critic and arbitrary
     reward scales; ReDiPPO's probability-only sigmoid is not applied.
     """
     errors = (predictions.float() - labels.float()).square()
+    if loss_reduction in ("sequence_mean", "seq_mean_token_sum_norm"):
+        counts = response_mask.sum(-1)
+        denominator = counts.clamp_min(1) if loss_reduction == "sequence_mean" else max_seq_len
+        errors = errors.masked_fill(~response_mask.bool(), 0).sum(-1) / denominator
+        return errors.masked_select(counts > 0).sum(), (counts > 0).sum()
     return errors.masked_select(response_mask).sum(), response_mask.sum()

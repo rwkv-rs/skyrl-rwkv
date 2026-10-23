@@ -212,11 +212,15 @@ def export_benchmarks(args):
                     question = doc.query
                     if spec["name"].startswith("gpqa:"):
                         question = task.dataset[task.evaluation_split[0]][int(doc.id)]["Question"]
+                    elif spec["name"] == "gsm_plus" and getattr(args, "include_answers", False):
+                        question = task.dataset[task.evaluation_split[0]][int(doc.id)]["seed_question"]
+                        question = f"Question: {question}\n"
                     key = hashlib.sha256(question.strip().encode()).hexdigest()
                     write_json(
                         handle,
                         {
                             "query": doc.query,
+                            **({"gold_answers": doc.get_golds()} if getattr(args, "include_answers", False) else {}),
                             "source": {
                                 "benchmark": spec["name"],
                                 "task": task.full_name,
@@ -226,7 +230,8 @@ def export_benchmarks(args):
                                 "task_version": task.dataset_config.version,
                                 "hf_repo": task.dataset_config.hf_repo,
                                 "evaluation_splits": task.evaluation_split,
-                                "prompt_template": (
+                                "prompt_template": spec.get("prompt_template")
+                                or (
                                     "bot"
                                     if spec["field"] in {"maths", "coding"} or spec["name"].startswith("gpqa:")
                                     else "assistant"
@@ -711,7 +716,7 @@ def load_model(model_path, adapter_path=None):
             for name, param in parameters.items():
                 param.copy_(weights[name])
     # BF16 scoring uses the differentiable fused operators under no_grad;
-    # FP16 free generation is handled by vLLM.
+    # free generation is handled by vLLM.
     return model.train()
 
 
@@ -774,7 +779,7 @@ async def generate(args):
             else await start_servers(
                 args,
                 processes,
-                enforce_eager=True,
+                enforce_eager=args.enforce_eager,
                 gpu_memory_utilization=args.gpu_memory_utilization,
                 max_num_batched_tokens=args.max_num_batched_tokens,
             )
@@ -857,7 +862,7 @@ async def generate(args):
                                     raise
                                 print(f"prompt_index={index} POST retry={attempt + 1}: {exc}", flush=True)
                                 await asyncio.sleep(1)
-                    for choice in payload["choices"]:
+                    for sample_index, choice in enumerate(payload["choices"]):
                         response_ids = choice["token_ids"]
                         text = tokenizer.decode(response_ids, skip_special_tokens=True)
                         found, hit = find_inner_repetition(text)
@@ -866,6 +871,7 @@ async def generate(args):
                             {
                                 "model": args.model,
                                 "prompt_index": index,
+                                "sample_index": choice.get("index", sample_index),
                                 "seed": args.seed + index,
                                 "prompt_ids": prompt_ids,
                                 "response_ids": response_ids,
@@ -1176,8 +1182,8 @@ def merge_and_save(model, tokenizer, model_path, output, probe_ids, device):
 
     with torch.no_grad():
         # Normalize NoRA in FP32 before using the vanilla LoRA inference path.
-        # Keep these FP32 factors for merging: BF16 base-weight rounding can
-        # erase small updates, whereas rollout uses FP16 projections.
+        # Keep these FP32 factors for merging, then round each merged
+        # projection once to the BF16 weights used by rollout.
         factors = {}
         for layer in model.modules():
             if isinstance(layer, LoraLayer):
@@ -1188,8 +1194,8 @@ def merge_and_save(model, tokenizer, model_path, output, probe_ids, device):
                     layer.use_nora["default"] = False
                 factors[layer] = (weight_a, weight_b)
                 layer.lora_A["default"].weight.data = weight_a
-        model.half().eval()
-        # FP16 inference reads dense Head and ChannelMix weights.
+        model.to(torch.bfloat16).eval()
+        # Merge dense Head and ChannelMix weights before the logits probe.
         head = model.get_output_embeddings()
         dense_layers = [head]
         if model.config.model_type == "rwkv":
@@ -1214,21 +1220,18 @@ def merge_and_save(model, tokenizer, model_path, output, probe_ids, device):
                 actual = F.linear(hidden, head.get_base_layer().weight)
                 torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
                 head_error = (actual - expected).abs().max().item()
-            layer.get_base_layer().weight.data = layer.get_base_layer().weight.data.half()
+            layer.get_base_layer().weight.data = layer.get_base_layer().weight.data.to(torch.bfloat16)
         before = last_logits(model, probe_ids, device)
         for layer, (weight_a, weight_b) in factors.items():
             layer.get_base_layer().weight.data = layer.get_base_layer().weight.data.float()
             layer.lora_A["default"].weight.data = weight_a
             layer.lora_B["default"].weight.data = weight_b
-        merged = model.merge_and_unload(safe_merge=True).half().to(device).eval()
+        merged = model.merge_and_unload(safe_merge=True).to(device, torch.bfloat16).eval()
         after = last_logits(merged, probe_ids, device)
     max_error = (before - after).abs().max().item()
     before_logp, after_logp = F.log_softmax(before, -1), F.log_softmax(after, -1)
     torch.testing.assert_close(after_logp, before_logp, atol=0.15, rtol=0.01)
     kl = (before_logp.exp() * (before_logp - after_logp)).sum(-1).item()
-    # RWKV inference temporarily casts its embedding to BF16; restore FP16
-    # so save_pretrained records the export dtype for dtype="auto" readers.
-    merged.half()
     merged.save_pretrained(output, safe_serialization=True)
     tokenizer.save_pretrained(output)
     for path in [*Path(model_path).glob("*generation_config.json"), *Path(model_path).glob("tokenizer_config.json")]:
@@ -1239,7 +1242,7 @@ def merge_and_save(model, tokenizer, model_path, output, probe_ids, device):
                 "max_logit_error": max_error,
                 "kl_reference_merged": kl,
                 "merge_dtype": "float32",
-                "export_dtype": "float16",
+                "export_dtype": "bfloat16",
                 "head_max_logit_error": head_error,
             }
         )
@@ -1256,8 +1259,6 @@ def train(args):
     from skyrl.backends.skyrl_train.distributed.fsdp_utils import layered_summon_lora_params
     from skyrl.train.config import FSDPConfig, OptimizerConfig
 
-    if "use_nora" not in LoraConfig.__dataclass_fields__:
-        raise RuntimeError(f"Install Joluck/NoRA at {NORA_REVISION} in the project .venv; see the RWKV README.")
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     dist.init_process_group("nccl")
@@ -1315,7 +1316,7 @@ def train(args):
             import wandb
 
             run = wandb.init(
-                project="rwkv_antidoom",
+                project="skyrl-rwkv",
                 name=f"{Path(args.model).name}-antidoom-nora",
                 config={
                     **vars(args),
@@ -1468,6 +1469,9 @@ def main():
     export_parser.add_argument("--lighteval-project", type=Path, required=True)
     export_parser.add_argument("--output", type=Path, required=True)
     export_parser.add_argument("--seed", type=int, default=42)
+    export_parser.add_argument(
+        "--include-answers", action="store_true", help="Retain native golds for offline value scoring"
+    )
     mix_parser = commands.add_parser("export-mix")
     mix_parser.add_argument("--benchmark-data", type=Path, required=True)
     mix_parser.add_argument("--tested-benchmarks", type=Path, required=True)
@@ -1509,6 +1513,9 @@ def main():
     generate_parser.add_argument("--max-num-seqs", type=int, default=128)
     generate_parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     generate_parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    generate_parser.add_argument(
+        "--enforce-eager", action=argparse.BooleanOptionalAction, default=True, help="Disable to use CUDA graphs"
+    )
     generate_parser.add_argument("--port", type=int, default=19001)
     generate_parser.add_argument("--timeout", type=float, default=1800)
     generate_parser.add_argument("--startup-timeout", type=float, default=900)

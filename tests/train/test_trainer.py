@@ -2,6 +2,8 @@
 uv  run --isolated --extra dev pytest tests/train/test_trainer.py
 """
 
+from contextvars import ContextVar
+from threading import Barrier
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -37,6 +39,84 @@ class DummyDataset:
 
     def collate_fn(self, batch):
         return batch
+
+
+@pytest.mark.parametrize("greater_is_better", [True, False])
+def test_best_checkpoint_survives_retention_and_hf_export(tmp_path, dummy_config, monkeypatch, greater_is_better):
+    import json
+    from pathlib import Path
+
+    from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
+
+    cfg = dummy_config.trainer
+    cfg.ckpt_path = cfg.export_path = str(tmp_path)
+    cfg.max_ckpts_to_keep = 1
+    cfg.metric_for_best_model = "eval/all/avg_score"
+    cfg.greater_is_better = greater_is_better
+    trainer = RayPPOTrainer(
+        cfg=dummy_config,
+        tracker=None,
+        tokenizer=None,
+        train_dataset=DummyDataset(),
+        eval_dataset=None,
+        inference_engine_client=None,
+        generator=None,
+    )
+    trainer.dispatch = MagicMock()
+    monkeypatch.setattr("skyrl.train.trainer.run_on_each_node", lambda *args: None)
+
+    def save_checkpoint(role, path, tokenizer):
+        Path(path).mkdir(parents=True, exist_ok=True)
+        (Path(path) / "model_rank_0.pt").write_bytes(b"training weights")
+        (Path(path) / "optim_rank_0.pt").write_bytes(b"optimizer state")
+
+    def export(role, path, tokenizer):
+        strategy = FSDPStrategy.__new__(FSDPStrategy)
+        with strategy._atomic_local_export_dir(path) as directory:
+            (Path(directory) / "model.safetensors").write_bytes(b"exported weights")
+
+    trainer.dispatch.save_checkpoint.side_effect = save_checkpoint
+    trainer.dispatch.save_hf_model.side_effect = export
+
+    def score(value):
+        return value if greater_is_better else -value
+
+    for step, value in [(1, 0.6), (2, 0.5), (3, 0.4)]:
+        trainer.global_step = step
+        trainer._save_best_checkpoint({cfg.metric_for_best_model: score(value)})
+        trainer.save_checkpoints()
+        trainer.save_models()
+    assert {path.name for path in tmp_path.glob("global_step_*")} == {"global_step_1", "global_step_3"}
+    best = json.loads((tmp_path / "best_checkpoint.json").read_text())
+    assert best["global_step"] == 1 and best["value"] == score(0.6)
+    assert (tmp_path / "global_step_1/policy/model_rank_0.pt").exists()
+    assert (tmp_path / "global_step_1/policy/optim_rank_0.pt").exists()
+    assert (tmp_path / "global_step_1/policy/huggingface/model.safetensors").exists()
+    trainer.global_step = 4
+    trainer._save_best_checkpoint({cfg.metric_for_best_model: score(0.7)})
+    trainer.save_checkpoints()
+    assert {path.name for path in tmp_path.glob("global_step_*")} == {"global_step_4"}
+    state = torch.load(tmp_path / "global_step_4/trainer_state.pt", weights_only=False)
+    assert state["best_global_step"] == 4 and state["best_metric"] == score(0.7)
+
+
+def test_eos_zero_is_kept_as_action_in_training_batch():
+    from skyrl.train.dataset.preprocess import (
+        convert_prompts_responses_to_batch_tensors,
+    )
+
+    sequences, attention, response, rewards, loss, logprobs, _, _ = convert_prompts_responses_to_batch_tensors(
+        0,
+        [[11, 12], [21]],
+        [[31, 0], [41, 42, 43]],
+        [[0.0, 1.0], [0.0] * 3],
+        [[1, 1], [1, 1, 1]],
+        [[-0.4, -0.7], [-0.1, -0.2, -0.3]],
+    )
+    assert sequences[0, -1] == 0 and attention[0, -1] == response[0, -1] == loss[0, -1] == 1
+    assert logprobs[0, -1] == pytest.approx(-0.7)
+    assert rewards[0, -1] == 1
+    assert sequences[1, -1] == 43  # A truncated answer does not acquire a synthetic EOS.
 
 
 @pytest.fixture
@@ -201,6 +281,56 @@ def test_calc_advantages_and_returns(mock_compute_adv_and_ret, dummy_config):
     assert metrics["avg_advantages"] == approx(
         torch.masked_select(mock_advantages, data["response_mask"].bool()).mean().item(), rel=1e-5
     )
+
+
+def test_calc_gae_adaptive_passes_action_mask_and_keeps_mc_returns(dummy_config):
+    dummy_config.trainer.algorithm.advantage_estimator = "gae_adaptive"
+    dummy_config.trainer.algorithm.gae_adaptive.min_length = 0
+    trainer = RayPPOTrainer(
+        cfg=dummy_config,
+        tracker=None,
+        tokenizer=None,
+        train_dataset=DummyDataset(),
+        eval_dataset=DummyDataset(),
+        inference_engine_client=None,
+        generator=None,
+    )
+    data = _get_test_data(trainer)
+    data["values"] = torch.zeros_like(data["rewards"])
+    data = trainer.compute_advantages_and_returns(data)
+    torch.testing.assert_close(data["returns"], data["loss_mask"].float())
+    assert not data["advantages"][~data["loss_mask"].bool()].any()
+    assert data["advantages"][0, 0] == approx(1 - 1 / (1.5 * 2))
+    assert data["advantages"][1, 0] == approx((1 - 1 / (1.5 * 3)) ** 2)
+    assert trainer.all_metrics["critic/token_mse"] == approx(1.0)
+    assert trainer.all_metrics["critic/prediction_mean"] == 0
+    assert trainer.all_metrics["critic/target_mean"] == 1
+
+
+@pytest.mark.parametrize("estimator, reward_index", [("gae_adaptive", 1), ("grpo", 3)])
+def test_postprocess_scalar_reward_at_last_action_for_adaptive_gae(dummy_config, estimator, reward_index):
+    dummy_config.trainer.algorithm.advantage_estimator = estimator
+    trainer = RayPPOTrainer(
+        cfg=dummy_config,
+        tracker=None,
+        tokenizer=None,
+        train_dataset=DummyDataset(),
+        eval_dataset=DummyDataset(),
+        inference_engine_client=None,
+        generator=None,
+    )
+    output = {"response_ids": [[11, 12, 21, 22]], "loss_masks": [[1, 1, 0, 0]], "rewards": [1.0]}
+    with patch(
+        "skyrl.train.trainer.get_metrics_from_generator_output",
+        return_value={
+            "pass_at_n": 1.0,
+            "avg_score": 1.0,
+            "mean_positive_reward": 1.0,
+        },
+    ):
+        result, _ = trainer.postprocess_generator_output(output, ["a"])
+    assert result["rewards"][0][reward_index] == 1.0
+    assert sum(result["rewards"][0]) == 1.0
 
 
 def test_calc_advantages_and_returns_step_wise_broadcast(dummy_config):
@@ -733,3 +863,136 @@ def test_validate_batch_sizes_lcm_dp_requirement():
     # Pass: ref disabled -> requirement reduces to policy_dp. With policy_dp=2, tbs=2 is valid.
     cfg = create_config(train_batch_size=2, policy_dp=2, ref_dp=3, include_ref=False)
     validate_batch_sizes(cfg)
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_critic_policy_training_concurrency_preserves_metrics_and_context(parallel):
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.cfg = SkyRLTrainConfig()
+    trainer.cfg.trainer.critic.model.path = "critic"
+    trainer.cfg.trainer.train_critic_and_policy_parallel = parallel
+    trainer.global_step = 7
+    trainer.all_timings = {}
+    trainer.all_metrics = {}
+    trainer.dispatch = MagicMock()
+    data = TrainingInputBatch({"sequences": torch.ones((2, 3), dtype=torch.long)})
+    data.metadata = {}
+    barrier = Barrier(2)
+    context = ContextVar("training_test_context", default=None)
+    token = context.set("step-7")
+    calls = []
+
+    def train_model(role, batch):
+        assert context.get() == "step-7"
+        assert batch.metadata["global_step"] == 7
+        calls.append(role)
+        if parallel:
+            barrier.wait(timeout=5)
+        return {"loss": 1.0 if role == "policy" else 2.0}
+
+    trainer._execute_training_step = train_model
+    try:
+        result = trainer.train_critic_and_policy(data)
+    finally:
+        context.reset(token)
+    assert result == {"loss": 1.0}
+    assert trainer.all_metrics == {"policy/loss": 1.0, "critic/loss": 2.0}
+    assert set(trainer.all_timings) == {"policy_train", "critic_train"}
+    assert sorted(calls) == ["critic", "policy"]
+    if not parallel:
+        assert calls == ["critic", "policy"]
+    trainer.dispatch.empty_cache.assert_called_once_with()
+
+
+def test_parallel_critic_failure_propagates():
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.cfg = SkyRLTrainConfig()
+    trainer.cfg.trainer.critic.model.path = "critic"
+    trainer.cfg.trainer.train_critic_and_policy_parallel = True
+    trainer.global_step = 1
+    trainer.all_timings = {}
+    trainer.dispatch = MagicMock()
+    data = TrainingInputBatch({"sequences": torch.ones((1, 3), dtype=torch.long)})
+    data.metadata = {}
+
+    def train_model(role, batch):
+        if role == "critic":
+            raise RuntimeError("critic failed")
+        return {}
+
+    trainer._execute_training_step = train_model
+    with pytest.raises(RuntimeError, match="critic failed"):
+        trainer.train_critic_and_policy(data)
+    trainer.dispatch.empty_cache.assert_not_called()
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_zero_critic_lr_preserves_critic_weights_and_optimizer(parallel):
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.cfg = SkyRLTrainConfig()
+    trainer.cfg.trainer.critic.model.path = "critic"
+    trainer.cfg.trainer.critic.optimizer_config.lr = 0
+    trainer.cfg.trainer.train_critic_and_policy_parallel = parallel
+    trainer.global_step = 26
+    trainer.all_timings = {}
+    trainer.all_metrics = {}
+    trainer.dispatch = MagicMock()
+    data = TrainingInputBatch({"sequences": torch.ones((1, 3), dtype=torch.long)})
+    data.metadata = {}
+    parameters = {role: torch.nn.Parameter(torch.tensor(1.0)) for role in ("policy", "critic")}
+    # A restored critic optimizer can retain the checkpoint's nonzero learning rate.
+    optimizers = {role: torch.optim.AdamW([parameter], lr=0.1) for role, parameter in parameters.items()}
+
+    def train_model(role, batch):
+        parameters[role].square().backward()
+        optimizers[role].step()
+        return {"loss": 1.0}
+
+    trainer._execute_training_step = train_model
+    trainer.train_critic_and_policy(data)
+    assert trainer.has_critic
+    assert parameters["policy"].item() < 1.0
+    assert parameters["critic"].item() == 1.0
+    assert parameters["critic"].grad is None
+    assert not optimizers["critic"].state
+    assert trainer.all_metrics == {"policy/loss": 1.0}
+    assert set(trainer.all_timings) == {"policy_train"}
+
+
+@pytest.mark.parametrize("dp_size,real_rows,mini_size", [(3, 10, 5), (7, 1024, 256), (8, 1024, 256)])
+def test_staged_forward_removes_each_minibatch_padding_before_reassembly(monkeypatch, dp_size, real_rows, mini_size):
+    from types import SimpleNamespace
+
+    from skyrl.backends.skyrl_train.distributed.dispatch import MeshDispatch
+    from skyrl.backends.skyrl_train.training_batch import (
+        TrainingInputBatch,
+        pad_training_input_batch,
+    )
+
+    data = TrainingInputBatch(
+        {
+            "sequences": torch.arange(real_rows).reshape(-1, 1),
+            "attention_mask": torch.ones(real_rows, 1, dtype=torch.long),
+        }
+    )
+    data.metadata = {"response_length": 1}
+    data = pad_training_input_batch(data, (-real_rows) % dp_size)
+    boundaries = [(i, i + mini_size) for i in range(0, real_rows, mini_size)]
+    monkeypatch.setattr("skyrl.backends.skyrl_train.distributed.dispatch.ray.put", lambda chunk: chunk)
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.cfg = SimpleNamespace(trainer=SimpleNamespace(recompute_old_logprobs_per_minibatch=True))
+
+    def forward(model, chunks):
+        return SimpleNamespace(
+            loss_fn_outputs=[{"logprobs": [-float(row[0])]} for chunk in chunks for row in chunk["sequences"]]
+        )
+
+    trainer.dispatch = SimpleNamespace(
+        stage_data=lambda model, batch, bounds: MeshDispatch.stage_chunks(dp_size, batch, bounds),
+        forward_from_staged=forward,
+    )
+    result = trainer._execute_forward_pass("policy", data, "logprobs", boundaries)
+    expected = torch.cat((-torch.arange(real_rows, dtype=torch.float32), torch.zeros(len(data) - real_rows))).reshape(
+        -1, 1
+    )
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)

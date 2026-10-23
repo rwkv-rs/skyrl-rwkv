@@ -7,12 +7,35 @@ import pytest
 
 from skyrl.backends.skyrl_train.inference_servers.utils import (
     _apply_serialized_fp8_weight_sync_defaults,
+    _get_vllm_logprobs_mode,
     build_vllm_cli_args,
     get_pd_cli_args,
     get_pd_p2p_connector_name,
     resolve_policy_model_name,
 )
 from skyrl.train.config import SkyRLTrainConfig
+
+
+@pytest.mark.parametrize("model_type", ["rwkv", "qwen3"])
+@pytest.mark.parametrize(
+    "sampling_override",
+    [{}, {"temperature": 0.8}, {"top_p": 0.9}, {"top_k": 32}, {"additional_kwargs": {"presence_penalty": 1.0}}],
+)
+def test_raw_logprobs_requires_rwkv_and_an_unmodified_distribution(monkeypatch, model_type, sampling_override):
+    import transformers
+
+    monkeypatch.setattr(
+        transformers.AutoConfig, "from_pretrained", lambda *_args, **_kwargs: SimpleNamespace(model_type=model_type)
+    )
+    cfg = SkyRLTrainConfig()
+    cfg.generator.inference_engine.engine_init_kwargs["logprobs_mode"] = "raw_logprobs"
+    for key, value in sampling_override.items():
+        setattr(cfg.generator.sampling_params, key, value)
+    if model_type == "rwkv" and not sampling_override:
+        assert _get_vllm_logprobs_mode(cfg) == "raw_logprobs"
+    else:
+        with pytest.raises(ValueError, match="unmodified rollout distribution"):
+            _get_vllm_logprobs_mode(cfg)
 
 
 def test_serialized_fp8_weight_sync_defaults_configure_vllm_checkpoint_fp8(monkeypatch):
@@ -182,6 +205,26 @@ def test_resolve_policy_model_name_uses_served_model_name():
     cfg.generator.inference_engine.served_model_name = "served-alias"
 
     assert resolve_policy_model_name(cfg) == "served-alias"
+
+
+@pytest.mark.parametrize("use_nora", [False, True])
+def test_fsdp_nora_serves_complete_weights_instead_of_adapter(use_nora):
+    from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+        SKYRL_LORA_ADAPTER_NAME,
+    )
+    from skyrl.backends.skyrl_train.inference_servers.utils import (
+        _uses_lora_weight_sync,
+    )
+
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        [
+            "trainer.policy.model.path=rwkv-student",
+            "trainer.policy.model.lora.rank=8",
+            f"trainer.policy.model.lora.use_nora={str(use_nora).lower()}",
+        ]
+    )
+    assert _uses_lora_weight_sync(cfg) is not use_nora
+    assert resolve_policy_model_name(cfg) == ("rwkv-student" if use_nora else SKYRL_LORA_ADAPTER_NAME)
 
 
 def test_serialized_fp8_threads_the_wire_format_into_the_ignore_list(monkeypatch):

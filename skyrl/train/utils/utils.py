@@ -134,17 +134,21 @@ def validate_batch_sizes(cfg: SkyRLTrainConfig):
     policy_mini_batch_size_per_gpu = (
         cfg.trainer.policy_mini_batch_size * cfg.generator.n_samples_per_prompt // policy_dp_size
     )
+    # Separate async pools need not divide the logical batch (e.g. seven
+    # learners and one sampler). Native MeshDispatch pads each mini-batch with
+    # loss_mask=0; FSDP's microbatch iterator handles the equal partial tails.
+    padded_async = cfg.trainer.fully_async.enabled and cfg.trainer.strategy == "fsdp"
     assert policy_mini_batch_size_per_gpu > 0, (
         f"Invalid policy_mini_batch_size_per_gpu: {policy_mini_batch_size_per_gpu}. "
         f"mini_batch_size={cfg.trainer.policy_mini_batch_size}, "
         f"n_samples_per_prompt={cfg.generator.n_samples_per_prompt}, "
         f"dp_size={policy_dp_size}"
     )
-    assert policy_mini_batch_size_per_gpu % cfg.trainer.micro_train_batch_size_per_gpu == 0, (
+    assert padded_async or policy_mini_batch_size_per_gpu % cfg.trainer.micro_train_batch_size_per_gpu == 0, (
         f"normalized policy_mini_batch_size_per_gpu {policy_mini_batch_size_per_gpu} should be divisible "
         f"by micro_train_batch_size_per_gpu {cfg.trainer.micro_train_batch_size_per_gpu}"
     )
-    assert policy_mini_batch_size_per_gpu // cfg.trainer.micro_train_batch_size_per_gpu > 0, (
+    assert padded_async or policy_mini_batch_size_per_gpu // cfg.trainer.micro_train_batch_size_per_gpu > 0, (
         f"normalized policy_mini_batch_size_per_gpu {policy_mini_batch_size_per_gpu} should be larger than "
         f"micro_train_batch_size_per_gpu {cfg.trainer.micro_train_batch_size_per_gpu}"
     )
@@ -153,7 +157,7 @@ def validate_batch_sizes(cfg: SkyRLTrainConfig):
     )
 
     # `train_batch_size_per_gpu` should be divisible by `policy_mini_batch_size_per_gpu`
-    assert policy_train_batch_size_per_gpu % policy_mini_batch_size_per_gpu == 0, (
+    assert padded_async or policy_train_batch_size_per_gpu % policy_mini_batch_size_per_gpu == 0, (
         f"normalized policy_train_batch_size_per_gpu (train_batch_size * n_samples_per_prompt // policy_dp_size) "
         f"{policy_train_batch_size_per_gpu} should be divisible by policy_mini_batch_size_per_gpu "
         f"(policy_mini_batch_size * n_samples_per_prompt // policy_dp_size) {policy_mini_batch_size_per_gpu}"
@@ -438,10 +442,13 @@ def validate_cfg(cfg: SkyRLTrainConfig):
     ), f"only ulysses is supported as of now, got {cfg.trainer.sequence_parallel_backend}"
 
     # if advantage estimator is GAE, then critic path should be provided
-    if cfg.trainer.algorithm.advantage_estimator == "gae":
+    if cfg.trainer.algorithm.advantage_estimator in ("gae", "gae_adaptive"):
         assert (
             cfg.trainer.critic.model.path
         ), "`trainer.critic.model.path` should be provided for PPO training, got `None`"
+    if cfg.trainer.algorithm.advantage_estimator == "gae_adaptive":
+        if not 0 <= cfg.trainer.algorithm.gamma <= 1 or not 0 <= cfg.trainer.algorithm.lambd <= 1:
+            raise ValueError("gae_adaptive requires gamma and lambd between zero and one")
 
     assert not (
         cfg.trainer.algorithm.use_kl_in_reward and cfg.trainer.algorithm.use_kl_loss
@@ -485,6 +492,12 @@ def validate_cfg(cfg: SkyRLTrainConfig):
     )
 
     algorithm = cfg.trainer.algorithm
+    if algorithm.rollout_is.score_centering and (
+        algorithm.use_tis or off_policy_correction_enabled(algorithm.off_policy_correction)
+    ):
+        raise ValueError(
+            "rollout_is.score_centering already centers the DIS weight; disable off_policy_correction and use_tis"
+        )
     flash_loss_names = {"flashreinforce", "flash_reinforce"}
     flash_advantage_names = {"flashreinforce", "flash_reinforce"}
     flash_enabled = (
@@ -589,7 +602,11 @@ def validate_cfg(cfg: SkyRLTrainConfig):
     # uniformly to every step's response tokens. This only makes sense for outcome-based estimators.
     # Temporal estimators (GAE, REINFORCE++) produce per-token advantages, which the broadcast
     # discards. Reject the combination explicitly.
-    if cfg.generator.step_wise_trajectories and cfg.trainer.algorithm.advantage_estimator in ("gae", "reinforce++"):
+    if cfg.generator.step_wise_trajectories and cfg.trainer.algorithm.advantage_estimator in (
+        "gae",
+        "gae_adaptive",
+        "reinforce++",
+    ):
         raise ValueError(
             f"advantage_estimator={cfg.trainer.algorithm.advantage_estimator!r} is not supported with "
             f"step_wise_trajectories=True. The step-wise branch collapses each trajectory to a single "
@@ -631,11 +648,18 @@ def validate_cfg(cfg: SkyRLTrainConfig):
         f"Must be one of `['token_mean', 'token_mean_legacy', 'sequence_mean', "
         f"'seq_mean_token_sum_norm', 'prompt_mean']`"
     )
-    if cfg.trainer.algorithm.loss_reduction == "seq_mean_token_sum_norm":
-        if cfg.trainer.algorithm.max_seq_len is None:
+    if cfg.trainer.algorithm.critic_loss_reduction not in ("sequence_mean", "seq_mean_token_sum_norm"):
+        raise ValueError(
+            "`trainer.algorithm.critic_loss_reduction` must be 'sequence_mean' or 'seq_mean_token_sum_norm'."
+        )
+    if "seq_mean_token_sum_norm" in (
+        cfg.trainer.algorithm.loss_reduction,
+        cfg.trainer.algorithm.critic_loss_reduction,
+    ):
+        if cfg.trainer.algorithm.max_seq_len is None or cfg.trainer.algorithm.max_seq_len <= 0:
             raise ValueError(
-                "`trainer.algorithm.max_seq_len` must be set explicitly when "
-                "`trainer.algorithm.loss_reduction='seq_mean_token_sum_norm'`. "
+                "`trainer.algorithm.max_seq_len` must be set explicitly to a positive value when "
+                "the actor or critic loss reduction is 'seq_mean_token_sum_norm'. "
                 "Choose the total sequence-length normalization constant for your setup; "
                 "this often matches the model context window / vLLM `max_model_len` when appropriate."
             )
@@ -1150,7 +1174,18 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         logger.info("Exporting wandb api key to ray runtime env")
         env_vars["WANDB_API_KEY"] = os.environ["WANDB_API_KEY"]
 
-    for var_name in ("WANDB_INIT_TIMEOUT", "WANDB_HTTP_TIMEOUT", "WANDB_HTTP_PROXY", "WANDB_HTTPS_PROXY"):
+    for var_name in (
+        "WANDB_RUN_ID",
+        "WANDB_RESUME",
+        "WANDB_ENTITY",
+        "WANDB_PROJECT",
+        "WANDB_MODE",
+        "WANDB_DIR",
+        "WANDB_INIT_TIMEOUT",
+        "WANDB_HTTP_TIMEOUT",
+        "WANDB_HTTP_PROXY",
+        "WANDB_HTTPS_PROXY",
+    ):
         if value := os.environ.get(var_name):
             logger.info(f"Exporting {var_name} to ray runtime env")
             env_vars[var_name] = value

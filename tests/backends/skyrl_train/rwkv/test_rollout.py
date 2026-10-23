@@ -62,6 +62,86 @@ def test_text_match_uses_final_answer_and_option_mapping():
     assert rollout.text_score("Final answer: b", "The polynomial hierarchy collapses", query)
 
 
+@pytest.mark.parametrize(
+    "domain,answer,gold,finish",
+    [
+        ("Math", r">reasoning </think> \boxed{42}", "42", "stop"),
+        ("Math", r">reasoning </think> \boxed{43}", "42", "stop"),
+        ("Math", r">reasoning </think> \boxed{42}", "42", "length"),
+        ("Knowledge", "Final answer: b", "second option", "stop"),
+        ("Long_Context", "Final answer: 5", "5", "stop"),
+        ("Long_Context", "Final answer: 5", "5", "length"),
+        ("Code", "print(3)", {"inputs": [""], "outputs": ["3\n"]}, "stop"),
+    ],
+)
+@pytest.mark.parametrize("threaded", [False, True])
+def test_ultradata_native_rewards_match_rollout(
+    tmp_path, tokenizer, monkeypatch, domain, answer, gold, finish, threaded
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    import skyrl_gym
+    from skyrl_gym.envs.ultradata import env as ultradata
+
+    query = "Question?\na: first option\nb: second option"
+    dataset_row(tmp_path, domain, f"{domain}_1", query, gold)
+    row = next(rollout.rows(tmp_path, 0, tokenizer, 1000, 8))
+    if domain == "Code":
+
+        def scorer(raw, tests):
+            return raw == "print(3)" and tests == gold, "ok"
+
+        monkeypatch.setattr(rollout, "run_code", scorer)
+        monkeypatch.setattr(ultradata, "run_code", scorer)
+    counts, _, _ = rollout.score_question(row, [{"text": answer, "token_ids": [7, 0], "finish_reason": finish}], 0)
+    path, offset = row["_source"]
+    env = skyrl_gym.make(
+        "ultradata",
+        extras={"data_source": domain, "reward_spec": {"source_path": path, "source_offset": offset}},
+    )
+    _, metadata = env.init([{"role": "user", "content": query}])
+    assert metadata["chat_template_kwargs"]["rwkv_generation_prompt"] == (
+        "open_think" if domain == "Math" else "fake_think"
+    )
+    env.set_generation_metadata(
+        action=answer, ended_eod=finish == "stop", truncated=finish == "length", stop_reason=finish
+    )
+    if threaded:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            result = executor.submit(env.step, answer).result()
+    else:
+        result = env.step(answer)
+    assert result["reward"] == float(counts["correct"])
+
+
+def test_prepare_ultradata_rl_keeps_lazy_rewards_and_question_split(tmp_path):
+    import pyarrow.parquet as pq
+
+    from examples.train.rwkv.prepare_opd import prepare
+
+    source = tmp_path / "source"
+    source.mkdir()
+    for domain in rollout.DOMAINS:
+        for index in range(8):
+            gold = {"inputs": [""], "outputs": ["3\n"]} if domain == "Code" else "3"
+            dataset_row(source, domain, f"{domain}_{index}", f"query {index}", gold)
+    output = tmp_path / "rl" / "train.parquet"
+    prepare(source, output, task_rewards=True, validation_fraction=0.5, seed=42)
+    train = pq.read_table(output).to_pylist()
+    validation = pq.read_table(output.with_name("validation.parquet")).to_pylist()
+    assert len(train) + len(validation) == 32
+    assert not {row["uuid"] for row in train} & {row["uuid"] for row in validation}
+    for row in train + validation:
+        assert row["env_class"] == "ultradata"
+        spec = row["reward_spec"]
+        with open(spec["source_path"], "rb") as stream:
+            stream.seek(spec["source_offset"])
+            assert json.loads(stream.readline())["uuid"] == row["uuid"]
+    opd_output = tmp_path / "opd" / "train.parquet"
+    prepare(source, opd_output)
+    assert {row["env_class"] for row in pq.read_table(opd_output).to_pylist()} == {"aime"}
+
+
 def test_code_python_and_cpp_execution():
     fence = chr(96) * 3
     tests = {"inputs": [""], "outputs": ["3\n"]}
@@ -266,7 +346,10 @@ def test_math_rollout_preserves_coordinate_commas(tmp_path, tokenizer):
     assert samples["wrong"]["sample_index"] == 1
 
 
-def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(tmp_path, tokenizer):
+@pytest.mark.parametrize("samples_per_prompt", [1, 64])
+def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(
+    tmp_path, tokenizer, samples_per_prompt
+):
     from aiohttp import web
 
     for index in range(4):
@@ -322,6 +405,8 @@ def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(
                     "--max-num-seqs",
                     "1",
                     "--save-rollouts",
+                    "--samples-per-prompt",
+                    str(samples_per_prompt),
                     "--sampling",
                     "rollout",
                     "--score-workers",
@@ -335,6 +420,10 @@ def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(
             dataset_row(tmp_path, "Knowledge", "Knowledge_4", "q4", "42", part="part2.jsonl")
             args.resume = True
             await rollout.run(args)
+            args.samples_per_prompt = samples_per_prompt + 1
+            with pytest.raises(ValueError, match="changed rollouts_per_question"):
+                await rollout.run(args)
+            args.samples_per_prompt = samples_per_prompt
             args.max_tokens = 10
             with pytest.raises(ValueError, match="changed max_tokens"):
                 await rollout.run(args)
@@ -368,26 +457,26 @@ def test_full_pipeline_persists_before_generation_finishes_and_uses_all_engines(
     assert summary["config"]["status"] == "completed"
     assert summary["config"]["queues"]["inflight"] == [0, 0]
     assert summary["Knowledge"]["num_questions"] == 5
-    assert summary["Knowledge"]["correct_rollouts"] == 320
-    assert summary["Knowledge"]["correct_count_histogram"] == {"64": 5}
+    assert summary["Knowledge"]["correct_rollouts"] == 5 * samples_per_prompt
+    assert summary["Knowledge"]["correct_count_histogram"] == {str(samples_per_prompt): 5}
     assert summary["config"]["resumed_questions"] == 4
     assert summary["config"]["progress"]["scored_questions"] == 5
-    assert sum(requests.values()) == 320 and all(requests[index] > 0 for index in range(2))
+    assert sum(requests.values()) == 5 * samples_per_prompt and all(requests[index] > 0 for index in range(2))
     assert len(tokenizer.prompts) == 5
     records = [json.loads(line) for line in (output / "correct_counts_by_question.jsonl").read_text().splitlines()]
     assert len(records) == 5
     assert {record["uuid"] for record in records} == {f"Knowledge_{index}" for index in range(5)}
-    assert all(record["counts"] == {"correct": 64} for record in records)
+    assert all(record["counts"] == {"correct": samples_per_prompt} for record in records)
     trajectories = [
         json.loads(line) for path in (output / "rollouts").glob("*/*.jsonl") for line in path.read_text().splitlines()
     ]
-    assert len(trajectories) == 320
-    assert len({(record["uuid"], record["sample_index"]) for record in trajectories}) == 320
+    assert len(trajectories) == 5 * samples_per_prompt
+    assert len({(record["uuid"], record["sample_index"]) for record in trajectories}) == 5 * samples_per_prompt
     assert all(record["response_ids"] == list(b"Final answer: 42") + [0] for record in trajectories)
     assert all(record["reward"] == 1.0 and not record["truncated"] for record in trajectories)
     assert not list((output / "rollouts").glob("*/*.pending"))
     manifest = build_value_data.build_data(output, tmp_path / "value", validation_fraction=0.5, seed=0, max_length=64)
-    assert sum(manifest["counts"][f"{split}_rollouts"] for split in ("train", "validation")) == 320
+    assert sum(manifest["counts"][f"{split}_rollouts"] for split in ("train", "validation")) == 5 * samples_per_prompt
 
 
 @pytest.fixture
@@ -421,6 +510,157 @@ def token_rollout_run(tmp_path):
                 )
     (shards / "unfinished.pending").write_text("not a completed trajectory")
     return output
+
+
+def test_build_balanced_value_data_keeps_disjoint_questions_and_both_sources(tmp_path, token_rollout_run):
+    other = tmp_path / "benchmark-run"
+    shards = other / "rollouts/gsm8k"
+    shards.mkdir(parents=True)
+    (other / "summary.json").write_bytes((token_rollout_run / "summary.json").read_bytes())
+    for index in range(20):
+        with (shards / f"{index}.jsonl").open("w") as handle:
+            for sample in range(4):
+                handle.write(
+                    json.dumps(
+                        {
+                            "uuid": f"problem_{index}",
+                            "domain": "gsm8k",
+                            "sample_index": sample,
+                            "prompt_ids": [11, 12],
+                            "response_ids": [13 + sample, 0],
+                            "reward": float(sample == 0),
+                            "truncated": False,
+                        }
+                    )
+                    + "\n"
+                )
+    outputs = [tmp_path / name for name in ("balanced", "balanced-repeat")]
+    for output in outputs:
+        manifest = build_value_data.build_data(
+            token_rollout_run,
+            output,
+            validation_fraction=0.5,
+            max_length=8,
+            additional_inputs=[other],
+            balance_rewards=True,
+        )
+        assert len(manifest["additional_sources"]) == 1
+        questions = {}
+        for split in ("train", "validation"):
+            rows = [json.loads(line) for line in (output / f"{split}.jsonl").read_text().splitlines()]
+            assert {row["domain"] for row in rows} == {"Knowledge", "gsm8k"}
+            identities = [(row["uuid"], row["sample_index"]) for row in rows]
+            assert len(set(identities)) == len(identities)
+            questions[split] = {row["uuid"] for row in rows}
+            for domain in ("Knowledge", "gsm8k"):
+                outcomes = Counter(row["reward"] for row in rows if row["domain"] == domain)
+                assert outcomes[0] == outcomes[1] > 0
+            assert manifest["counts"][f"{split}_rollouts"] == len(rows)
+            assert manifest["counts"][f"{split}_action_tokens"] == sum(sum(row["loss_mask"]) for row in rows)
+        assert questions["train"].isdisjoint(questions["validation"])
+    for split in ("train", "validation"):
+        assert (outputs[0] / f"{split}.jsonl").read_bytes() == (outputs[1] / f"{split}.jsonl").read_bytes()
+    (other / "summary.json").write_text(json.dumps({"config": {"save_rollouts": True, "model": "other-checkpoint"}}))
+    with pytest.raises(ValueError, match="same checkpoint"):
+        build_value_data.build_data(token_rollout_run, tmp_path / "wrong-model", additional_inputs=[other])
+
+
+def test_balance_drops_domains_without_both_outcomes_and_rejects_nonbinary(tmp_path):
+    path = tmp_path / "data.jsonl"
+    row = {"uuid": "one", "domain": "Math", "reward": 0, "loss_mask": [0, 1]}
+    path.write_text(json.dumps(row) + "\n")
+    counts, _ = build_value_data.balance_data(path, 42)
+    assert counts["rollouts"] == counts["positive_rewards"] == 0
+    assert path.read_bytes() == b""
+    path.write_text(json.dumps({**row, "reward": 0.25}) + "\n")
+    with pytest.raises(ValueError, match="binary"):
+        build_value_data.balance_data(path, 42)
+
+
+def test_native_benchmark_value_scoring_preserves_tokens_and_checks_provenance(tmp_path, monkeypatch):
+    import hashlib
+
+    from skyrl.utils import tok
+
+    model = tmp_path / "model"
+    model.mkdir()
+    alias = tmp_path / "model-alias"
+    alias.symlink_to(model, target_is_directory=True)
+    monkeypatch.setenv("PYTHONPATH", "original-path")
+    calls = []
+
+    def extract(text, extractor, *, rendered_prompt):
+        calls.append((text, extractor, rendered_prompt))
+        return text
+
+    monkeypatch.setitem(
+        sys.modules,
+        "src.rwkv_eval.answer_extract.free_response",
+        SimpleNamespace(
+            answer_extractor_for_benchmark=lambda name: "math",
+            extract_answer=extract,
+            verify_math_answer=lambda gold, answer: gold == answer,
+        ),
+    )
+    monkeypatch.setattr(tok, "get_tokenizer", lambda model: SimpleNamespace(decode=lambda ids, **kwargs: "<think"))
+    prompts = tmp_path / "prompts.jsonl"
+    prompts.write_text(
+        json.dumps({"gold_answers": ["42"], "source": {"benchmark": "gsm8k", "problem_key": "family"}}) + "\n"
+    )
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    config = {
+        "model": str(model),
+        "input_sha256": hashlib.sha256(prompts.read_bytes()).hexdigest(),
+        "samples_per_prompt": 2,
+    }
+    (raw / "generation.json").write_text(json.dumps(config))
+    rows = [
+        {
+            "model": str(alias),
+            "prompt_index": 0,
+            "sample_index": sample,
+            "prompt_ids": [7, 8],
+            "response_ids": [9 + sample, 0],
+            "text": text,
+            "finish_reason": finish,
+        }
+        for sample, text, finish in [(0, "42", "stop"), (1, "41", "length")]
+    ]
+    (raw / "rollouts.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    output = tmp_path / "scored"
+    result = build_value_data.score_benchmarks(raw, prompts, output, tmp_path)
+    assert result["counts"] == {"rollouts": 2, "positive_rewards": 1, "truncated": 1}
+    scored = [json.loads(line) for line in (output / "rollouts/gsm8k/0.jsonl").read_text().splitlines()]
+    assert [row["reward"] for row in scored] == [1.0, 0.0]
+    assert [row["response_ids"] for row in scored] == [[9, 0], [10, 0]]
+    assert all(row["uuid"] == "family" for row in scored)
+    assert calls == [("42", "math", "<think"), ("41", "math", "<think")]
+    prompts.write_text("changed\n")
+    with pytest.raises(ValueError, match="match the input"):
+        build_value_data.score_benchmarks(raw, prompts, tmp_path / "mismatched", tmp_path)
+
+
+def test_build_value_data_can_keep_budget_truncations_as_terminal_failures(tmp_path, token_rollout_run):
+    output = tmp_path / "bounded-value-data"
+    manifest = build_value_data.build_data(
+        token_rollout_run, output, validation_fraction=0.5, max_length=8, truncation_as_terminal=True
+    )
+    assert manifest["truncation_as_terminal"]
+    assert manifest["counts"]["truncated_terminal_failures"] == 40
+    rows = [
+        json.loads(line)
+        for split in ("train", "validation")
+        for line in (output / f"{split}.jsonl").read_text().splitlines()
+    ]
+    assert len(rows) == 80
+    assert sum(row["reward"] for row in rows) == 20
+    for row in rows:
+        if row["truncated"]:
+            assert row["reward"] == 0
+            assert row["returns"] == [0.0] * len(row["input_ids"])
+            assert row["input_ids"][-2:] in ([15, 16], [18, 0])
+            assert row["loss_mask"] == [0, 0, 1, 1]
 
 
 def test_build_value_data_preserves_tokens_masks_outcomes_and_uuid_split(tmp_path, token_rollout_run):
@@ -613,7 +853,8 @@ def test_partial_startup_failure_cleans_only_owned_process_groups(tmp_path, toke
 
 
 @pytest.mark.parametrize("valid_eos", [True, False])
-def test_owned_engine_acceptance_precedes_dataset_generation(tmp_path, tokenizer, monkeypatch, valid_eos):
+@pytest.mark.parametrize("probe_text", [r">reasoning </think> \boxed{4}", r"\boxed{5}"])
+def test_owned_engine_acceptance_precedes_dataset_generation(tmp_path, tokenizer, monkeypatch, valid_eos, probe_text):
     from aiohttp import web
 
     dataset_row(tmp_path, "Knowledge", "Knowledge_1", "q", "4")
@@ -631,7 +872,7 @@ def test_owned_engine_acceptance_precedes_dataset_generation(tmp_path, tokenizer
         async def complete(request):
             payload = await request.json()
             requests.append(payload)
-            text = r">reasoning </think> \boxed{4}"
+            text = probe_text if len(requests) == 1 else r">reasoning </think> \boxed{4}"
             ids = list(text.encode()) + [0 if valid_eos else 1]
             return web.json_response({"choices": [{"token_ids": ids, "finish_reason": "stop"}]})
 

@@ -1014,13 +1014,14 @@ class PolicyWorkerBase(Worker):
             data,
             micro_batch_size=self.cfg.micro_train_batch_size_per_gpu,
             max_tokens_per_microbatch=self.cfg.max_tokens_per_microbatch,
+            use_padded_token_count=getattr(self.model, "is_rwkv", False),
         )
         all_metrics = defaultdict(list)
         loss_fn_output_batches = []  # per-microbatch; restored to input order below
 
         for microbatch_index, microbatch in enumerate(microbatch_iterator):
             experience = BaseBatchIterator.batch_to_experience(microbatch)
-            microbatch_weight = len(microbatch) / len(data)
+            microbatch_weight = len(microbatch) / len(data) * data.metadata.get("loss_scale", 1.0)
             with self._microbatch_context(is_last=microbatch_index == len(microbatch_iterator) - 1):
                 metrics = self._forward_backward_micro(
                     experience,
@@ -1130,6 +1131,7 @@ class PolicyWorkerBase(Worker):
             # NOTE: users can provide a custom loss config class, so we need to use the same class after applying overrides
             loss_config = type(loss_config).from_dict_config(new_loss_config)
 
+        score_centering = loss_config.flashreinforce.score_centering or loss_config.rollout_is.score_centering
         # TODO (sumanthrh): don't think this does anything for fsdp rn because autocast happens internally
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             # actor loss
@@ -1144,16 +1146,13 @@ class PolicyWorkerBase(Worker):
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
                 sample_support=(
-                    experience.rollout_sample_support
-                    if (sample_support_replay or loss_config.flashreinforce.score_centering)
-                    else None
+                    experience.rollout_sample_support if (sample_support_replay or score_centering) else None
                 ),
-                sample_support_logprobs=(
-                    experience.rollout_sample_support_logprobs if loss_config.flashreinforce.score_centering else None
-                ),
-                loss_mask=loss_mask if (sample_support_replay or loss_config.flashreinforce.score_centering) else None,
+                sample_support_logprobs=(experience.rollout_sample_support_logprobs if score_centering else None),
+                loss_mask=loss_mask if (sample_support_replay or score_centering) else None,
                 enable_sample_support_replay=sample_support_replay,
-                enable_score_centering=loss_config.flashreinforce.score_centering,
+                enable_score_centering=score_centering,
+                response_mask=experience.response_mask,
             )
             # loss function
             # TODO: recompute advantages
@@ -1161,11 +1160,13 @@ class PolicyWorkerBase(Worker):
                 "loss_mask": loss_mask,
                 "rollout_logprobs": rollout_action_logprobs,
             }
+            if resolved_loss_name == "async_opd":
+                policy_loss_kwargs["teacher_log_probs"] = base_action_log_probs
             if resolved_loss_name in ("flashreinforce", "flash_reinforce"):
                 policy_loss_kwargs["real_rows"] = loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
-                if loss_config.flashreinforce.score_centering:
-                    policy_loss_kwargs["score_centering_train_logprobs"] = output["score_centering_train_logprobs"]
-                    policy_loss_kwargs["score_centering_sampler_logprobs"] = output["score_centering_sampler_logprobs"]
+            if score_centering:
+                policy_loss_kwargs["score_centering_train_logprobs"] = output["score_centering_train_logprobs"]
+                policy_loss_kwargs["score_centering_sampler_logprobs"] = output["score_centering_sampler_logprobs"]
             policy_loss, loss_metrics = current_loss_fn(
                 action_log_probs,
                 old_action_log_probs,
@@ -1307,13 +1308,20 @@ class PolicyWorkerBase(Worker):
 
         return status
 
-    def optim_step(self) -> float:
+    def optim_step(self, gradient_scale: float = 1.0) -> float:
         """
-        Perform optimizer step.
+        Normalize accumulated gradients, clip them, and perform an optimizer step.
 
         Returns:
-            The gradient norm (before scaling, after clipping)
+            The gradient norm after normalization and before clipping.
         """
+        # Streaming token-mean objectives learn their global token count only
+        # after the logical batch closes. Normalize before clipping and Adam.
+        if gradient_scale != 1.0:
+            for group in self.optimizer.param_groups:
+                for parameter in group["params"]:
+                    if parameter.grad is not None:
+                        parameter.grad.mul_(gradient_scale)
         # Perform optimizer step (includes gradient clipping)
         grad_norm = self.strategy.optimizer_step(self.optimizer, self.model, self.scheduler, name="actor")
 
@@ -1353,6 +1361,7 @@ class PolicyWorkerBase(Worker):
                 data,
                 micro_batch_size=self.cfg.micro_forward_batch_size_per_gpu,
                 max_tokens_per_microbatch=self.cfg.max_tokens_per_microbatch,
+                use_padded_token_count=getattr(self.model, "is_rwkv", False),
             )
             outputs = [self._forward_micro_batch(micro_batch) for micro_batch in microbatch_iterator]
             output = microbatch_iterator.reorder_and_combine_batches(outputs)
@@ -1427,6 +1436,7 @@ class PolicyWorkerBase(Worker):
             new_loss_config = OmegaConf.merge(OmegaConf.create(asdict(loss_config)), OmegaConf.create(loss_fn_config))
             loss_config = type(loss_config).from_dict_config(new_loss_config)
 
+        score_centering = loss_config.flashreinforce.score_centering or loss_config.rollout_is.score_centering
         with torch.no_grad(), torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             action_log_probs, output = self.model(
                 sequences,
@@ -1439,16 +1449,13 @@ class PolicyWorkerBase(Worker):
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
                 sample_support=(
-                    experience.rollout_sample_support
-                    if (sample_support_replay or loss_config.flashreinforce.score_centering)
-                    else None
+                    experience.rollout_sample_support if (sample_support_replay or score_centering) else None
                 ),
-                sample_support_logprobs=(
-                    experience.rollout_sample_support_logprobs if loss_config.flashreinforce.score_centering else None
-                ),
-                loss_mask=loss_mask if (sample_support_replay or loss_config.flashreinforce.score_centering) else None,
+                sample_support_logprobs=(experience.rollout_sample_support_logprobs if score_centering else None),
+                loss_mask=loss_mask if (sample_support_replay or score_centering) else None,
                 enable_sample_support_replay=sample_support_replay,
-                enable_score_centering=loss_config.flashreinforce.score_centering,
+                enable_score_centering=score_centering,
+                response_mask=experience.response_mask,
             )
             policy_loss_kwargs = {
                 "loss_mask": loss_mask,
@@ -1456,9 +1463,9 @@ class PolicyWorkerBase(Worker):
             }
             if loss_fn in ("flashreinforce", "flash_reinforce"):
                 policy_loss_kwargs["real_rows"] = loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
-                if loss_config.flashreinforce.score_centering:
-                    policy_loss_kwargs["score_centering_train_logprobs"] = output["score_centering_train_logprobs"]
-                    policy_loss_kwargs["score_centering_sampler_logprobs"] = output["score_centering_sampler_logprobs"]
+            if score_centering:
+                policy_loss_kwargs["score_centering_train_logprobs"] = output["score_centering_train_logprobs"]
+                policy_loss_kwargs["score_centering_sampler_logprobs"] = output["score_centering_sampler_logprobs"]
             policy_loss, _ = current_loss_fn(
                 action_log_probs,
                 old_action_log_probs,
@@ -1533,6 +1540,7 @@ class PolicyWorkerBase(Worker):
                 sample_support=micro_batch.get(SAMPLE_SUPPORT_FIELD) if sample_support_replay else None,
                 loss_mask=micro_batch.get("loss_mask") if sample_support_replay else None,
                 enable_sample_support_replay=sample_support_replay,
+                response_mask=micro_batch.get("response_mask"),
             )
         policy_logprob = policy_logprob.to("cpu")
         output = TrainingOutputBatch(
@@ -1630,6 +1638,7 @@ class CriticWorkerBase(Worker):
             data,
             micro_batch_size=self.cfg.micro_train_batch_size_per_gpu,
             max_tokens_per_microbatch=self.cfg.max_tokens_per_microbatch,
+            use_padded_token_count=getattr(self.model, "is_rwkv", False),
         )
         all_metrics = defaultdict(list)
 
@@ -1778,6 +1787,7 @@ class CriticWorkerBase(Worker):
             data,
             micro_batch_size=self.cfg.micro_forward_batch_size_per_gpu,
             max_tokens_per_microbatch=self.cfg.max_tokens_per_microbatch,
+            use_padded_token_count=getattr(self.model, "is_rwkv", False),
         )
         outputs = [self._forward_micro_batch(micro_batch) for micro_batch in microbatch_iterator]
         output = microbatch_iterator.reorder_and_combine_batches(outputs)
@@ -1809,6 +1819,7 @@ class RefWorkerBase(Worker):
             data,
             micro_batch_size=self.cfg.micro_forward_batch_size_per_gpu,
             max_tokens_per_microbatch=self.cfg.max_tokens_per_microbatch,
+            use_padded_token_count=getattr(self.model, "is_rwkv", False),
         )
         outputs = [self._forward_micro_batch(micro_batch) for micro_batch in microbatch_iterator]
         output = microbatch_iterator.reorder_and_combine_batches(outputs)
@@ -1840,6 +1851,7 @@ class RefWorkerBase(Worker):
                 sample_support=micro_batch.get(SAMPLE_SUPPORT_FIELD) if sample_support_replay else None,
                 loss_mask=micro_batch.get("loss_mask") if sample_support_replay else None,
                 enable_sample_support_replay=sample_support_replay,
+                response_mask=micro_batch.get("response_mask"),
             )
         log_probs = log_probs.to("cpu")
         output = TrainingOutputBatch(

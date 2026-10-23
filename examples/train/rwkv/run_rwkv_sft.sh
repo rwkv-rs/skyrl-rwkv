@@ -25,6 +25,8 @@ fi
 : "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-nemotron-cot-sft}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
 : "${EVAL_ROOT:=$OUTPUT_ROOT/evaluation/lighteval_avg16}"
+export MODEL_DIR
+export UV_PROJECT_ENVIRONMENT="$(realpath .venv)"
 export RAY_ADDRESS=local
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 export SKYRL_PYTHONPATH_EXPORT=1
@@ -39,7 +41,7 @@ fi
 
 if [[ "${UPLOAD_ONLY:-0}" == 1 ]]; then
   unset WANDB_RUN_ID WANDB_RESUME WANDB_SERVICE
-  uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+  uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" \
     - "$EVAL_ROOT" "$EVAL_STEP" "$UPLOAD_PHASE" "$WANDB_RUN_PATH" <<'PY'
 import fcntl
 import json
@@ -53,32 +55,31 @@ evaluation_root, step, phase, run_path = sys.argv[1:]
 evaluation_root = Path(evaluation_root)
 root = evaluation_root / (f"global_step_{step}/sft" if phase == "sft" else "base")
 status = root / "upload_status.json"
-with (evaluation_root.parent / f".{phase}.upload.lock").open("a") as lock:
+with (evaluation_root.parent / ".wandb.upload.lock").open("a") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     status.write_text(json.dumps({"state": "uploading", "global_step": int(step), "pid": os.getpid()}) + "\n")
     try:
-        model_name = json.loads((root / "completed.json").read_text())["model_name"]
         scores = {path.parent.name: json.loads(path.read_text()) for path in root.glob("*/scores.json")}
-        samples = {selector: next(iter(rows.values()))["num_completions"] //
-                   next(iter(rows.values()))["num_questions"] for selector, rows in scores.items()}
-        entity, project, run_id = run_path.split("/")
-        run = wandb.init(entity=entity, project=project, id=f"{run_id}-eval-{phase}",
-                         resume="allow", name=f"{run_id}-{phase}-math-eval", group=run_id,
-                         job_type="evaluation", allow_val_change=True,
-                         config={"model_name": model_name, "phase": phase,
-                                 "avg_k": samples, "samples_per_question": samples,
-                                 "max_generated_tokens": 24576, "wkv_mode": "fp32io16"})
-        values = {f"eval/{phase}/{selector}/{key}": value for selector, rows in scores.items()
-                  for row in rows.values() for key, value in row.items()}
-        run.define_metric("eval/global_step")
-        run.define_metric(f"eval/{phase}/*", step_metric="eval/global_step")
-        run.log({**values, "eval/global_step": int(step)})
-        for selector, avg_k in samples.items():
-            artifact = wandb.Artifact(f"{run_id}-{phase}-{selector}-avg{avg_k}-step{step}",
-                                     type="evaluation")
-            artifact.add_dir(str(root / selector))
-            run.log_artifact(artifact).wait()
-        run.finish()
+        parent = wandb.Api().run(run_path)
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and ".lighteval_cache" not in path.parts and path.name not in (
+                "upload.log", "upload.pid", "upload_status.json"
+            ):
+                parent.upload_file(str(path), root=str(evaluation_root.parent))
+        # During training, the native eval_command hook owns metric logging.
+        # Standalone evaluations append to that same run after training stops.
+        if parent.state in ("finished", "failed", "crashed", "killed"):
+            entity, project, run_id = run_path.split("/")
+            run = wandb.init(entity=entity, project=project, id=run_id, resume="must")
+            try:
+                values = {f"eval/{phase}/{selector}/{key}": value for selector, rows in scores.items()
+                          for row in rows.values() for key, value in row.items()}
+                run.define_metric("eval/checkpoint_step", hidden=True)
+                run.define_metric(f"eval/{phase}/*", step_metric="eval/checkpoint_step")
+                run.log({**values, "eval/checkpoint_step": 0 if phase == "base" else int(step)})
+                run.summary["eval/source_run_state"] = parent.state
+            finally:
+                run.finish(exit_code=0 if parent.state == "finished" else 1)
     except Exception as error:
         status.write_text(json.dumps({"state": "failed", "global_step": int(step),
                                       "pid": os.getpid(), "error": str(error)}) + "\n")
@@ -88,7 +89,7 @@ PY
   exit 0
 fi
 
-TOTAL_STEPS=$(uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" - "$DATA_DIR" "$BATCH_SIZE" <<'PY'
+TOTAL_STEPS=$(uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" - "$DATA_DIR" "$BATCH_SIZE" <<'PY'
 import json
 import math
 import sys
@@ -102,14 +103,15 @@ WARMUP_STEPS=$((TOTAL_STEPS / 20))
 EVAL_OVERRIDES=()
 if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" != 1 ]]; then
   : "${WANDB_RUN_PATH:?Set the training run path: entity/project/run_id}"
-  EVAL_COMMAND=$(uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
-    - "$OUTPUT_ROOT" "$DATA_DIR" "$LIGHTEVAL_PROJECT" "$WANDB_RUN_PATH" <<'PY'
+  EVAL_COMMAND=$(uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" \
+    - "$OUTPUT_ROOT" "$DATA_DIR" "$LIGHTEVAL_PROJECT" "$WANDB_RUN_PATH" "$EVAL_ROOT" <<'PY'
 import json
 import sys
 
-output, data, producer, run = sys.argv[1:]
+output, data, producer, run, evaluation = sys.argv[1:]
 print(json.dumps(["env", "EVAL_ONLY=1", "EVAL_STEP={global_step}",
                   f"OUTPUT_ROOT={output}", f"DATA_DIR={data}",
+                  f"EVAL_ROOT={evaluation}",
                   f"LIGHTEVAL_PROJECT={producer}", f"WANDB_RUN_PATH={run}",
                   "NUM_GPUS=8", "BATCH_SIZE=56", "EVAL_MAX_NUM_SEQS=1024",
                   "EVAL_GPU_MEMORY_UTILIZATION=0.65",
@@ -117,11 +119,11 @@ print(json.dumps(["env", "EVAL_ONLY=1", "EVAL_STEP={global_step}",
 PY
 )
   EVAL_OVERRIDES+=("eval_command=$EVAL_COMMAND"
-    "eval_command_metrics_path=$OUTPUT_ROOT/evaluation/lighteval_avg16/global_step_{global_step}/sft/eval_metrics.json")
+    "eval_command_metrics_path=$EVAL_ROOT/global_step_{global_step}/sft/eval_metrics.json")
 fi
 
 if [[ "${EVAL_ONLY:-0}" != 1 ]]; then
-  uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" -m skyrl.train.main_sft \
+  uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" -m skyrl.train.main_sft \
     strategy=fsdp model.path="$MODEL_DIR" \
     "pretokenized_dataset_paths=['$DATA_DIR/train']" \
     "eval_pretokenized_dataset_paths=['$DATA_DIR/eval']" \
@@ -144,7 +146,7 @@ if [[ "${EVAL_ONLY:-0}" != 1 ]]; then
     ckpt_path="$OUTPUT_ROOT/checkpoints" export_path="$OUTPUT_ROOT/hf_exports" \
     ckpt_interval=50 eval_interval=50 hf_save_interval=50 \
     eval_before_train=true max_ckpts_to_keep=2 \
-    logger="$LOGGER" project_name=rwkv_direct_sft run_name="$RUN_NAME" \
+    logger="$LOGGER" project_name=skyrl-rwkv run_name="$RUN_NAME" \
     "${EVAL_OVERRIDES[@]}" \
     "$@"
 fi
@@ -203,10 +205,10 @@ if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" == 1 ]]; then
       port=$((19100 + gpu))
       WORKER_URLS+=("http://127.0.0.1:$port")
       setsid env CUDA_VISIBLE_DEVICES="$gpu" VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
-        uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+        uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" \
         -m vllm.entrypoints.openai.api_server \
         --model "$EVAL_MODEL" --served-model-name "$EVAL_NAME" \
-        --host 127.0.0.1 --port "$port" --dtype float16 \
+        --host 127.0.0.1 --port "$port" --dtype bfloat16 \
         --max-model-len 32768 --max-num-seqs "$EVAL_MAX_NUM_SEQS" \
         --max-num-batched-tokens 32768 --gpu-memory-utilization "$EVAL_GPU_MEMORY_UTILIZATION" \
         --enable-prefix-caching --enable-chunked-prefill \
@@ -214,16 +216,17 @@ if [[ -n "${LIGHTEVAL_PROJECT:-}" && "${EVAL_ONLY:-0}" == 1 ]]; then
         > "$PHASE_ROOT/inference-gpu$gpu.log" 2>&1 &
       EVAL_PIDS+=("$!")
     done
-    setsid uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+    setsid uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" \
       -m vllm_router.launch_router --host 127.0.0.1 --port "$ROUTER_PORT" \
       --prometheus-port "$((19300 + phase_index))" \
+      --policy round_robin \
       --worker-urls "${WORKER_URLS[@]}" \
       > "$PHASE_ROOT/router.log" 2>&1 &
     EVAL_PIDS+=("$!")
     phase_index=$((phase_index + 1))
   done
 
-  uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+  uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" \
     - "${#EVAL_PHASES[@]}" "${EVAL_PIDS[@]}" <<'PY'
 import time
 import sys
@@ -262,8 +265,9 @@ PY
     fi
     (
       cd "$LIGHTEVAL_PROJECT"
-      unset PYTHONPATH WANDB_RUN_ID WANDB_RESUME WANDB_SERVICE
-      exec setsid uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+      unset WANDB_RUN_ID WANDB_RESUME WANDB_SERVICE
+      export PYTHONPATH="$UV_PROJECT_ENVIRONMENT/rwkv-eval:$SKYRL_PROJECT"
+      exec setsid uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" \
         - "$phase" "$PHASE_ROOT" "$EVAL_NAME" "$ROUTER_PORT" \
         "$EVAL_MAX_NUM_SEQS" "$WANDB_RUN_PATH" "$SKYRL_PROJECT" \
         "$EVAL_STEP" "$GPUS_PER_PHASE" <<'PY'
@@ -274,56 +278,27 @@ import subprocess
 import sys
 from pathlib import Path
 
-import litellm
-from lighteval.logging.evaluation_tracker import EvaluationTracker
-from lighteval.metrics.metrics import Metrics
-from lighteval.pipeline import ParallelismManager, PipelineParameters
-from lighteval.tasks.requests import SamplingMethod
-from src.rwkv_eval.configs import ModelEndpoint
-from src.rwkv_eval.main import RWKVExactMatches, RWKVPipeline, _litelm_model
+from argparse import Namespace
 
 logging.basicConfig(level=logging.INFO)
 phase, root, model_name, port, capacity, run_path, skyrl_project, step, gpu_count = sys.argv[1:]
+sys.path.insert(0, skyrl_project)
+from examples.train.rwkv.evaluate import evaluate
+
 root = Path(root)
 eval_metrics = {}
-endpoint = ModelEndpoint(f"http://127.0.0.1:{port}", "unused", model_name,
-                         int(gpu_count) * int(capacity) + 32, 25600)
 selectors = os.environ.get("EVAL_TASKS", "aime24 aime25 aimo_progress_prize_1 math_500").split()
 for selector in selectors:
     avg_k = int(os.environ.get("EVAL_AVG_K", 4 if selector == "math_500" else 16))
-    config = _litelm_model(endpoint, [endpoint], "CoT", "bot", 24576, 42,
-                          cache_dir=str(root / ".lighteval_cache"))
-    config.max_model_length = 32768
-    litellm.cache = None
-    tracker = EvaluationTracker(output_dir=str(root / selector),
-                                save_details=False, save_streaming_completions=True)
-    pipeline = RWKVPipeline(selector, PipelineParameters(
-        launcher_type=ParallelismManager.NONE, streaming_evaluation=True),
-        tracker, model_config=config)
-    for task in pipeline.tasks_dict.values():
-        metric = Metrics.avg_at_n_math(sample_params={"n": avg_k})
-        metric.sample_level_fn.compute_score = RWKVExactMatches().compute
-        task.metrics = task.config.metrics = [metric]
-        task.num_samples = [avg_k]
-        task.sampling_methods = [SamplingMethod.GENERATIVE]
-    tracker.task_config_logger.log(pipeline.tasks_dict)
-    pipeline.evaluate()
-    pipeline.save_and_push_results()
-    results = pipeline.get_results()
-    rows = {}
-    for task_name in pipeline.tasks_dict:
-        metrics = results["results"][task_name.replace("|", ":")]
-        score = next(value for name, value in metrics.items() if not name.endswith("_stderr"))
-        count = pipeline.task_sample_counts[task_name]
-        completions = pipeline.task_completion_counts[task_name]
-        if completions != avg_k * count or pipeline.task_avg_k[task_name] != avg_k:
-            raise ValueError(f"Incomplete avg@{avg_k} evaluation: {task_name}, {count=}, {completions=}")
-        row = {f"avg@{avg_k}": float(score), "num_questions": count,
-               "num_completions": completions,
-               "truncation_rate": pipeline.task_truncation_counts[task_name] / completions}
-        rows[task_name] = row
+    evaluate(Namespace(
+        project=Path.cwd(), url=f"http://127.0.0.1:{port}", model=model_name,
+        tokenizer=os.environ["MODEL_DIR"], output=root / selector, step=int(step),
+        task=selector, num_samples=avg_k, context_length=25600,
+        concurrency=int(gpu_count) * int(capacity) + 32, max_samples=None,
+    ))
+    rows = json.loads((root / selector / "scores.json").read_text())
+    for row in rows.values():
         eval_metrics.update({f"{phase}/{selector}/{key}": value for key, value in row.items()})
-    (root / selector / "scores.json").write_text(json.dumps(rows, indent=2) + "\n")
     (root / "eval_metrics.json").write_text(json.dumps(eval_metrics, indent=2) + "\n")
 (root / "completed.json").write_text(json.dumps({"global_step": int(step), "model_name": model_name,
                                                "benchmarks": selectors}) + "\n")
@@ -354,4 +329,19 @@ PY
   for pid in "${PRODUCER_PIDS[@]}"; do
     wait "$pid"
   done
+  uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+    - "$EVAL_ROOT" "$EVAL_STEP" "${EVAL_PHASES[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root, step, *phases = sys.argv[1:]
+root = Path(root)
+path = root / f"global_step_{step}/sft/eval_metrics.json"
+if "sft" in phases:
+    metrics = json.loads(path.read_text())
+    if "base" in phases:
+        metrics.update(json.loads((root / "base/eval_metrics.json").read_text()))
+    path.write_text(json.dumps(metrics, indent=2) + "\n")
+PY
 fi

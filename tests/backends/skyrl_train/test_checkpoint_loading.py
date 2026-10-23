@@ -67,7 +67,8 @@ def test_weights_only_load_does_not_reset_live_optimizer():
 
 
 @pytest.mark.parametrize("rwkv,fsdp_size,copies", [(True, 1, 1), (True, 2, 2), (False, 1, 2)])
-def test_fsdp_checkpoint_saves_one_full_rwkv_replica(tmp_path, monkeypatch, rwkv, fsdp_size, copies):
+@pytest.mark.parametrize("wrapped", [True, False])
+def test_fsdp_checkpoint_saves_one_full_rwkv_replica(tmp_path, monkeypatch, rwkv, fsdp_size, copies, wrapped):
     """Only fully replicated RWKV state is deduplicated; rank-local RNG remains separate."""
     monkeypatch.setattr(torch.distributed, "barrier", lambda: None)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
@@ -79,8 +80,10 @@ def test_fsdp_checkpoint_saves_one_full_rwkv_replica(tmp_path, monkeypatch, rwkv
     model = HFModelWrapper.__new__(HFModelWrapper)
     nn.Module.__init__(model)
     model.model = nn.Linear(2, 2)
-    model.model.config = SimpleNamespace()
+    model.model.config = SimpleNamespace(model_type="rwkv" if rwkv else "other")
     model.is_rwkv = rwkv
+    if not wrapped:
+        model = model.model
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
     for rank in range(2):

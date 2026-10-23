@@ -209,22 +209,12 @@ class FSDPStrategy(DistributedStrategy):
             param_dtype = torch.bfloat16
             reduce_dtype = torch.float32
 
-        if is_wrapped and model.is_rwkv and model.rwkv_inference_mode:
-            # Native FP16 RWKV inference uses BF16 input embeddings and their
-            # norm. Establish these dtypes before FSDP caches parameter metadata;
-            # changing .data dtype during forward breaks the next all-gather
-            # after an offload/reload cycle. Frozen groups support mixed dtypes.
-            model.model.requires_grad_(False)
-            model.model.get_input_embeddings().to(dtype=torch.bfloat16)
-            model.model.model.embedding_norm.to(dtype=torch.bfloat16)
-            param_dtype = None
-
         assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
-        # RWKV inference and recurrent chunks carry FP32 WKV states between
-        # decoder layers. Hidden states already follow the compute dtype.
-        rwkv_recurrent = is_wrapped and model.is_rwkv and (model.rwkv_chunk_size > 0 or model.rwkv_inference_mode)
+        # Recurrent RWKV chunks carry FP32 WKV states between decoder layers.
+        # Their hidden states already follow the BF16 compute parameters.
+        rwkv_infctx = is_wrapped and model.is_rwkv and model.rwkv_chunk_size > 0
         mp_policy = MixedPrecisionPolicy(
-            param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=not rwkv_recurrent
+            param_dtype=param_dtype, reduce_dtype=reduce_dtype, cast_forward_inputs=not rwkv_infctx
         )
 
         cpu_offload = CPUOffloadPolicy(pin_memory=True) if self.fsdp_config.cpu_offload else None
@@ -722,7 +712,7 @@ class FSDPStrategy(DistributedStrategy):
         model: Union[HFModelWrapper, nn.Module],
         output_dir: str,
         tokenizer=None,
-        output_dtype: torch.dtype = torch.float16,
+        output_dtype: torch.dtype = torch.bfloat16,
         **kwargs,
     ) -> None:
         """Save model in HuggingFace safetensors format using FSDP's full state dict gathering"""

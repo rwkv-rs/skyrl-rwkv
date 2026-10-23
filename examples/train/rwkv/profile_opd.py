@@ -77,7 +77,7 @@ def profile_inference(args):
         raise ValueError("The rollout file must contain enough prompts of at most 1024 tokens")
     llm = LLM(
         model=args.model,
-        dtype="float16",
+        dtype="bfloat16",
         max_model_len=args.sequence_length,
         max_num_seqs=max(args.micro_batch_sizes),
         max_num_batched_tokens=8192,

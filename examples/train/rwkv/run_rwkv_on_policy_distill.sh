@@ -14,7 +14,6 @@ fi
 
 : "${STUDENT_MODEL:=$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600}"
 : "${TEACHER_MODEL:=$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-nora}"
-: "${TEACHER_DTYPE:=float16}"
 : "${MAX_GENERATE_LENGTH:=8192}"
 : "${DATA_DIR:=$HOME/data/ultradata-opd}"
 : "${TRAIN_FILE:=$DATA_DIR/train.parquet}"
@@ -152,7 +151,6 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   trainer.policy.fsdp_config.sync_gradients_each_microbatch=false \
   trainer.ref.fsdp_config.fsdp_size="$NUM_POLICY_GPUS" \
   trainer.ref.fsdp_config.reshard_after_forward=false \
-  trainer.ref.fsdp_config.mixed_precision.param_dtype="$TEACHER_DTYPE" \
   trainer.update_ref_every_epoch=false \
   trainer.fully_async.enabled="$ASYNC_ENABLED" \
   trainer.fully_async.mode="${ASYNC_MODE/disabled/fully_async}" \
@@ -187,7 +185,7 @@ uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3"
   trainer.ckpt_path="$OUTPUT_ROOT/checkpoints" \
   trainer.export_path="$OUTPUT_ROOT/exports" \
   generator.inference_engine.backend=vllm \
-  generator.inference_engine.model_dtype=float16 \
+  generator.inference_engine.model_dtype=bfloat16 \
   generator.inference_engine.served_model_name="${STUDENT_MODEL##*/}" \
   generator.inference_engine.router_init_kwargs.policy=round_robin \
   generator.inference_engine.engine_init_kwargs.logprobs_mode=raw_logprobs \

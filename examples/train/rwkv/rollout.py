@@ -311,7 +311,7 @@ async def start_servers(
             "--tensor-parallel-size",
             "1",
             "--dtype",
-            "float16",
+            "bfloat16",
             "--generation-config",
             "vllm",
             "--skip-tokenizer-init",

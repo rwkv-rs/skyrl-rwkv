@@ -957,3 +957,42 @@ def test_zero_critic_lr_preserves_critic_weights_and_optimizer(parallel):
     assert not optimizers["critic"].state
     assert trainer.all_metrics == {"policy/loss": 1.0}
     assert set(trainer.all_timings) == {"policy_train"}
+
+
+@pytest.mark.parametrize("dp_size,real_rows,mini_size", [(3, 10, 5), (7, 1024, 256), (8, 1024, 256)])
+def test_staged_forward_removes_each_minibatch_padding_before_reassembly(monkeypatch, dp_size, real_rows, mini_size):
+    from types import SimpleNamespace
+
+    from skyrl.backends.skyrl_train.distributed.dispatch import MeshDispatch
+    from skyrl.backends.skyrl_train.training_batch import (
+        TrainingInputBatch,
+        pad_training_input_batch,
+    )
+
+    data = TrainingInputBatch(
+        {
+            "sequences": torch.arange(real_rows).reshape(-1, 1),
+            "attention_mask": torch.ones(real_rows, 1, dtype=torch.long),
+        }
+    )
+    data.metadata = {"response_length": 1}
+    data = pad_training_input_batch(data, (-real_rows) % dp_size)
+    boundaries = [(i, i + mini_size) for i in range(0, real_rows, mini_size)]
+    monkeypatch.setattr("skyrl.backends.skyrl_train.distributed.dispatch.ray.put", lambda chunk: chunk)
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.cfg = SimpleNamespace(trainer=SimpleNamespace(recompute_old_logprobs_per_minibatch=True))
+
+    def forward(model, chunks):
+        return SimpleNamespace(
+            loss_fn_outputs=[{"logprobs": [-float(row[0])]} for chunk in chunks for row in chunk["sequences"]]
+        )
+
+    trainer.dispatch = SimpleNamespace(
+        stage_data=lambda model, batch, bounds: MeshDispatch.stage_chunks(dp_size, batch, bounds),
+        forward_from_staged=forward,
+    )
+    result = trainer._execute_forward_pass("policy", data, "logprobs", boundaries)
+    expected = torch.cat((-torch.arange(real_rows, dtype=torch.float32), torch.zeros(len(data) - real_rows))).reshape(
+        -1, 1
+    )
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)

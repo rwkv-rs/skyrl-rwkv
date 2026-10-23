@@ -14,6 +14,44 @@ import sys
 from pathlib import Path
 
 
+def create_eval_server_pool(cfg, worker_locations):
+    """Create native vLLM servers on offloaded trainer GPUs, as in ServerGroup."""
+    import ray
+    from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
+
+    from skyrl.backends.skyrl_train.inference_servers.common import SERVER_PORT_STRIDE
+    from skyrl.backends.skyrl_train.inference_servers.engine_utils import build_engine_runtime_env
+    from skyrl.backends.skyrl_train.inference_servers.server_pool import ServerActorPool
+    from skyrl.backends.skyrl_train.inference_servers.utils import build_vllm_cli_args
+    from skyrl.backends.skyrl_train.inference_servers.vllm_server_actor import VLLMServerActor
+
+    args = build_vllm_cli_args(cfg)
+    args.tensor_parallel_size = args.pipeline_parallel_size = args.data_parallel_size = 1
+    args.enable_sleep_mode = False
+    actors = []
+    for index, (node_id, gpu_id) in enumerate(worker_locations):
+        actor = ray.remote(VLLMServerActor).options(
+            num_gpus=0,
+            num_cpus=0.2,
+            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node_id, soft=False),
+            runtime_env=build_engine_runtime_env(
+                use_expandable_segments=cfg.generator.inference_engine.use_expandable_segments
+            ),
+        )
+        actors.append(
+            actor.remote(
+                args,
+                start_port=18000 + index * SERVER_PORT_STRIDE,
+                server_idx=index,
+                distributed_executor_backend="mp",
+                mp_cuda_visible_devices=str(gpu_id),
+                colocated_training=True,
+                enable_ray_prometheus_stats=cfg.generator.inference_engine.enable_ray_prometheus_stats,
+            )
+        )
+    return ServerActorPool(actors)
+
+
 def set_generation_budgets(docs, model, tokenizer, context_length, strip_template):
     """Use the producer's exact messages and the inference tokenizer/template."""
     for doc in docs:
@@ -46,9 +84,10 @@ def evaluate(args):
     from src.rwkv_eval.configs import ModelEndpoint
     from src.rwkv_eval.main import RWKVExactMatches, _litelm_model
     from src.rwkv_eval.main import RWKVPipeline as ProducerPipeline
-    from transformers import AutoTokenizer
+    from transformers import AutoTokenizer, GenerationConfig
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+    generation_config = GenerationConfig.from_pretrained(args.tokenizer)
 
     class RWKVPipeline(ProducerPipeline):
         def _run_model_for_docs(self, sampling_docs):
@@ -67,6 +106,10 @@ def evaluate(args):
     config = _litelm_model(
         endpoint, [endpoint], "CoT", "bot", args.context_length, 42, cache_dir=str(output / ".lighteval_cache")
     )
+    # The native producer clears task-level stops for CoT. Model termination
+    # strings belong in the provider request, independently of task formatting.
+    config.extra_body["stop"] = generation_config.stop_strings
+    config.extra_body["include_stop_str_in_output"] = True
     # The producer uses Doc.generation_size when no global completion cap is set.
     config.generation_parameters.max_new_tokens = None
     litellm.cache = None
@@ -120,6 +163,7 @@ def evaluate(args):
                 "generation_budget": "context_length - actual prompt tokens",
                 "prompt_template": "bot",
                 "generation_prompt": "open_think",
+                "stop_strings": generation_config.stop_strings,
                 "producer": str(project),
                 "completions_path": tracker.results["completions_path"],
                 "producer_commit": subprocess.check_output(

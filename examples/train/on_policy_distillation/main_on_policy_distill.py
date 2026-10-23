@@ -9,10 +9,13 @@ from pathlib import Path
 
 import ray
 import torch
+from loguru import logger
 
 from examples.train.on_policy_distillation.stopd import STOPD, STOPDConfig, request_seed
 from examples.train.on_policy_distillation.topd import (
     TOPDConfig,
+    async_topd_policy_loss,
+    balance_training_input,
     compute_topd_advantage,
     compute_topd_stopd_advantage,
     topd_stopd_policy_loss,
@@ -24,8 +27,10 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     register_advantage_estimator,
     register_policy_loss,
 )
+from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.train.config import AlgorithmConfig, BaseConfig, SkyRLTrainConfig, make_config
 from skyrl.train.entrypoints.main_base import BasePPOExp, validate_cfg
+from skyrl.train.fully_async_trainer import FullyAsyncRayPPOTrainer
 from skyrl.train.generators.base import TRAINING_PHASE_EVAL
 from skyrl.train.generators.skyrl_gym_generator import SkyRLGymGenerator
 from skyrl.train.trainer import RayPPOTrainer
@@ -53,6 +58,11 @@ class OnPolicyDistillationAlgorithmConfig(AlgorithmConfig):
     stopd: STOPDConfig = field(default_factory=STOPDConfig)
     """Optional stochastic truncation, inverse-probability weights, and lagged normalization."""
     topd: TOPDConfig = field(default_factory=TOPDConfig)
+    async_opd: bool = False
+    """Use recorded behavior probabilities for asynchronous OPD. Plain OPD recomputes
+    the detached teacher/current-student advantage in each learner forward (AsyncOPD Eq. 7).
+    TOP-D retains its complete-group, clipped surrogate and STOPD telescoping coefficients.
+    """
 
     def __post_init__(self):
         if not isinstance(self.proximal_teacher_alpha, (int, float)) or not 0 < self.proximal_teacher_alpha <= 1:
@@ -65,10 +75,21 @@ OnPolicyDistillationConfig = make_config(algorithm_cls=OnPolicyDistillationAlgor
 def validate_stopd_cfg(cfg):
     algorithm = cfg.trainer.algorithm
     generator = cfg.generator
+    asynchronous = cfg.trainer.fully_async
+    if asynchronous.enabled:
+        if algorithm.async_opd != (asynchronous.mode != "zero_stale"):
+            raise ValueError("Asynchronous OPD requires async_opd=True, except zero_stale requires False")
+        if algorithm.stopd.enabled and asynchronous.mode == "fully_async":
+            raise ValueError("STOPD requires fixed-policy logical batches: use one_step_off or zero_stale")
+    if algorithm.async_opd and not algorithm.topd.enabled and algorithm.proximal_teacher_alpha != 1:
+        raise ValueError("Plain AsyncOPD requires proximal_teacher_alpha=1 for its reverse-KL estimator")
     if algorithm.topd.enabled:
+        expected_loss = (
+            "topd_stopd" if algorithm.stopd.enabled else ("async_topd" if algorithm.async_opd else "regular")
+        )
         if (
             algorithm.advantage_estimator != "no_op"
-            or algorithm.policy_loss_type != ("topd_stopd" if algorithm.stopd.enabled else "regular")
+            or algorithm.policy_loss_type != expected_loss
             or algorithm.loss_reduction != "prompt_mean"
             or not algorithm.use_kl_in_reward
             or algorithm.use_kl_loss
@@ -86,7 +107,6 @@ def validate_stopd_cfg(cfg):
             or generator.step_wise_trajectories
             or not generator.use_conversation_multi_turn
             or generator.vision_language_generator
-            or cfg.trainer.fully_async.enabled
             or algorithm.dynamic_sampling.type is not None
             or generator.apply_overlong_filtering
             or algorithm.off_policy_correction.tis_ratio_type is not None
@@ -94,8 +114,20 @@ def validate_stopd_cfg(cfg):
             or algorithm.enable_sample_support_replay
             or generator.inference_engine.enable_return_routed_experts
         ):
-            raise ValueError("TOP-D requires synchronous single-turn text rollouts without filtering or replay")
+            raise ValueError("TOP-D requires single-turn text rollouts without filtering or replay")
         generator.preserve_truncated_action_mask = True
+        if algorithm.topd.balance_batch:
+            trainer = cfg.trainer
+            if (
+                trainer.strategy != "fsdp"
+                or trainer.policy.sequence_parallel_size != 1
+                or trainer.max_tokens_per_microbatch > 0
+                or trainer.micro_forward_batch_size_per_gpu != trainer.micro_train_batch_size_per_gpu
+            ):
+                raise ValueError(
+                    "TOP-D balance_batch requires FSDP without sequence parallelism, equal fixed forward/train "
+                    "microbatches"
+                )
     if not cfg.trainer.algorithm.stopd.enabled:
         return
     if generator.apply_overlong_filtering:
@@ -103,7 +135,7 @@ def validate_stopd_cfg(cfg):
     generator.preserve_truncated_action_mask = True
     if not algorithm.topd.enabled and (
         algorithm.advantage_estimator != "no_op"
-        or algorithm.policy_loss_type != "importance_sampling"
+        or algorithm.policy_loss_type != ("async_opd" if algorithm.async_opd else "importance_sampling")
         or not algorithm.use_kl_in_reward
         or algorithm.use_kl_loss
         or algorithm.use_entropy_loss
@@ -117,7 +149,6 @@ def validate_stopd_cfg(cfg):
         or generator.step_wise_trajectories
         or not generator.use_conversation_multi_turn
         or generator.vision_language_generator
-        or cfg.trainer.fully_async.enabled
         or algorithm.dynamic_sampling.type is not None
         or (
             not algorithm.topd.enabled
@@ -138,11 +169,16 @@ class STOPDGenerator(SkyRLGymGenerator):
 
     complete_rollouts = False
     grouped_budgets = False
+    context_length = None
 
-    def __init__(self, *args, stopd_cfg, complete_rollouts=False, grouped_budgets=False, **kwargs):
+    def __init__(
+        self, *args, stopd_cfg, complete_rollouts=False, grouped_budgets=False, async_generation=False, **kwargs
+    ):
         super().__init__(*args, **kwargs)
         self.complete_rollouts = complete_rollouts
         self.grouped_budgets = grouped_budgets
+        self.async_generation = async_generation
+        self.context_length = self.generator_cfg.inference_engine.engine_init_kwargs.get("max_model_len")
         self.stopd = STOPD(
             self.generator_cfg.sampling_params.max_generate_length,
             require_denominator=not (complete_rollouts or grouped_budgets),
@@ -157,6 +193,20 @@ class STOPDGenerator(SkyRLGymGenerator):
         count = len(input_batch["prompts"])
         if self.complete_rollouts:
             budgets = [self.stopd.max_len] * count
+        elif self.async_generation:
+            budgets = [
+                self.stopd.budgets(
+                    1,
+                    offset=request_seed(
+                        self.stopd.seed,
+                        metadata.global_step,
+                        trajectory.instance_id,
+                        0 if self.grouped_budgets else trajectory.repetition_id,
+                        "block_index",
+                    ),
+                )[0]
+                for trajectory in input_batch["trajectory_ids"]
+            ]
         elif self.grouped_budgets:
             group_size = self.generator_cfg.n_samples_per_prompt
             budgets = [budget for budget in self.stopd.budgets(count // group_size) for _ in range(group_size)]
@@ -165,7 +215,14 @@ class STOPDGenerator(SkyRLGymGenerator):
         input_batch = {**input_batch, "env_extras": copy.deepcopy(input_batch["env_extras"])}
         for index, (extras, budget) in enumerate(zip(input_batch["env_extras"], budgets, strict=True)):
             extras["_stopd_budget"] = budget
-            extras["_stopd_seed"] = request_seed(self.stopd.seed, metadata.global_step, index, 0, "rollout")
+            trajectory = input_batch["trajectory_ids"][index] if self.async_generation else None
+            extras["_stopd_seed"] = request_seed(
+                self.stopd.seed,
+                metadata.global_step,
+                trajectory.instance_id if self.async_generation else index,
+                trajectory.repetition_id if self.async_generation else 0,
+                "rollout",
+            )
         return await super().generate(input_batch, disable_tqdm=disable_tqdm)
 
     async def agent_loop(
@@ -182,6 +239,20 @@ class STOPDGenerator(SkyRLGymGenerator):
     ):
         if training_phase != TRAINING_PHASE_EVAL:
             max_tokens = env_extras.pop("_stopd_budget")
+            if self.context_length is not None:
+                prompt_ids = self.tokenizer.apply_chat_template(
+                    prompt,
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_dict=False,
+                    **self.generator_cfg.chat_template_kwargs,
+                )
+                remaining = self.context_length - len(prompt_ids)
+                if remaining < 1:
+                    raise ValueError("OPD prompt consumes the configured model context")
+                # Clip the sampled budget, keeping its original distribution and
+                # IPW probabilities for every token that fits the full context.
+                max_tokens = min(max_tokens, remaining)
             sampling_params = {**sampling_params, "max_tokens": max_tokens, "seed": env_extras.pop("_stopd_seed")}
         return await super().agent_loop(
             prompt,
@@ -216,10 +287,20 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
             else None
         )
 
-    async def eval(self, vllm_metrics_scraper=None):
+    def convert_to_training_input(self, generator_output, uids, *, train_batch_size=None):
+        data = super().convert_to_training_input(generator_output, uids, train_batch_size=train_batch_size)
+        if self.cfg.trainer.algorithm.topd.enabled and self.cfg.trainer.algorithm.topd.balance_batch:
+            data, metrics = balance_training_input(
+                data, self.dispatch.dp_size("policy"), self.cfg.trainer.micro_train_batch_size_per_gpu
+            )
+            self.all_metrics.update(metrics)
+        return data
+
+    async def eval(self, vllm_metrics_scraper=None, *, inference_engine_client=None):
         config = self.cfg.trainer.algorithm.lighteval
         if config.project is None:
             return await super().eval(vllm_metrics_scraper=vllm_metrics_scraper)
+        client = inference_engine_client or self.inference_engine_client
         output = Path(self.cfg.trainer.export_path) / "lighteval" / f"global_step_{self.global_step}"
         output.mkdir(parents=True, exist_ok=True)
         command = [
@@ -234,9 +315,9 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
             "--project",
             config.project,
             "--url",
-            self.inference_engine_client.proxy_url,
+            client.proxy_url,
             "--model",
-            self.inference_engine_client.model_name,
+            client.model_name,
             "--tokenizer",
             self.cfg.trainer.policy.model.path,
             "--output",
@@ -250,14 +331,16 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
             "--context-length",
             str(config.context_length),
             "--concurrency",
-            str(
-                self.cfg.generator.inference_engine.num_engines * self.cfg.generator.inference_engine.max_num_seqs + 32
-            ),
+            str(len(client.server_urls) * self.cfg.generator.inference_engine.max_num_seqs + 32),
         ]
         # Keep the producer's pinned math dependency private to the evaluation
         # subprocess, using this project's interpreter and virtual environment.
         dependencies = Path(sys.executable).parent.parent / "rwkv-eval"
         env = os.environ | {"PYTHONPATH": f"{dependencies}{os.pathsep}{os.environ.get('PYTHONPATH', '')}"}
+        # Benchmarks are prepared before training. Avoid Hub retries on the
+        # synchronous evaluation path when the dataset is already cached.
+        env.setdefault("HF_HUB_OFFLINE", "1")
+        env.setdefault("HF_DATASETS_OFFLINE", "1")
         if vllm_metrics_scraper is not None:
             vllm_metrics_scraper.resume()
         try:
@@ -336,6 +419,10 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
                 self.dump_data(data, file_name=f"global_step_{self.global_step}_topd_input")
             return data
         data = super().compute_advantages_and_returns(data)
+        if self.cfg.trainer.algorithm.async_opd:
+            # The worker computes the current-student advantage; this tensor
+            # carries only reduction and STOPD observation weights.
+            data["advantages"] = self._stopd_mask(data).float()
         if self.stopd is not None and self.stopd.truncating:
             # Native token_mean divides by the complete mini-batch's loss mask
             # before DP sharding. Cancel that divisor in favor of C_k.
@@ -379,7 +466,11 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
 
     def load_checkpoints(self):
         global_step, checkpoint_path = super().load_checkpoints()
-        if checkpoint_path is not None and (self.stopd is not None or self.cfg.trainer.algorithm.topd.enabled):
+        if (
+            checkpoint_path is not None
+            and not self.cfg.trainer.fully_async.enabled
+            and (self.stopd is not None or self.cfg.trainer.algorithm.topd.enabled)
+        ):
             # A STOPD continuation must restore the exact data position; propagate
             # a load failure rather than the native best-effort dataloader fallback.
             with io.open_file(os.path.join(checkpoint_path, "data.pt"), "rb") as handle:
@@ -451,12 +542,44 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
                 / denominator,
             }
         )
+        if self.cfg.trainer.algorithm.topd.enabled:
+            # Self-normalized IPW estimates complete-response token means:
+            # later tokens have lower STOPD observation probabilities.
+            full_weights = self.stopd.weights(mask) if self.stopd is not None else mask
+            full_count = full_weights.sum().item()
+            self.all_metrics.update(
+                {
+                    "opd/full_reward_mean_estimate": (rewards * full_weights).sum().item() / full_count,
+                    "opd/full_reverse_kl_mean_estimate": ((action_log_probs - teacher_action_log_probs) * full_weights)
+                    .sum()
+                    .item()
+                    / full_count,
+                }
+            )
         return data
 
 
 def compute_no_op_advantage(token_level_rewards: torch.Tensor, **kwargs):
     # just pass through the rewards
     return token_level_rewards, token_level_rewards
+
+
+def async_opd_policy_loss(
+    log_probs, old_log_probs, advantages, config, loss_mask=None, rollout_logprobs=None, teacher_log_probs=None
+):
+    """AsyncOPD's current-advantage, unclipped sampled reverse-KL gradient.
+
+    ``advantages`` contains the trainer's reduction/IPW weights. The teacher
+    scores and behavior probabilities refer to these exact sampled tokens.
+    """
+    mask = loss_mask.bool()
+    current = log_probs.float().masked_fill(~mask, 0)
+    behavior = rollout_logprobs.detach().float().masked_fill(~mask, 0)
+    teacher = teacher_log_probs.detach().float().masked_fill(~mask, 0)
+    ratio = (current - behavior).exp()
+    advantage = (teacher - current).detach()
+    loss = -(ratio * advantage * advantages * mask).sum()
+    return loss, {"importance_ratio": masked_mean(ratio.detach(), mask).item()}
 
 
 class OnPolicyDistillationExp(BasePPOExp):
@@ -476,10 +599,66 @@ class OnPolicyDistillationExp(BasePPOExp):
             stopd_cfg=stopd_cfg,
             complete_rollouts=algorithm.topd.enabled and not algorithm.stopd.enabled,
             grouped_budgets=algorithm.topd.enabled and algorithm.stopd.enabled,
+            async_generation=cfg.trainer.fully_async.enabled or cfg.trainer.algorithm.async_opd,
         )
 
     def get_trainer(self, *args, **kwargs):
+        cfg = kwargs.get("cfg", args[0] if args else None)
+        if cfg.trainer.fully_async.enabled:
+            return FullyAsyncOnPolicyDistillationTrainer(*args, **kwargs)
         return OnPolicyDistillationTrainer(*args, **kwargs)
+
+
+class FullyAsyncOnPolicyDistillationTrainer(FullyAsyncRayPPOTrainer, OnPolicyDistillationTrainer):
+    """Native async scheduling with OPD/TOP-D losses and complete STOPD checkpoints."""
+
+    _streaming_supports_token_mean = True
+    _preserve_epoch_shuffle = True
+
+    async def eval(self, vllm_metrics_scraper=None):
+        if self.cfg.trainer.algorithm.lighteval.project is None:
+            return await super().eval(vllm_metrics_scraper=vllm_metrics_scraper)
+
+        from examples.train.rwkv.evaluate import create_eval_server_pool
+        from skyrl.backends.skyrl_train.inference_servers.setup import build_new_inference_client
+
+        async with self._staleness_manager.pause_generation(self._generation_failure):
+            await asyncio.to_thread(self.save_models)
+            cfg = copy.deepcopy(self.cfg)
+            cfg.trainer.policy.model.path = str(
+                Path(cfg.trainer.export_path) / f"global_step_{self.global_step}" / "policy"
+            )
+            cfg.generator.inference_engine.served_model_name = self.inference_engine_client.model_name
+            locations = self.dispatch.get_worker_gpu_locations("policy")
+            with self.dispatch.offload_for_evaluation():
+                pool = create_eval_server_pool(cfg, locations)
+                try:
+                    await asyncio.to_thread(pool.start)
+                    cfg.generator.inference_engine.external_proxy_url = None
+                    cfg.generator.inference_engine.external_server_urls = (
+                        self.inference_engine_client.server_urls + pool.get_server_urls()
+                    )
+                    client, setup = await asyncio.to_thread(build_new_inference_client, cfg, self.tokenizer)
+                    try:
+                        logger.info(f"LightEval using {len(client.server_urls)} engines with training paused")
+                        metrics = await super().eval(
+                            vllm_metrics_scraper=vllm_metrics_scraper, inference_engine_client=client
+                        )
+                        metrics["eval/lighteval/num_engines"] = len(client.server_urls)
+                        return metrics
+                    finally:
+                        await asyncio.to_thread(setup.router.shutdown)
+                finally:
+                    await asyncio.to_thread(pool.shutdown)
+
+    def _streaming_token_normalization(self):
+        return not self.cfg.trainer.algorithm.topd.enabled and (self.stopd is None or not self.stopd.truncating)
+
+    def _finish_streaming_step(self, data):
+        if self.stopd is not None:
+            metrics = self.stopd.end_step(self._stopd_mask(data))
+            metrics["grouped_budgets"] = int(self.cfg.trainer.algorithm.topd.enabled)
+            self.all_metrics.update({f"stopd/{key}": value for key, value in metrics.items()})
 
 
 @ray.remote(num_cpus=1)
@@ -493,6 +672,8 @@ def main() -> None:
     # Register from the entrypoint so that import never calls back into them.
     register_advantage_estimator("no_op")(compute_no_op_advantage)
     register_policy_loss("topd_stopd")(topd_stopd_policy_loss)
+    register_policy_loss("async_topd")(async_topd_policy_loss)
+    register_policy_loss("async_opd")(async_opd_policy_loss)
     cfg = OnPolicyDistillationConfig.from_cli_overrides(sys.argv[1:])
     # validate the arguments
     validate_cfg(cfg)

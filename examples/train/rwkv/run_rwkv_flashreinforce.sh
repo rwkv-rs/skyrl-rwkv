@@ -11,15 +11,33 @@ fi
 : "${MODEL_DIR:=$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600}"
 : "${DATA_DIR:=$HOME/data/gsm8k}"
 : "${NUM_GPUS:=8}"
+
+# Optional native async rollout/learner placement. Fixed modes keep whole logical batches.
+: "${ASYNC_MODE:=disabled}"
+: "${ASYNC_STREAMING_BATCH_SIZE:=0}"
+: "${MINI_BATCH_SIZE:=128}"
+ASYNC_ENABLED=false
+COLOCATE_ALL=true
+ASYNC_STALENESS=1
+if [[ "$ASYNC_MODE" != disabled ]]; then
+  ASYNC_ENABLED=true
+  COLOCATE_ALL=false
+  : "${NUM_POLICY_GPUS:=$((NUM_GPUS - 1))}"
+  : "${NUM_INFERENCE_GPUS:=1}"
+  if [[ "$ASYNC_MODE" == zero_stale ]]; then
+    ASYNC_STALENESS=0
+  fi
+fi
 : "${NUM_POLICY_GPUS:=$NUM_GPUS}"
 : "${NUM_INFERENCE_GPUS:=$NUM_GPUS}"
-: "${MINI_BATCH_SIZE:=128}"
+: "${ASYNC_GENERATION_WORKERS:=$MINI_BATCH_SIZE}"
 : "${MICRO_BATCH_SIZE:=32}"
 : "${LOGGER:=wandb}"
 : "${TRAINING_ENTRYPOINT:=skyrl.train.entrypoints.main_base}"
 : "${RUN_NAME:=rwkv7-g1k-1.5b-20260930-ctx25600-gsm8k-flashreinforce-50step}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
-export UV_PROJECT_ENVIRONMENT="$PWD/.venv"
+export UV_PROJECT_ENVIRONMENT="$(realpath .venv)"
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 # FlashRWKV2 uses get_default_build_root() (XDG_CACHE_HOME), not TORCH_EXTENSIONS_DIR.
 export XDG_CACHE_HOME="$HOME/.cache/skyrl-rwkv"
 export TORCH_EXTENSIONS_DIR="$XDG_CACHE_HOME/torch_extensions"
@@ -32,14 +50,14 @@ if [[ "${1:-}" == --prepare-flashrwkv2 ]]; then
   fi
   export MAX_JOBS="${MAX_JOBS:-2}"
   uv sync --extra rwkv
-  uv run --isolated --no-project .venv/bin/python examples/train/rwkv/prepare_flashrwkv2.py
+  uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" examples/train/rwkv/prepare_flashrwkv2.py
   exit 0
 fi
 
 # Check the exact native cache key before loading.
-uv run --isolated --no-project .venv/bin/python examples/train/rwkv/prepare_flashrwkv2.py --check
+uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" examples/train/rwkv/prepare_flashrwkv2.py --check
 
-uv run --isolated --no-project .venv/bin/python -m "$TRAINING_ENTRYPOINT" \
+uv run --isolated --no-config --no-project "$UV_PROJECT_ENVIRONMENT/bin/python3" -m "$TRAINING_ENTRYPOINT" \
   data.train_data="['$DATA_DIR/train.parquet']" \
   data.val_data="['$DATA_DIR/validation.parquet']" \
   trainer.algorithm.policy_loss_type=flashreinforce \
@@ -61,8 +79,13 @@ uv run --isolated --no-project .venv/bin/python -m "$TRAINING_ENTRYPOINT" \
   trainer.policy.sequence_parallel_size=1 \
   trainer.policy.use_torch_compile=false \
   trainer.gradient_checkpointing=true \
+  trainer.fully_async.enabled="$ASYNC_ENABLED" \
+  trainer.fully_async.mode="${ASYNC_MODE/disabled/fully_async}" \
+  trainer.fully_async.max_staleness_steps="$ASYNC_STALENESS" \
+  trainer.fully_async.num_parallel_generation_workers="$ASYNC_GENERATION_WORKERS" \
+  trainer.fully_async.streaming_batch_size="$ASYNC_STREAMING_BATCH_SIZE" \
   trainer.fully_async.clear_kv_cache_on_weight_sync=true \
-  trainer.placement.colocate_all=true \
+  trainer.placement.colocate_all="$COLOCATE_ALL" \
   trainer.placement.policy_num_gpus_per_node="$NUM_POLICY_GPUS" \
   trainer.placement.critic_num_gpus_per_node="$NUM_POLICY_GPUS" \
   trainer.placement.ref_num_gpus_per_node="$NUM_POLICY_GPUS" \

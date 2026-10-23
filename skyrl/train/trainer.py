@@ -949,7 +949,9 @@ class RayPPOTrainer:
         self.dispatch.init_weight_sync_state(self.inference_engine_client)
         logger.info("Initialized weight sync state for policy model and inference engines.")
 
-    def convert_to_training_input(self, generator_output: GeneratorOutput, uids: List[str]) -> TrainingInputBatch:
+    def convert_to_training_input(
+        self, generator_output: GeneratorOutput, uids: List[str], *, train_batch_size: Optional[int] = None
+    ) -> TrainingInputBatch:
         """Converts lists to a padded batch of tensors for training
 
         Args:
@@ -1053,11 +1055,15 @@ class RayPPOTrainer:
 
         # 4. Compute mini-batch boundaries for train_critic_and_policy(). It excludes the ones
         # we will add in pad_training_input_batch().
-        train_batch_size = self.cfg.trainer.train_batch_size
+        policy_mini_batch_size = self.cfg.trainer.policy_mini_batch_size
+        if train_batch_size is None:
+            train_batch_size = self.cfg.trainer.train_batch_size
+        else:
+            policy_mini_batch_size = train_batch_size
         n_samples_per_prompt = self.cfg.generator.n_samples_per_prompt
         is_stepwise = self.cfg.generator.step_wise_trajectories
         training_input.metadata["policy_mini_batch_boundaries"] = compute_prompt_mini_batch_boundaries(
-            uids, self.cfg.trainer.policy_mini_batch_size, train_batch_size, is_stepwise, n_samples_per_prompt
+            uids, policy_mini_batch_size, train_batch_size, is_stepwise, n_samples_per_prompt
         )
         # Per-prompt boundaries (used by the `prompt_mean` loss reduction). Policy-only,
         # since advantage normalization only applies to the policy.
@@ -1448,10 +1454,17 @@ class RayPPOTrainer:
             # the packing — and resulting logprobs/values — match what forward_backward recomputes.
             all_chunk_refs = self.dispatch.stage_data(model, data_fwd_pass, mini_batch_boundaries)
             combined_outputs: List[Dict[str, Any]] = []
-            for chunk_refs in all_chunk_refs:
+            for (start, end), chunk_refs in zip(mini_batch_boundaries, all_chunk_refs, strict=True):
                 mb_output = self.dispatch.forward_from_staged(model, chunk_refs)
-                combined_outputs.extend(mb_output.loss_fn_outputs)
-            return loss_fn_outputs_to_tensor(combined_outputs, key=key)
+                # stage_data pads each mini-batch independently for DP. Remove
+                # those synthetic rows before concatenation, or every following
+                # mini-batch's scores shift relative to its sampled tokens.
+                combined_outputs.extend(mb_output.loss_fn_outputs[: end - start])
+            result = loss_fn_outputs_to_tensor(combined_outputs, key=key)
+            # The input may also have trailing full-batch padding. Keep its
+            # tensor shape without inserting padding between real mini-batches.
+            padding = result.new_zeros((len(data_fwd_pass) - len(result), *result.shape[1:]))
+            return torch.cat((result, padding), dim=0)
 
         output = self.dispatch.forward(model, data_fwd_pass)
         return loss_fn_outputs_to_tensor(output.loss_fn_outputs, key=key)
@@ -1504,6 +1517,8 @@ class RayPPOTrainer:
             - `["values"]`: Float[torch.Tensor, "batch_size response_len"]
         """
         fwd_keys = ["sequences", "attention_mask"]
+        if self.cfg.trainer.rwkv_response_only_head:
+            fwd_keys.append("response_mask")
         if training_input.get("rollout_expert_indices") is not None:
             fwd_keys.append("rollout_expert_indices")
         if training_input.get("router_padding_mask") is not None:

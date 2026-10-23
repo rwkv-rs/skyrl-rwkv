@@ -948,6 +948,39 @@ async def test_agent_loop_pads_a_stop_string_eos_support_row_in_single_turn_mode
 
 @pytest.mark.asyncio
 @patch("skyrl_gym.make")
+async def test_agent_loop_preserves_sampled_stop_tokens_and_masks_only_synthetic_eos(
+    mock_make, mock_tokenizer, mock_llm, mock_env, generator_cfg, mock_env_cfg
+):
+    generator_cfg.batched = False
+    generator_cfg.use_conversation_multi_turn = True
+    generator_cfg.sampling_params.logprobs = 1
+    generator_cfg.sampling_params.stop = ["✿", "\nUser:", "\n### User"]
+    mock_make.return_value = mock_env
+    mock_env.init.return_value = ([{"role": "user", "content": "Initial input"}], {})
+    mock_env.step.side_effect = [BaseTextEnvStepOutput(observations=[], reward=1.0, done=True, metadata={})]
+    mock_llm.generate = AsyncMock(
+        return_value={
+            "responses": ["answer✿"],
+            "response_ids": [[10, 11]],
+            "response_logprobs": [[-0.4, -0.2]],
+            "stop_reasons": ["stop"],
+        }
+    )
+    generator = SkyRLGymGenerator(generator_cfg, mock_env_cfg, mock_llm, mock_tokenizer)
+    generator.base_conversation_token_ids = []
+
+    output = await generator.agent_loop(
+        [{"role": "user", "content": "Start"}], mock_env_cfg.env_class, {}, max_tokens=32, max_input_length=64
+    )
+
+    assert output.response_ids == [10, 11, 4]
+    assert output.rollout_logprobs == [-0.4, -0.2, 0.0]
+    assert output.loss_mask == [1, 1, 0]
+    mock_env.step.assert_called_once_with("answer✿")
+
+
+@pytest.mark.asyncio
+@patch("skyrl_gym.make")
 async def test_generate_batched(mock_make, mock_tokenizer, mock_llm, mock_env, generator_cfg, mock_env_cfg):
     mock_make.return_value = mock_env
     mock_env.init.return_value = ([{"role": "user", "content": "Initial input"}], {})

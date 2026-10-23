@@ -99,6 +99,63 @@ class ToyRecurrentCausalLM(ToyCausalLM):
         return {"logits": self.lm_head(hidden), "past_key_values": cache}
 
 
+@pytest.mark.parametrize("distributed", [False, True])
+@pytest.mark.parametrize("entropy_requires_grad", [False, True])
+def test_rwkv_response_only_head_preserves_loss_context_gradients_and_entropy(
+    monkeypatch, distributed, entropy_requires_grad
+):
+    class SelectedHeadToyCausalLM(ToyRecurrentCausalLM):
+        def forward(self, input_ids, logits_to_keep=0):
+            self.calls.append((input_ids.detach().clone(), logits_to_keep))
+            hidden = self.embed_tokens(input_ids).cumsum(1)
+            if isinstance(logits_to_keep, torch.Tensor):
+                hidden = hidden.gather(1, logits_to_keep.unsqueeze(-1).expand(-1, -1, hidden.shape[-1]))
+            return {"logits": self.lm_head(hidden)}
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: distributed)
+    torch.manual_seed(42)
+    model = SelectedHeadToyCausalLM()
+    wrapper = HFModelWrapper(model)
+    ids = torch.tensor([[0, 0, 1, 2, 3, 4, 5, 6, 7], [0, 0, 0, 0, 8, 9, 10, 11, 12], [1, 2, 3, 4, 5, 6, 7, 8, 9]])
+    mask = ids.ne(0)
+    response_mask = torch.tensor([[0, 0, 0, 1, 1, 1], [0, 0, 0, 0, 0, 1], [0, 0, 1, 1, 1, 1]])
+
+    def run():
+        lp, output = wrapper(
+            ids,
+            6,
+            attention_mask=mask,
+            response_mask=response_mask,
+            return_output=True,
+            compute_entropy=True,
+            entropy_requires_grad=entropy_requires_grad,
+        )
+        ent = output["entropy"][:, -7:-1]
+        loss = (-(lp * response_mask).sum() + 0.01 * (ent * response_mask).sum()) / response_mask.sum()
+        loss.backward()
+        return lp.detach(), ent.detach(), [p.grad.clone() for p in model.parameters()]
+
+    expected_lp, expected_entropy, expected_grads = run()
+    model.zero_grad(set_to_none=True)
+    model.calls.clear()
+    wrapper.rwkv_response_only_head = True
+    actual_lp, actual_entropy, actual_grads = run()
+    torch.testing.assert_close(actual_lp[response_mask.bool()], expected_lp[response_mask.bool()])
+    torch.testing.assert_close(actual_entropy[response_mask.bool()], expected_entropy[response_mask.bool()])
+    assert actual_lp[~response_mask.bool()].count_nonzero() == 0
+    for actual, expected in zip(actual_grads, expected_grads, strict=True):
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    assert actual_grads[0][1].abs().sum() > 0  # Prompt history still receives gradients.
+    assert all(isinstance(selection, torch.Tensor) and selection.shape[1] <= 4 for _, selection in model.calls)
+
+
+def test_rwkv_response_only_head_requires_response_mask():
+    wrapper = HFModelWrapper(ToyCausalLM(), rwkv_response_only_head=True)
+    ids = torch.tensor([[1, 2, 3]])
+    with pytest.raises(ValueError, match="response_mask"):
+        wrapper(ids, 2, attention_mask=torch.ones_like(ids))
+
+
 def test_rwkv_infctx_preserves_cross_chunk_labels_states_and_gradients():
     model = ToyRecurrentCausalLM()
     wrapper = HFModelWrapper(model, rwkv_chunk_size=2)
@@ -438,7 +495,8 @@ def test_non_rwkv_model_keeps_direct_forward_path():
     assert torch.equal(model.calls[0][1]["attention_mask"], attention_mask)
 
 
-def test_rwkv_disables_outer_autocast_without_changing_direct_forward():
+@pytest.mark.parametrize("inference_mode", [False, True])
+def test_rwkv_disables_outer_autocast_without_changing_direct_forward(inference_mode):
     sequences = torch.tensor([[1, 2, 3]])
     attention_mask = torch.ones_like(sequences)
     rwkv_model = AutocastAwareToyCausalLM("rwkv")
@@ -447,12 +505,14 @@ def test_rwkv_disables_outer_autocast_without_changing_direct_forward():
     direct_model.eval()
 
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-        HFModelWrapper(rwkv_model)(sequences, num_actions=2, attention_mask=attention_mask)
+        HFModelWrapper(rwkv_model, rwkv_inference_mode=inference_mode)(
+            sequences, num_actions=2, attention_mask=attention_mask
+        )
         HFModelWrapper(direct_model)(sequences, num_actions=2, attention_mask=attention_mask)
 
     assert rwkv_model.autocast_states == [False]
     assert direct_model.autocast_states == [True]
-    assert rwkv_model.training_states == [True]
+    assert rwkv_model.training_states == [not inference_mode]
     assert direct_model.training_states == [False]
     assert not rwkv_model.training
 
@@ -529,7 +589,8 @@ def test_critic_warm_start_keeps_fresh_optimizer_and_scheduler(monkeypatch, resu
     assert not optimizer.state
 
 
-def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):
+@pytest.mark.parametrize("inference_mode", [False, True])
+def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch, inference_mode):
     config = SimpleNamespace(
         model_type="rwkv",
         vision_config=None,
@@ -556,11 +617,12 @@ def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):
         fake_from_pretrained,
     )
 
-    wrapper = HFModelWrapper("rwkv-checkpoint", bf16=False)
+    wrapper = HFModelWrapper("rwkv-checkpoint", bf16=False, rwkv_inference_mode=inference_mode)
 
     assert wrapper.is_rwkv
     assert "attn_implementation" not in captured_kwargs
     assert not hasattr(config, "_attn_implementation")
+    assert captured_kwargs["torch_dtype"] == (torch.float16 if inference_mode else torch.float32)
 
 
 @pytest.mark.parametrize(
@@ -698,6 +760,38 @@ def test_rwkv_fully_async_requires_cache_reset_before_fsdp_prepare(monkeypatch, 
         with pytest.raises(ValueError, match="clear_kv_cache_on_weight_sync=True"):
             worker.init_model("checkpoint")
         strategy.prepare.assert_not_called()
+
+
+@pytest.mark.parametrize("model_type", ["rwkv", "llama"])
+@pytest.mark.parametrize("param_dtype", [None, "bf16", "fp16"])
+def test_reference_inference_mode_only_for_explicit_fp16_rwkv(monkeypatch, model_type, param_dtype):
+    from unittest.mock import MagicMock
+
+    from skyrl.backends.skyrl_train.workers.fsdp import fsdp_worker as module
+    from skyrl.train.config import MixedPrecisionConfig, SkyRLTrainConfig
+
+    cfg = SkyRLTrainConfig().trainer
+    if param_dtype is not None:
+        cfg.ref.fsdp_config.mixed_precision = MixedPrecisionConfig(param_dtype=param_dtype)
+    wrapper = HFModelWrapper(ToyCausalLM(model_type))
+    strategy = MagicMock()
+    strategy.prepare.return_value = wrapper
+    monkeypatch.setattr(module, "FSDPStrategy", lambda **kwargs: strategy)
+    monkeypatch.setattr(
+        module.AutoConfig,
+        "from_pretrained",
+        lambda *args, **kwargs: SimpleNamespace(model_type=model_type, tie_word_embeddings=False),
+    )
+    monkeypatch.setattr(module, "should_use_meta_init", lambda **kwargs: False)
+    factory = MagicMock(return_value=wrapper)
+    monkeypatch.setattr(module, "HFModelWrapper", factory)
+    worker = object.__new__(module.FSDPRefWorkerBase)
+    worker.cfg = cfg
+    worker._seq_parallel_monkey_patch = MagicMock()
+    worker._set_expandable_segments = MagicMock()
+    worker.init_model("checkpoint")
+    assert factory.call_args.kwargs["rwkv_inference_mode"] == (model_type == "rwkv" and param_dtype == "fp16")
+    assert not worker.model.training
 
 
 @pytest.mark.parametrize(

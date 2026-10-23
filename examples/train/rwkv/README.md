@@ -593,8 +593,8 @@ TEACHER_MODEL="$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-
   > /tmp/results_rwkv_opd.log 2>&1
 ```
 
-Defaults: 8 colocated GPUs, eight TP1 student inference engines, BF16 training and
-teacher scoring with `wkv_mode=fp32io16`, FP16 inference, gradient checkpointing,
+Defaults: 8 colocated GPUs, eight TP1 student inference engines, BF16 student training,
+FP16 frozen-teacher scoring and inference with `wkv_mode=fp32io16`, gradient checkpointing,
 512 prompts per batch, one completion per prompt, policy mini-batch 512, per-GPU
 micro-batch 4 for training and forward passes, and AdamW LR `2e-6`.
 Each fresh rollout batch produces one optimizer
@@ -605,10 +605,62 @@ and disabled penalties. Evaluation uses temperature `0.96`, top-p `0.76`, top-k 
 presence penalty `1.0`, frequency penalty `0.1`, penalty decay `0.988`, and 32 samples
 per prompt.
 
+The merged AntiDoom teacher retains its exported FP16 weights. Its FSDP reference
+worker selects the native FP16 forward path and preserves FP32 recurrent states;
+the student continues to use BF16 forward/backward. `TEACHER_DTYPE=bfloat16`
+selects BF16 reference scoring for an explicit precision comparison.
+The teacher's input embedding and its norm use the native inference BF16 dtype,
+established before FSDP wraps the frozen parameters. ChannelMix transposes are
+built after each layer's all-gather while FSDP retains ownership of parameter
+placement. These dtypes and caches remain valid across CPU offload and GPU reload.
+
+Long-context FP16 teacher scoring can produce WKV readouts larger than 65504.
+The optional `trainer.ref.model_config_kwargs.wkv_output_dtype=float32` keeps
+the recurrent output and its head normalization in FP32 while preserving the
+exported FP16 weights. This requires FlashRWKV2's FP32-output/readout support
+and the corresponding `transformers-rwkv` config support in the prepared
+environment. The validated local revisions are FlashRWKV2
+`fd29c063aeecc27ef0142e9bce28331fdc846831` and `transformers-rwkv`
+`b8643244727e7d5e1c4a2be90c26e6bb5118f3b8`; the public dependency pins do not
+yet include these patches. Record the installed revisions with the run config.
+
+`MAX_GENERATE_LENGTH=16384` extends the training response horizon. With TOP-D or
+STOPD, each request is limited by the remaining space in the configured
+`generator.inference_engine.engine_init_kwargs.max_model_len=25600` context.
+The original prompt dataset is retained. STOPD samples its budget before this
+context cap, so the same inclusion probabilities apply to retained tokens.
+When changing the horizon of a resumed TOP-D run, prepare a checkpoint copy with
+the new `stopd_state.pt` `max_len` and clear its unused lagged denominator;
+preserve its step, seed, block size, and all native training state. The loader
+continues to reject a mismatched STOPD horizon.
+
+TOP-D logs `opd/full_reverse_kl_mean_estimate` and `opd/full_reward_mean_estimate`
+alongside the observed-prefix metrics. These are self-normalized inverse-probability
+estimates over the complete training response horizon, with finite-sample ratio
+estimation error. They do not measure exact full-vocabulary KL or evaluation accuracy.
+
 RWKV Rapid-Sampling uses `raw_logprobs`. The launcher selects it explicitly;
 the inference setup requires an unmodified training distribution so these equal
 the sampling logprobs used by OPD. Evaluation logprobs do not enter the loss.
+
+OPD inference uses vLLM `FULL_DECODE_ONLY` CUDA Graphs with compilation mode 0.
+Prefill remains eager, and rollout requests still return raw logprobs. Override
+`generator.inference_engine.enforce_eager=true` for an eager comparison.
+`profile_opd.py --role inference` compares fixed-length decoding on saved rollout
+prompts and checks weight replacement, restoration, and sleep/wake cycles. Pass
+`--model`, `--comparison-model`, `--rollouts`, and `--output`; use the same arguments
+with `--enforce-eager` for the control report.
+
+Prepare the native LightEval benchmark cache before starting training. Evaluation
+subprocesses default `HF_HUB_OFFLINE=1` and `HF_DATASETS_OFFLINE=1` so Hub metadata
+retries cannot stall the synchronous training loop. Explicit environment values
+take precedence; set both to 0 when preparing a previously uncached benchmark.
+The native task, prompt, extraction, and grading implementations are unchanged.
 Each engine has a 2-GiB recurrent-state cache budget and up to 128 active requests.
+The launcher advertises 32 Ray CPU resources and defaults to two OpenMP threads
+and two glibc allocator arenas per process. Existing environment values override
+these defaults. Adam state stays on GPU (`offload_after_step=false`), using
+available GPU memory to reduce host memory pressure during colocated training.
 
 The default run covers one complete epoch. Evaluation runs before training and
 every 50 steps; resumable checkpoints and HF exports are saved every 50 steps.
@@ -616,7 +668,7 @@ Training metrics, evaluation scores, and sampled trajectories are uploaded to W&
 detailed training rollout dumps are written under `$OUTPUT_ROOT/exports/dumped_rollouts`.
 `OUTPUT_ROOT` defaults to `$HOME/skyrl-rwkv-runs/$RUN_NAME`.
 
-`STUDENT_MODEL`, `TEACHER_MODEL`, `DATA_DIR`, `TRAIN_FILE`, `TEST_FILE`, `NUM_GPUS`,
+`STUDENT_MODEL`, `TEACHER_MODEL`, `TEACHER_DTYPE`, `MAX_GENERATE_LENGTH`, `DATA_DIR`, `TRAIN_FILE`, `TEST_FILE`, `NUM_GPUS`,
 `MICRO_BATCH_SIZE`, `MICRO_FORWARD_BATCH_SIZE`, `MINI_BATCH_SIZE`, `LR`, `USE_NORA`,
 `LORA_RANK`, `LORA_ALPHA`, `LORA_TARGET_MODULES`, `LOGGER`, `RUN_NAME`, and `OUTPUT_ROOT`
 accept environment overrides.
@@ -910,6 +962,11 @@ MODEL_DIR="$MODEL_DIR" DATA_DIR="$DATA_DIR" NUM_GPUS=8 \
   > /tmp/results_direct_sft.log 2>&1
 ```
 
+To train NoRA adapters instead of all parameters, pass the native overrides
+`model.lora.use_nora=true model.lora.rank=256 model.lora.alpha=256` and
+`'model.lora.target_modules=[r_proj,k_proj,v_proj,o_proj,lm_head]'`.
+HF exports merge the adapters into a complete model for subsequent OPD.
+
 The launcher trains one epoch with native FSDP and complete cross-chunk
 gradients (`rwkv_chunk_size=2048`, `wkv_mode=fp32io16`). Similar-length batches
 are shuffled using a checkpointable sampler; each source row is visited once.
@@ -956,11 +1013,12 @@ avg@4 respectively: mean correctness across the responses, then across
 questions. Configure the producer explicitly; its current default sampling
 policy does not guarantee these response counts.
 
-Use CoT with the `bot` template and `open_think`, a 24,576-token completion
-budget, temperature 0.96, top-p 0.76, top-k 32, presence penalty 1.0,
+Use CoT with the `bot` template and `open_think`, a 25,600-token total context
+budget (completion budget equals context minus the exact prompt length),
+temperature 0.96, top-p 0.76, top-k 32, presence penalty 1.0,
 frequency penalty 0.1 and penalty decay 0.988. Save per-rollout results,
 question and completion counts, and truncation rates alongside aggregate
-scores. Invoke the existing producer checkout with its dedicated environment;
+scores. Invoke the existing producer source with the SkyRL project environment;
 SkyRL owns the final export and inference service. Set `LIGHTEVAL_PROJECT` to
 the producer checkout and `WANDB_RUN_PATH` to `entity/project/run_id` to enable
 periodic benchmarks. SFT loss evaluation and weight saving remain every
@@ -1414,3 +1472,77 @@ uv run --isolated --no-config --no-project uv pip install \
   --python .venv/bin/python --no-deps 'peft==0.18.1' \
   > /tmp/results_antidoom_restore_peft.log 2>&1
 ```
+
+
+## Optional native asynchronous RL
+
+`run_rwkv_grpo.sh`, `run_rwkv_flashreinforce.sh`, and
+`run_rwkv_on_policy_distill.sh` accept `ASYNC_MODE` (default `disabled`).
+All modes reuse `FullyAsyncRayPPOTrainer`, native generation queues, FSDP
+workers, and NoRA-to-full-weight synchronization. Set `NUM_POLICY_GPUS` and
+`NUM_INFERENCE_GPUS` to partition the same device budget; the teacher shares
+learner devices. RWKV clears its recurrent cache when weights change.
+
+OPD's native `lighteval-rwkv` evaluation temporarily uses both device sets.
+Training updates and new training rollout admission pause while running
+requests drain. Trainer models and optimizer states move to CPU, and native
+vLLM servers on the learner GPUs load the current merged student export.
+The existing rollout servers and these temporary servers share one evaluation
+router. After evaluation, the temporary servers exit, trainer residency is
+restored, and training continues with its buffered rollouts. The 7+1 training
+layout therefore evaluates on all eight GPUs; `eval/lighteval/num_engines`
+records the evaluation pool size.
+
+| Mode | Rollout/update scheduling | TOP-D + STOPD |
+| --- | --- | --- |
+| `one_step_off` | Fixed logical batches; overlap the next rollout batch with the current batch's updates; publish weights after that rollout batch closes | Supported |
+| `zero_stale` | Admit only the current batch; optionally accumulate ready complete-group gradients before one update | Supported |
+| `fully_async` | Native completion queue and bounded admission, with behavior-policy correction | TOP-D supported; STOPD requires a fixed-batch mode |
+
+For example, preserve the current OPD batch and optimizer schedule while testing
+seven learner/teacher devices and one rollout device:
+
+```bash
+ASYNC_MODE=one_step_off NUM_POLICY_GPUS=7 NUM_INFERENCE_GPUS=1 \
+MAX_GENERATE_LENGTH=16384 LR=2.5e-7 TOPD_BALANCE_BATCH=true \
+USE_TOPD=true USE_STOPD=true TOPD_GROUP_SIZE=2 MINI_BATCH_SIZE=512 \
+TOPD_MINI_BATCH_SIZE=128 UPDATE_EPOCHS_PER_BATCH=2 \
+uv run --isolated bash examples/train/rwkv/run_rwkv_on_policy_distill.sh \
+  trainer.resume_mode=from_path trainer.resume_path=/absolute/path/to/global_step_N
+```
+
+Plain [AsyncOPD](https://arxiv.org/abs/2606.24143) recomputes
+`teacher_logprob - current_student_logprob` at every learner forward and uses
+an unclipped current/behavior action ratio. TOP-D instead retains its group
+normalization and future returns with a behavior-anchored clipped surrogate;
+STOPD's signed telescoping coefficients remain outside clipping. The local
+reverse-KL gradient identity for plain AsyncOPD does not apply to TOP-D's
+separate objective or remove stale-prefix distribution differences.
+Native `fully_async` uses one policy mini-batch per logical batch, so set
+`policy_mini_batch_size=train_batch_size` for that mode.
+
+Following [ThunderSyncRL](https://arxiv.org/abs/2610.05935), `zero_stale` can
+set `ASYNC_STREAMING_BATCH_SIZE` to a positive number of complete prompt groups.
+It retains the full causal graph, accumulates gradients at fixed weights,
+and normalizes/clips/updates once after the logical batch closes. This
+complete-group implementation supports GRPO and OPD, including TOP-D/STOPD;
+it does not implement the paper's trajectory-local GRPO decomposition.
+Streaming requires one update epoch, `policy_mini_batch_size=train_batch_size`,
+group-local advantages, and chunks divisible by the learner/teacher DP and
+microbatch grid. Use prompt/sequence reduction for GRPO. FlashREINFORCE's
+batch-wide baseline uses the complete batch and supports async scheduling
+without gradient streaming. A multi-update run should use `one_step_off` to
+retain its existing optimizer schedule.
+
+Synchronous checkpoints import model, optimizer, STOPD state, consumed prompt
+UIDs, and the saved epoch permutation. Keep the logical train batch size when
+switching modes. Throughput comparisons should use the same total GPU count,
+checkpoint, token budget, and optimizer updates; exclude initialization and
+compare multiple steady-state steps before enabling a production mode.
+
+RWKV rollout and evaluation load the checkpoint's `generation_config.json`
+`stop_strings` when no explicit sampling stop is configured. The inference
+request includes the generated stop string, preserving sampled token IDs and
+logprobs. Native conversation-mode generation masks a synthetically appended
+EOS with zero; sampled stop tokens remain active. LightEval receives the same
+model stops through its provider request, independently of task-level stops.

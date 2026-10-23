@@ -1012,6 +1012,10 @@ class SFTTrainer:
             config=self.sft_cfg,
             tags=self.cfg.trainer.tags,
         )
+        if self.sft_cfg.eval_command and self.tracker.backend == "wandb":
+            self.tracker.logger.define_metric("eval/checkpoint_step", hidden=True)
+            for name in ("eval/base/*", "eval/sft/*"):
+                self.tracker.logger.define_metric(name, step_metric="eval/checkpoint_step")
 
     def add_callback(self, callback: TrainingCallback) -> None:
         """Register a callback. Can be called anytime; events fired after this
@@ -1634,6 +1638,7 @@ class SFTTrainer:
                 subprocess.run(command, check=True)
             with io.open_file(self.sft_cfg.eval_command_metrics_path.format(**values)) as stream:
                 metrics.update(json.load(stream))
+            metrics["checkpoint_step"] = self.global_step
         return metrics, total_eval_batches
 
     def _run_eval_one(self, eval_dataloader: StatefulDataLoader) -> tuple[float, int]:

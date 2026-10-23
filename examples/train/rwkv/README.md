@@ -506,6 +506,29 @@ git check-ignore -v .env
 
 The launch script loads this project-root `.env` without printing its contents.
 
+All RWKV post-training stages log to the private `rhineai/skyrl-rwkv` project.
+Use one run per training experiment. Baseline and checkpoint evaluations are
+points in that run's `eval/*` curves; independent training variants and
+continuation runs can be associated with groups.
+Curated runs carry `rwkv-post-training`, `stage:<stage>`, and `role:<role>` tags;
+the stages are `sft`, `antidoom`, `opd`, `value`, and `online-rl`.
+Short failed attempts and debug runs are retained in the private
+`rhineai/skyrl-rwkv-archive` project with the `archived` tag and a reason in
+their notes. Historical artifacts remain in their original projects; the
+original run paths are recorded in the curated run notes.
+
+W&B display names follow `stage | model size | method and variant | purpose`.
+Stage prefixes are `01 SFT`, `02 AntiDoom`, `03 OPD`, `04 Value`, and `05 RL`.
+Use concise purposes to distinguish training variants, comparisons, data
+generation, and continuation from a checkpoint. Evaluating a training checkpoint
+does not create a new run.
+For example, `01 SFT | 1.5B | Nemotron-CoT 全参 | 训练` and
+`03 OPD | 1.5B | TOPD+STOPD 异步 | 续训 step191` identify the experiment
+without embedding its full launch command. Archived names include `归档` in
+the purpose. Exact weight versions remain in the run configuration and notes;
+notes also retain the previous display name and stable run ID. Renaming an
+existing W&B display name does not rename its output directory or checkpoints.
+
 ## Run
 
 The defaults use a BF16 Trainer, FP16 vLLM-RWKV inference, 8 GPUs, eight TP1 colocated inference engines, GRPO, `train_batch_size=64`, four samples per prompt, global policy mini-batch 64, per-GPU micro-batch 2, gradient checkpointing, and one optimizer step per training step. Step 50 runs evaluation and writes both a resumable checkpoint and an HF export.
@@ -898,7 +921,7 @@ still starts at zero. The native FSDP scheduler is `cosine_with_min_lr` with
 the restored optimizer uses its saved learning rate for the first update;
 the next scheduler advance applies the configured floor at the restored step.
 Every 50 steps it saves resumable checkpoints, exports HF
-weights and logs held-out SFT loss to W&B under `rwkv_direct_sft`. Periodic
+weights and logs held-out SFT loss to W&B under `skyrl-rwkv`. Periodic
 evaluation uses a fixed 512-row panel selected by UUID hash from the validation
 partition; the complete validation split remains in `DATA_DIR/validation`.
 SFT loss measures teacher-forced fit, rather than free-generation math accuracy.
@@ -944,9 +967,12 @@ periodic benchmarks. SFT loss evaluation and weight saving remain every
 50 steps. The launcher checks `BENCHMARK_INTERVAL` (default 500) before
 starting inference; other loss evaluations return no benchmark metrics.
 The native `eval_command` hook waits for generation and scoring, then merges
-the locally saved metrics with eval loss at the same training step. W&B
-uploads run in a separate CPU process after scoring and do not delay the
-next training step. A file lock serializes uploads to each evaluation run.
+the locally saved metrics with eval loss in the training run. The
+`eval/checkpoint_step` field records the evaluated training step, independently
+of upload time. Original-model metrics use `eval/base/*`; checkpoint metrics
+use `eval/sft/*`. Background CPU processes upload detailed result files to the
+same training run without opening another run or writing concurrent history.
+A single file lock serializes uploads for the training run.
 `EVAL_ONLY=1 EVAL_STEP=<step> BENCHMARK_INTERVAL=1` evaluates an existing
 export independently.
 
@@ -955,8 +981,8 @@ replicas to each model; subsequent rounds use all eight replicas for SFT.
 Each replica supports 1,024 concurrent sequences. The training workers remain
 resident while their unused CUDA allocator memory is released. Inference uses
 65% of each GPU and terminates before training continues. Scores are logged
-to the training run and to evaluation curves keyed by the checkpoint step.
-Each checkpoint has a separate output directory and W&B result artifact.
+to the training run's evaluation curves keyed by the checkpoint step.
+Each checkpoint has a separate output directory and W&B result files.
 This workflow only uploads to W&B.
 
 With RWKV and `fsdp_size=1`, save one complete model and Adam state on rank 0
@@ -978,7 +1004,12 @@ For the final AIME24, AIME25 and AIMO avg@256 evaluation, use
 `EVAL_ROOT="$OUTPUT_ROOT/evaluation/lighteval_avg256"`. This generates
 7,680, 7,680 and 2,560 completions respectively. The separate output root
 preserves the periodic avg@16 and Math500 avg@4 results; scores and artifacts
-are labeled avg@256 in the same W&B experiment. Upload-only retries must
+are labeled avg@256 in the same W&B training run. Standalone evaluation uploads
+resume that existing run after training has stopped, append the result with
+the evaluated checkpoint step, and retain its training success or failure status.
+The previous state is recorded in `eval/source_run_state`; interrupted runs remain
+failed after a standalone upload.
+Upload-only retries must
 use the same `EVAL_ROOT`.
 
 ## Antidoom FTPO with NoRA
@@ -1313,7 +1344,7 @@ Every 50 optimizer steps and at each epoch boundary, including the final step, t
 per-rank optimizer/scheduler/RNG states, and held-out FTPO loss on a fixed
 `--eval-max-samples` subset. The frozen base is identified by the exact model
 path instead of being copied into every checkpoint. W&B receives training and
-evaluation curves under `rwkv_antidoom`, plus training and merge metrics artifacts.
+evaluation curves under `skyrl-rwkv`, plus training and merge metrics artifacts.
 Training logs include cumulative examples, completed epoch fraction and the
 learning rate actually used by each optimizer update. Preference data and
 generation text remain in the experiment output directory.

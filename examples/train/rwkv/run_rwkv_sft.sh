@@ -53,32 +53,31 @@ evaluation_root, step, phase, run_path = sys.argv[1:]
 evaluation_root = Path(evaluation_root)
 root = evaluation_root / (f"global_step_{step}/sft" if phase == "sft" else "base")
 status = root / "upload_status.json"
-with (evaluation_root.parent / f".{phase}.upload.lock").open("a") as lock:
+with (evaluation_root.parent / ".wandb.upload.lock").open("a") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     status.write_text(json.dumps({"state": "uploading", "global_step": int(step), "pid": os.getpid()}) + "\n")
     try:
-        model_name = json.loads((root / "completed.json").read_text())["model_name"]
         scores = {path.parent.name: json.loads(path.read_text()) for path in root.glob("*/scores.json")}
-        samples = {selector: next(iter(rows.values()))["num_completions"] //
-                   next(iter(rows.values()))["num_questions"] for selector, rows in scores.items()}
-        entity, project, run_id = run_path.split("/")
-        run = wandb.init(entity=entity, project=project, id=f"{run_id}-eval-{phase}",
-                         resume="allow", name=f"{run_id}-{phase}-math-eval", group=run_id,
-                         job_type="evaluation", allow_val_change=True,
-                         config={"model_name": model_name, "phase": phase,
-                                 "avg_k": samples, "samples_per_question": samples,
-                                 "max_generated_tokens": 24576, "wkv_mode": "fp32io16"})
-        values = {f"eval/{phase}/{selector}/{key}": value for selector, rows in scores.items()
-                  for row in rows.values() for key, value in row.items()}
-        run.define_metric("eval/global_step")
-        run.define_metric(f"eval/{phase}/*", step_metric="eval/global_step")
-        run.log({**values, "eval/global_step": int(step)})
-        for selector, avg_k in samples.items():
-            artifact = wandb.Artifact(f"{run_id}-{phase}-{selector}-avg{avg_k}-step{step}",
-                                     type="evaluation")
-            artifact.add_dir(str(root / selector))
-            run.log_artifact(artifact).wait()
-        run.finish()
+        parent = wandb.Api().run(run_path)
+        for path in sorted(root.rglob("*")):
+            if path.is_file() and ".lighteval_cache" not in path.parts and path.name not in (
+                "upload.log", "upload.pid", "upload_status.json"
+            ):
+                parent.upload_file(str(path), root=str(evaluation_root.parent))
+        # During training, the native eval_command hook owns metric logging.
+        # Standalone evaluations append to that same run after training stops.
+        if parent.state in ("finished", "failed", "crashed", "killed"):
+            entity, project, run_id = run_path.split("/")
+            run = wandb.init(entity=entity, project=project, id=run_id, resume="must")
+            try:
+                values = {f"eval/{phase}/{selector}/{key}": value for selector, rows in scores.items()
+                          for row in rows.values() for key, value in row.items()}
+                run.define_metric("eval/checkpoint_step", hidden=True)
+                run.define_metric(f"eval/{phase}/*", step_metric="eval/checkpoint_step")
+                run.log({**values, "eval/checkpoint_step": 0 if phase == "base" else int(step)})
+                run.summary["eval/source_run_state"] = parent.state
+            finally:
+                run.finish(exit_code=0 if parent.state == "finished" else 1)
     except Exception as error:
         status.write_text(json.dumps({"state": "failed", "global_step": int(step),
                                       "pid": os.getpid(), "error": str(error)}) + "\n")
@@ -144,7 +143,7 @@ if [[ "${EVAL_ONLY:-0}" != 1 ]]; then
     ckpt_path="$OUTPUT_ROOT/checkpoints" export_path="$OUTPUT_ROOT/hf_exports" \
     ckpt_interval=50 eval_interval=50 hf_save_interval=50 \
     eval_before_train=true max_ckpts_to_keep=2 \
-    logger="$LOGGER" project_name=rwkv_direct_sft run_name="$RUN_NAME" \
+    logger="$LOGGER" project_name=skyrl-rwkv run_name="$RUN_NAME" \
     "${EVAL_OVERRIDES[@]}" \
     "$@"
 fi
@@ -354,4 +353,19 @@ PY
   for pid in "${PRODUCER_PIDS[@]}"; do
     wait "$pid"
   done
+  uv run --isolated --no-config --no-project "$PWD/.venv/bin/python" \
+    - "$EVAL_ROOT" "$EVAL_STEP" "${EVAL_PHASES[@]}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root, step, *phases = sys.argv[1:]
+root = Path(root)
+path = root / f"global_step_{step}/sft/eval_metrics.json"
+if "sft" in phases:
+    metrics = json.loads(path.read_text())
+    if "base" in phases:
+        metrics.update(json.loads((root / "base/eval_metrics.json").read_text()))
+    path.write_text(json.dumps(metrics, indent=2) + "\n")
+PY
 fi

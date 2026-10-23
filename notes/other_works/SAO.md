@@ -780,6 +780,18 @@ response_mask[:, 1:]
 
 验证：RWKV 相关测试分组运行 **69 passed**（数据/预训练 40、model wrapper 29），含采集→builder→训练数据契约、CLI、resume 去重和真实 RWKV HF checkpoint 的 BF16 / value-head 往返。GPU 训练验收尚未完成：本机最小 CUDA 内存查询就触发 OOM；没有据此宣称真实模型训练、收敛或多 GPU FSDP 已通过。数据构建链路已补齐：`examples/train/rwkv/rollout.py --sampling rollout --save-rollouts` 保存全部已评分的精确 token 轨迹；`examples/train/rwkv/build_value_data.py` 流式生成 `train.jsonl`、`validation.jsonl` 和 provenance manifest，按 question UUID 固定分组，不重分词、不做正负样本重平衡。完整 token IDs 按 question 暂存到磁盘，评分后先原子发布 shard，再记录 completed question；resume 不重复追加同一 question。默认剔除空响应、超长样本和没有显式 bootstrap returns 的截断样本，并记录计数，因此 MC 数据目标是满足完成/长度条件的轨迹分布。
 
+### 9.13 本项目在线 GAE 与 DIS + Score-Centering
+
+2026-10-15，在线部分补齐到原生接口：
+
+- `advantage_estimator=gae_adaptive`：通过原生 registry 分发，按 `response_mask & loss_mask` 跳过 observation/padding，只在有效 action 之间连接 TD residual 和 trace。Actor 默认使用 `max(0, 1 - 1/(1.5*l))`，critic 独立使用 `gae_adaptive.critic_lambd=1`；`mode=fixed` 可单独使用原有 `algorithm.lambd` 作为 actor lambda。内部 FP64 累积，输出 FP32 targets；不强制 whitening，由原生 Trainer 的 normalization/reduction 配置控制。
+- Response-level terminal reward 在该 estimator 下放到最后有效 action；已有 token-level rewards 保持生成器提供的 action-boundary 位置。完整轨迹在原生同步/fully async Trainer 中共用该 estimator。
+- `policy_loss_type=rollout_is` 复用已有 DIS；可选 `rollout_is.score_centering=true` 复用现有 FSDP/RWKV top-k sampler-support 采集、worker forward/backward 和 SC helper。对完整 `ratio * double-sided gate` 加权 score 做中心化，包含相同加权函数下的 head/tail correction，不再次按 sampled-action gate 屏蔽 correction。
+- SC 组合使用 temperature 1、top-p 1、top-k -1、无 penalty 的 rollout 分布，默认捕获 128 个 raw candidates；capture width 不改变 sampling top-k。该实验选项不叠加其他 off-policy correction 或 support replay。
+- 现有 `gae` 和其他算法的默认路径保留。配置和启动示例见 `examples/train/rwkv/README.md` 的 Online SAO and Score-Centering。
+
+验证：相关回归 **428 passed**；当前环境未安装 FlashAttention 的 3 个既有 packed-layout 测试未运行。覆盖 compressed-action GAE 对照、actor/critic lambda 分离、8k/BF16 trace 精度、Ray registry 重建、SC 加权梯度/常数 advantage 漂移抵消/top-k tail、FSDP worker train/eval 通道与原有 RWKV critic。Ruff、Black、gitleaks 通过。本轮未进行真实 RWKV GPU 端到端训练，尚未验证 SAO + SC 的收敛和效果收益。
+
 ### 9.14 RWKV critic 配方审计与 Channel-mixing 修正
 
 2026-10-21，重新对照原论文 §2、§3.2、§4.1、§4.3，以及固定版本的 `miles-values` 和 Fireworks experimental cookbook。两份代码是参考实现，不能视为论文作者公开的完整原始训练配方。

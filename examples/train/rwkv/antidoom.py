@@ -1321,7 +1321,7 @@ def train(args):
             import wandb
 
             run = wandb.init(
-                project="rwkv_antidoom",
+                project="skyrl-rwkv",
                 name=f"{Path(args.model).name}-antidoom-nora",
                 config={
                     **vars(args),

@@ -11,7 +11,6 @@ from transformers import AutoConfig
 from skyrl.backends.skyrl_train.distributed.dispatch import WorkerOutput
 from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
 from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
-    PrecisionType,
     should_use_meta_init,
 )
 from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
@@ -170,7 +169,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         if self.cfg.policy.model.lora.use_nora:
             return FsdpLoraWeightSource(self.model.model, dtype, weight_prefix)
 
-        return FsdpWeightSource(self.model.model, dtype, weight_prefix, rwkv_effective_bf16=self.model.is_rwkv)
+        return FsdpWeightSource(self.model.model, dtype, weight_prefix)
 
     async def _save_lora_adapters_and_sync(
         self,
@@ -372,14 +371,6 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
 
 
 class FSDPRefWorkerBase(RefWorkerBase):
-    @staticmethod
-    def _prepare_rwkv_inference_weights(layer, inputs):
-        # HF's FP16 path builds this transpose and then moves the original
-        # parameter to CPU. FSDP owns that parameter's storage. Prepare the same
-        # cache after FSDP's all-gather, keeping parameter placement unchanged.
-        if layer.mlp._value_runtime is None:
-            layer.mlp._value_runtime = layer.mlp.value.weight.t().contiguous()
-
     def init_model(self, model_path):
         assert self.cfg.strategy == "fsdp"
         strategy = FSDPStrategy(
@@ -407,19 +398,11 @@ class FSDPRefWorkerBase(RefWorkerBase):
             language_model_only=self.cfg.ref.language_model_only,
             logprobs_chunk_size=self.cfg.logprobs_chunk_size,
             rwkv_response_only_head=self.cfg.rwkv_response_only_head,
-            rwkv_inference_mode=(
-                model_config.model_type == "rwkv"
-                and self.cfg.ref.fsdp_config.mixed_precision is not None
-                and PrecisionType.to_dtype(self.cfg.ref.fsdp_config.mixed_precision.param_dtype) == torch.float16
-            ),
         )
         self._seq_parallel_monkey_patch(model=wrapped_model.model)
 
         self.model = strategy.prepare(wrapped_model)
         self.model.eval()
-        if wrapped_model.rwkv_inference_mode:
-            for layer in self.model.model.model.layers:
-                layer.register_forward_pre_hook(self._prepare_rwkv_inference_weights)
 
         self._set_expandable_segments(True)
 

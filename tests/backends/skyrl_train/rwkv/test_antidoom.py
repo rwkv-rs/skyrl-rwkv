@@ -786,8 +786,8 @@ def test_adapter_reference_reload_and_merged_logits_after_optimizer_step(tmp_pat
     actual = antidoom.last_logits(merged, prompt_ids, "cpu")
     torch.testing.assert_close(actual, adapted, atol=0.003, rtol=0.01)
     assert not any("lora_" in name for name, _ in merged.named_parameters())
-    assert merged.dtype == torch.float16
+    assert merged.dtype == torch.bfloat16
     reloaded = LlamaForCausalLM.from_pretrained(output, dtype="auto").eval()
-    assert reloaded.dtype == torch.float16
+    assert reloaded.dtype == torch.bfloat16
     torch.testing.assert_close(antidoom.last_logits(reloaded, prompt_ids, "cpu"), actual)
     assert json.loads((output / "merge_metrics.json").read_text())["merge_dtype"] == "float32"

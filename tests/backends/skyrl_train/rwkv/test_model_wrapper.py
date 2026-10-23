@@ -422,14 +422,14 @@ def test_rwkv_weight_source_matches_metadata_and_fsdp_bf16_forward_dtype(monkeyp
     weights = torch.tensor([1.003, -2.007], dtype=torch.float32)
     model = torch.nn.Module()
     model.register_parameter("weight", torch.nn.Parameter(weights))
-    source = FsdpWeightSource(model, torch.float16, rwkv_effective_bf16=True)
+    source = FsdpWeightSource(model, torch.bfloat16)
     metadata = source.metadata()
     [(name, actual)] = list(source)
 
     assert metadata[0].name == name == "weight"
-    assert metadata[0].dtype == actual.dtype == torch.float16
+    assert metadata[0].dtype == actual.dtype == torch.bfloat16
     assert metadata[0].shape == tuple(actual.shape) == (2,)
-    assert torch.equal(actual, weights.to(torch.bfloat16).to(torch.float16))
+    assert torch.equal(actual, weights.to(torch.bfloat16))
     assert not torch.equal(actual, weights.to(torch.float16))
     [(name, direct)] = list(FsdpWeightSource(model, torch.float16))
     assert torch.equal(direct, weights.to(torch.float16))
@@ -495,8 +495,7 @@ def test_non_rwkv_model_keeps_direct_forward_path():
     assert torch.equal(model.calls[0][1]["attention_mask"], attention_mask)
 
 
-@pytest.mark.parametrize("inference_mode", [False, True])
-def test_rwkv_disables_outer_autocast_without_changing_direct_forward(inference_mode):
+def test_rwkv_disables_outer_autocast_without_changing_direct_forward():
     sequences = torch.tensor([[1, 2, 3]])
     attention_mask = torch.ones_like(sequences)
     rwkv_model = AutocastAwareToyCausalLM("rwkv")
@@ -505,14 +504,12 @@ def test_rwkv_disables_outer_autocast_without_changing_direct_forward(inference_
     direct_model.eval()
 
     with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
-        HFModelWrapper(rwkv_model, rwkv_inference_mode=inference_mode)(
-            sequences, num_actions=2, attention_mask=attention_mask
-        )
+        HFModelWrapper(rwkv_model)(sequences, num_actions=2, attention_mask=attention_mask)
         HFModelWrapper(direct_model)(sequences, num_actions=2, attention_mask=attention_mask)
 
     assert rwkv_model.autocast_states == [False]
     assert direct_model.autocast_states == [True]
-    assert rwkv_model.training_states == [not inference_mode]
+    assert rwkv_model.training_states == [True]
     assert direct_model.training_states == [False]
     assert not rwkv_model.training
 
@@ -589,8 +586,7 @@ def test_critic_warm_start_keeps_fresh_optimizer_and_scheduler(monkeypatch, resu
     assert not optimizer.state
 
 
-@pytest.mark.parametrize("inference_mode", [False, True])
-def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch, inference_mode):
+def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):
     config = SimpleNamespace(
         model_type="rwkv",
         vision_config=None,
@@ -617,12 +613,12 @@ def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch, i
         fake_from_pretrained,
     )
 
-    wrapper = HFModelWrapper("rwkv-checkpoint", bf16=False, rwkv_inference_mode=inference_mode)
+    wrapper = HFModelWrapper("rwkv-checkpoint", bf16=False)
 
     assert wrapper.is_rwkv
     assert "attn_implementation" not in captured_kwargs
     assert not hasattr(config, "_attn_implementation")
-    assert captured_kwargs["torch_dtype"] == (torch.float16 if inference_mode else torch.float32)
+    assert captured_kwargs["torch_dtype"] == torch.float32
 
 
 @pytest.mark.parametrize(
@@ -760,38 +756,6 @@ def test_rwkv_fully_async_requires_cache_reset_before_fsdp_prepare(monkeypatch, 
         with pytest.raises(ValueError, match="clear_kv_cache_on_weight_sync=True"):
             worker.init_model("checkpoint")
         strategy.prepare.assert_not_called()
-
-
-@pytest.mark.parametrize("model_type", ["rwkv", "llama"])
-@pytest.mark.parametrize("param_dtype", [None, "bf16", "fp16"])
-def test_reference_inference_mode_only_for_explicit_fp16_rwkv(monkeypatch, model_type, param_dtype):
-    from unittest.mock import MagicMock
-
-    from skyrl.backends.skyrl_train.workers.fsdp import fsdp_worker as module
-    from skyrl.train.config import MixedPrecisionConfig, SkyRLTrainConfig
-
-    cfg = SkyRLTrainConfig().trainer
-    if param_dtype is not None:
-        cfg.ref.fsdp_config.mixed_precision = MixedPrecisionConfig(param_dtype=param_dtype)
-    wrapper = HFModelWrapper(ToyCausalLM(model_type))
-    strategy = MagicMock()
-    strategy.prepare.return_value = wrapper
-    monkeypatch.setattr(module, "FSDPStrategy", lambda **kwargs: strategy)
-    monkeypatch.setattr(
-        module.AutoConfig,
-        "from_pretrained",
-        lambda *args, **kwargs: SimpleNamespace(model_type=model_type, tie_word_embeddings=False),
-    )
-    monkeypatch.setattr(module, "should_use_meta_init", lambda **kwargs: False)
-    factory = MagicMock(return_value=wrapper)
-    monkeypatch.setattr(module, "HFModelWrapper", factory)
-    worker = object.__new__(module.FSDPRefWorkerBase)
-    worker.cfg = cfg
-    worker._seq_parallel_monkey_patch = MagicMock()
-    worker._set_expandable_segments = MagicMock()
-    worker.init_model("checkpoint")
-    assert factory.call_args.kwargs["rwkv_inference_mode"] == (model_type == "rwkv" and param_dtype == "fp16")
-    assert not worker.model.training
 
 
 @pytest.mark.parametrize(

@@ -37,7 +37,6 @@ from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
     FSDPRefWorkerBase,
 )
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
-from skyrl.train.config import MixedPrecisionConfig
 
 
 def reference_loss_gradient(data, log_probs, config):
@@ -352,8 +351,7 @@ def compare_teacher_precision(args, cfg, rank, world, emit):
     variants = args.precision_variants
     for variant in variants:
         worker = None
-        if variant == "native_fp16":
-            cfg.trainer.ref.fsdp_config.mixed_precision = MixedPrecisionConfig(param_dtype="fp16")
+        if variant == "native":
             worker = object.__new__(FSDPRefWorkerBase)
             worker.cfg = cfg.trainer
             worker.sequence_parallel_size = cfg.trainer.ref.sequence_parallel_size
@@ -363,15 +361,8 @@ def compare_teacher_precision(args, cfg, rank, world, emit):
             model = load_model(adapter_config["base_model_name_or_path"], args.teacher_adapter)
         else:
             model = AutoModelForCausalLM.from_pretrained(
-                cfg.trainer.ref.model.path,
-                dtype=torch.bfloat16 if variant == "merged_bf16" else torch.float16,
-                wkv_mode="fp32io16",
+                cfg.trainer.ref.model.path, dtype=torch.bfloat16, wkv_mode="fp32io16"
             )
-            if variant == "rounded_fp16":
-                # Keep the FP16 execution path, changing only stored weight values.
-                with torch.no_grad():
-                    for parameter in model.parameters():
-                        parameter.copy_(parameter.bfloat16().half())
         if worker is None:
             model.to("cuda").eval()
         measurements = []
@@ -388,7 +379,7 @@ def compare_teacher_precision(args, cfg, rank, world, emit):
             with torch.no_grad(), torch.autocast("cuda", enabled=False):
                 logp = model(input_ids=ids, use_cache=False, logits_to_keep=positions).logits[0]
                 logp = logp.float().log_softmax(-1).cpu()
-            if variant == "merged_fp16":
+            if variant == "merged_bf16":
                 targets.append(logp)
             target = targets[row_index]
             actions = torch.tensor(response)[offsets, None]
@@ -462,8 +453,8 @@ def main():
     parser.add_argument(
         "--precision-variants",
         nargs="+",
-        choices=("merged_fp16", "rounded_fp16", "merged_bf16", "unmerged_nora", "native_fp16"),
-        default=["merged_fp16", "rounded_fp16", "merged_bf16", "unmerged_nora"],
+        choices=("merged_bf16", "unmerged_nora", "native"),
+        default=["merged_bf16", "unmerged_nora"],
     )
     parser.add_argument("--scored-input", type=Path, help="Saved native TOP-D input before advantage scaling")
     parser.add_argument("--comparison-checkpoints", type=Path, nargs="*", default=[])
@@ -481,8 +472,8 @@ def main():
     args = parser.parse_args()
     if args.mode == "precision" and args.teacher_adapter is None:
         parser.error("precision requires --teacher-adapter")
-    if args.mode == "precision" and args.precision_variants[0] != "merged_fp16":
-        parser.error("precision comparisons must start with merged_fp16")
+    if args.mode == "precision" and args.precision_variants[0] != "merged_bf16":
+        parser.error("precision comparisons must start with merged_bf16")
     rank = int(os.environ["LOCAL_RANK"])
     world = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(rank)

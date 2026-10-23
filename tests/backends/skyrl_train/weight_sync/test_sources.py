@@ -120,8 +120,6 @@ class TestFsdpLoraWeightSource:
             iter_merged_lora_weights,
         )
 
-        if "use_nora" not in LoraConfig.__dataclass_fields__:
-            pytest.skip("requires Joluck/NoRA")
         base = RwkvForCausalLM(
             RwkvConfig(
                 vocab_size=32,

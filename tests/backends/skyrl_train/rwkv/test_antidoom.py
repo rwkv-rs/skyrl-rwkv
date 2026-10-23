@@ -696,10 +696,7 @@ def test_prepare_groups_siblings_and_keeps_original_validation_prompts(tmp_path,
     "use_nora",
     [
         False,
-        pytest.param(
-            True,
-            marks=pytest.mark.skipif("use_nora" not in LoraConfig.__dataclass_fields__, reason="requires Joluck/NoRA"),
-        ),
+        True,
     ],
 )
 @pytest.mark.parametrize("adapt_head", [False, True])

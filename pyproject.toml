@@ -142,6 +142,9 @@ rwkv = [
     "vllm; sys_platform == 'linux'",
     "FlashRWKV2==0.1.0a16; sys_platform == 'linux'",
     "tokenizers; sys_platform == 'linux'",
+    # Native RWKV LightEval benchmarks and rollout summary plots.
+    "lighteval; sys_platform == 'linux'",
+    "matplotlib",
 ]
 
 megatron = [
@@ -320,6 +323,8 @@ override-dependencies = [
     { package = { name = "megatron-bridge" }, dependencies = ["transformers>=5.6.1,<=5.16.1; sys_platform == 'linux'"] },
     # Keep the RWKV Transformers source selected by this project.
     { package = { name = "vllm", version = "0.23.1rc1.dev5450+g7e2db182c.rwkv" }, dependencies = ["transformers==5.16.0.dev0; sys_platform == 'linux'"] },
+    # NoRA PEFT fork (based on PEFT 0.19.2.dev0) for RWKV NoRA training and merging.
+    "peft @ git+https://github.com/Joluck/NoRA@4669c35ce0ffd027456272ee5050c0f58ac8d22a#subdirectory=peft",
     "megatron-core>=0.16.0; sys_platform == 'linux'",
     "ml_dtypes>=0.5.0; sys_platform == 'linux'",
     # `nixl` hard-depends on both nixl-cu12 and nixl-cu13; drop the cu12 variant
@@ -355,7 +360,8 @@ override-dependencies = [
     #     tilelang 0.1.9  + ffi 0.1.12  -> AttributeError
     #     tilelang 0.1.13 + ffi 0.1.12  -> import OK
     # 0.1.13 is the first tilelang whose bound (`>=0.1.11,<0.1.13`) admits 0.1.12.
-    "tilelang==0.1.13; sys_platform == 'linux'",
+    # FlashRWKV2 0.1.0a16 pins tilelang==0.1.15, which keeps the same ffi bound.
+    "tilelang==0.1.15; sys_platform == 'linux'",
     "apache-tvm-ffi==0.1.12; sys_platform == 'linux'",
     "nvidia-cutlass-dsl[cu13]==4.7.1; sys_platform == 'linux'",
     "quack-kernels[cu13]==0.6.5; sys_platform == 'linux'",
@@ -378,6 +384,21 @@ name = "flashinfer-cubin"
 version = "0.6.18.post1"
 requires-python = ">=3.8"
 requires-dist = []
+
+# lighteval-rwkv pins latex2sympy2_extended==1.0.6; keep SkyRL's math-verify parser
+# version. The last four packages come from its vLLM backend's optional imports.
+[[tool.uv.dependency-metadata]]
+name = "lighteval"
+version = "0.13.1.dev0"
+requires-python = ">=3.10"
+requires-dist = [
+    "transformers>=4.54.0", "inspect-ai>=0.3.140", "openai", "accelerate", "huggingface_hub[hf_xet]>=0.30.2",
+    "torch>=2.0,<3.0", "GitPython>=3.1.41", "datasets>=4.0.0", "pydantic", "pillow", "numpy>=2", "hf-xet>=1.1.8",
+    "typer>=0.20.0", "termcolor==2.3.0", "pytablewriter", "rich", "colorlog", "aenum==3.1.15", "nltk==3.10.3",
+    "scikit-learn", "sacrebleu", "rouge_score==0.1.2", "sentencepiece>=0.1.99", "protobuf", "pycountry",
+    "fsspec>=2023.12.2", "httpx[socks]>=0.27.2", "langcodes",
+    "aiolimiter", "diskcache", "more-itertools", "jsonlines",
+]
 
 [[tool.uv.dependency-metadata]]
 name = "mamba-ssm"
@@ -489,6 +510,7 @@ skyrl-gym = { path = "./skyrl-gym", editable = true }
 skycap = { path = "./skycap", editable = true }
 transformers = { git = "https://github.com/rwkv-rs/transformers-rwkv", rev = "f163615d2a7c60aa1df5c292874d56cbe878219f", extra = "rwkv" }
 vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "7e2db182cc3e89239ff7c867f275bcfcb09cc105", extra = "rwkv" }
+lighteval = { git = "https://github.com/rwkv-rs/lighteval-rwkv", rev = "c5475e27a1e58184c9a6cdbd30572ec1ae601dd7", extra = "rwkv" }
 tokenizers = { git = "https://github.com/rwkv-rs/tokenizers-rwkv", rev = "c5d8dde5ff49c70e4656199d5033a84e03c21b2b", subdirectory = "bindings/python", extra = "rwkv" }
 # Match torch's CUDA variant (cu130).
 flashinfer-jit-cache = { index = "flashinfer-cu130", marker = "sys_platform == 'linux'" }

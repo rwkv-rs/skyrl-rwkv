@@ -536,6 +536,14 @@ The defaults use a BF16 Trainer, BF16 vLLM-RWKV inference, 8 GPUs, eight TP1 col
 MODEL_DIR="$MODEL_DIR" bash examples/train/rwkv/run_rwkv_grpo.sh
 ```
 
+The Trainer and vLLM-RWKV share FlashRWKV2's BF16 forward and produce identical FP32
+logits. The RWKV forward computes sampled-token logprobs with vLLM's own log-softmax
+kernel, so full-parameter training gives bitwise-equal rollout and trainer logprobs:
+`policy/rollout_train_logprobs_abs_diff_max` is exactly 0 before and after each update.
+NoRA weight sync and HF export merge each adapter in FP32 on the current CUDA device and
+convert the result to BF16 once, so rollouts match the exported merged model bitwise. The
+unmerged NoRA training forward uses different arithmetic and is not bitwise equal.
+
 Choose `MICRO_BATCH_SIZE` for the available GPU memory while keeping global train and policy mini-batch sizes fixed. Successful acceptance requires all 50 optimizer steps, every trainer-to-inference weight update, aligned rollout token/logprob/loss-mask lengths, finite logprob-difference metrics without abnormal jumps, step-50 checkpoint/export/eval artifacts, and an online W&B run containing training, reward, evaluation, system-resource, and logprob-alignment curves.
 
 ## On-policy distillation

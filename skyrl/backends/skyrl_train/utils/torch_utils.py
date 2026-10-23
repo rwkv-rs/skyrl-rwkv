@@ -154,6 +154,44 @@ def logprobs_from_logits_flash_attn(logits, labels, inplace_backward=True):
     return -output[0]
 
 
+class _VLLMTokenLogprobs(torch.autograd.Function):
+    """vLLM's sampled-token log-softmax with the analytic cross-entropy gradient.
+
+    The forward runs vLLM's own reduction, so FP32 logits equal to the rollout's
+    give bitwise-equal logprobs.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, labels):
+        from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
+
+        logprobs = compute_token_logprobs(logits, labels[:, None])[:, 0]
+        ctx.save_for_backward(logits, labels, logprobs)
+        return logprobs
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        logits, labels, logprobs = ctx.saved_tensors
+        rows = torch.arange(labels.numel(), device=labels.device)
+        log_normalizer = logits[rows, labels] - logprobs
+        grad_logits = (logits - log_normalizer[:, None]).exp_().mul_(-grad_output[:, None])
+        grad_logits[rows, labels] += grad_output
+        return grad_logits, None
+
+
+def logprobs_from_logits_vllm(
+    logits: Float[torch.Tensor, "batch_size seqlen vocab_size"],
+    labels: Integer[torch.Tensor, "batch_size seqlen"],
+) -> Float[torch.Tensor, "batch_size seqlen"]:
+    """Per-token log-probabilities computed by vLLM's rollout logprob kernel."""
+    # The vLLM kernel is a CUDA Triton kernel.
+    if not logits.is_cuda:
+        return logprobs_from_logits(logits, labels)
+    batch_dim = logits.shape[:-1]
+    output = _VLLMTokenLogprobs.apply(logits.reshape(-1, logits.shape[-1]).float().contiguous(), labels.reshape(-1))
+    return output.view(*batch_dim)
+
+
 # Credits: https://www.tylerromero.com/posts/2025-02-selective-log-softmax/
 # https://github.com/volcengine/verl/pull/220
 def logprobs_from_logits_v2(

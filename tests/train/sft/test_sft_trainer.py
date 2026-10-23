@@ -110,7 +110,7 @@ def test_sft_run_eval_merges_checkpoint_benchmark_metrics(mock_dispatch, monkeyp
 
     monkeypatch.setattr("skyrl.train.sft_trainer.subprocess.run", benchmark)
     metrics, _ = trainer.run_eval()
-    assert metrics == {"evalset/loss": 0.31, "sft/math_500/avg@16": 0.25}
+    assert metrics == {"evalset/loss": 0.31, "sft/math_500/avg@16": 0.25, "checkpoint_step": 1100}
     assert trainer.global_step == 1100
 
 

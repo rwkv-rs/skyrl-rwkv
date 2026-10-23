@@ -367,7 +367,7 @@ def main(argv=None):
         "--fsdp-size", type=int, default=-1, help="FSDP shard size; -1 uses all ranks, 1 replicates the base"
     )
     parser.add_argument("--report-to", choices=("wandb", "none"), default="wandb")
-    parser.add_argument("--wandb-project", default="rwkv-value-pretraining")
+    parser.add_argument("--wandb-project", default="skyrl-rwkv")
     parser.add_argument("--run-name", default=None)
     args = parser.parse_args(argv)
     if args.loss_reduction == "seq_mean_token_sum_norm" and (args.max_seq_len is None or args.max_seq_len <= 0):

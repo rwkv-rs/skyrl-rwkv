@@ -70,6 +70,8 @@ def iter_merged_lora_weights(model, state_dict=None):
     Use AntiDoom's FP32 column normalization and merge precision. Materialize one
     projection at a time so FSDP weight transfer can stream from sharded models.
     ``state_dict`` may supply already gathered PEFT weights for an HF export.
+    The merge runs on the current CUDA device so weight sync and CPU-offloaded
+    HF exports produce identical bytes; each result returns to its source device.
     """
     from peft.tuners.lora import LoraLayer
 
@@ -79,6 +81,7 @@ def iter_merged_lora_weights(model, state_dict=None):
     else:
         state_dict = {name.removeprefix("base_model.model."): tensor for name, tensor in state_dict.items()}
     modules = dict(base_model.named_modules())
+    merge_device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
 
     def materialize(tensor):
         return tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
@@ -99,13 +102,15 @@ def iter_merged_lora_weights(model, state_dict=None):
             module_name = name.removesuffix(".base_layer.weight")
             layer = modules[module_name]
             assert isinstance(layer, LoraLayer)
-            weight = weight.float()
+            source_device = weight.device
+            weight = weight.to(merge_device).float()
             for adapter in layer.active_adapters:
-                weight_a = materialize(state_dict[f"{module_name}.lora_A.{adapter}.weight"]).float()
-                weight_b = materialize(state_dict[f"{module_name}.lora_B.{adapter}.weight"]).float()
+                weight_a = materialize(state_dict[f"{module_name}.lora_A.{adapter}.weight"]).to(merge_device).float()
+                weight_b = materialize(state_dict[f"{module_name}.lora_B.{adapter}.weight"]).to(merge_device).float()
                 if layer.use_nora.get(adapter) is True:
                     weight_a = weight_a / (weight_a.norm(dim=0, keepdim=True) + 1e-6)
                 weight = weight + (weight_b @ weight_a) * layer.scaling[adapter]
+            weight = weight.to(source_device)
         yield name.replace(".base_layer.", "."), weight
 
 

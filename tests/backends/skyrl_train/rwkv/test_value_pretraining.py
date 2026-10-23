@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from peft import LoraConfig, PeftModel
+from peft import PeftModel
 
 from skyrl.backends.skyrl_train.workers.model_wrapper import (
     _get_critic_model,
@@ -227,7 +227,6 @@ def test_rwkv_critic_checkpoint_round_trip_uses_native_bf16(tmp_path, rwkv_check
         torch.testing.assert_close(restored.state_dict()[key], value, rtol=0, atol=0)
 
 
-@pytest.mark.skipif("use_nora" not in LoraConfig.__dataclass_fields__, reason="requires Joluck/NoRA")
 @pytest.mark.parametrize("rank", [8, 16])
 @pytest.mark.parametrize("freeze_backbone", [False, True])
 @pytest.mark.parametrize("target_modules", [["v_proj", "o_proj"], ["mlp.key", "mlp.value"]])
@@ -326,9 +325,6 @@ def test_rwkv_nora_critic_updates_and_exports_full_head(
 @pytest.mark.parametrize("rank", [0, 8])
 def test_rwkv_head_only_critic_keeps_backbone_and_adapters_fixed(rwkv_checkpoint, monkeypatch, rank):
     from transformers import RwkvModel
-
-    if rank and "use_nora" not in LoraConfig.__dataclass_fields__:
-        pytest.skip("requires Joluck/NoRA")
 
     def causal_forward(self, input_ids, use_cache):
         hidden = self.embed_tokens(input_ids).cumsum(1)

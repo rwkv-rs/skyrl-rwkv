@@ -18,7 +18,7 @@ This recipe runs the native SkyRL FSDP Trainer, vLLM InferenceEngines, weight sy
 - `wkv_mode`: `fp32io16`
 - Expected weight dtype: BF16 Safetensors
 
-The `[rwkv]` extra pins the matching Transformers, tokenizer, vLLM-RWKV, FlashRWKV2, and torch cu130 dependency chain. Use the project-local `.venv`; do not reuse another project's environment.
+The `[rwkv]` extra pins the matching Transformers, tokenizer, vLLM-RWKV, FlashRWKV2, and torch cu130 dependency chain, together with native LightEval-RWKV. The project overrides PEFT with [Joluck/NoRA](https://github.com/Joluck/NoRA)'s fork at `4669c35ce0ffd027456272ee5050c0f58ac8d22a`. Use the project-local `.venv`; do not reuse another project's environment.
 
 ```bash
 uv sync --extra rwkv
@@ -54,7 +54,7 @@ external engines instead of starting local ones. `--concurrency`, `--max-num-seq
 
 Prompts are rendered and tokenized once per question. Serialized token-input requests are reused
 for its 64 samples, which are assigned to the least-loaded engine together for prefix reuse.
-The engines use `--skip-tokenizer-init`, `generation_config=vllm`, FP16 weights, FP32 recurrent
+The engines use `--skip-tokenizer-init`, `generation_config=vllm`, BF16 weights, FP32 recurrent
 states, prefix caching, and 8,192-token chunked prefill. Token-only completions are decoded locally;
 Math retains the exact final generated token for strict EOS checking. Evaluation sampling remains
 temperature 0.96, top-p 0.76, top-k 32, presence penalty 1.0, frequency penalty 0.1, and penalty decay 0.988.
@@ -232,8 +232,7 @@ uv run --isolated --no-project .venv/bin/torchrun --standalone --nproc-per-node=
   > /tmp/results_rwkv_value_pretraining.log 2>&1
 ```
 
-Install the pinned NoRA PEFT fork from "Antidoom FTPO with NoRA" before using
-`--use-nora`. NoRA freezes the original backbone weights and trains Channel-mixing
+NoRA freezes the original backbone weights and trains Channel-mixing
 adapters on `mlp.key` and `mlp.value`, together with the complete FP32 `value_head`.
 This keeps the Time-mixing parameters fixed, following SAO's frozen-attention
 design as an RWKV adaptation choice. It reuses the existing fused FlashRWKV2
@@ -531,7 +530,7 @@ existing W&B display name does not rename its output directory or checkpoints.
 
 ## Run
 
-The defaults use a BF16 Trainer, FP16 vLLM-RWKV inference, 8 GPUs, eight TP1 colocated inference engines, GRPO, `train_batch_size=64`, four samples per prompt, global policy mini-batch 64, per-GPU micro-batch 2, gradient checkpointing, and one optimizer step per training step. Step 50 runs evaluation and writes both a resumable checkpoint and an HF export.
+The defaults use a BF16 Trainer, BF16 vLLM-RWKV inference, 8 GPUs, eight TP1 colocated inference engines, GRPO, `train_batch_size=64`, four samples per prompt, global policy mini-batch 64, per-GPU micro-batch 2, gradient checkpointing, and one optimizer step per training step. Step 50 runs evaluation and writes both a resumable checkpoint and an HF export.
 
 ```bash
 MODEL_DIR="$MODEL_DIR" bash examples/train/rwkv/run_rwkv_grpo.sh
@@ -594,7 +593,7 @@ TEACHER_MODEL="$HOME/Weights/RWKV/hf/rwkv7-g1k-13.3b-20260930-ctx25600-antidoom-
 ```
 
 Defaults: 8 colocated GPUs, eight TP1 student inference engines, BF16 student training,
-FP16 frozen-teacher scoring and inference with `wkv_mode=fp32io16`, gradient checkpointing,
+frozen-teacher scoring and inference with `wkv_mode=fp32io16`, gradient checkpointing,
 512 prompts per batch, one completion per prompt, policy mini-batch 512, per-GPU
 micro-batch 4 for training and forward passes, and AdamW LR `2e-6`.
 Each fresh rollout batch produces one optimizer
@@ -605,24 +604,9 @@ and disabled penalties. Evaluation uses temperature `0.96`, top-p `0.76`, top-k 
 presence penalty `1.0`, frequency penalty `0.1`, penalty decay `0.988`, and 32 samples
 per prompt.
 
-The merged AntiDoom teacher retains its exported FP16 weights. Its FSDP reference
-worker selects the native FP16 forward path and preserves FP32 recurrent states;
-the student continues to use BF16 forward/backward. `TEACHER_DTYPE=bfloat16`
-selects BF16 reference scoring for an explicit precision comparison.
-The teacher's input embedding and its norm use the native inference BF16 dtype,
-established before FSDP wraps the frozen parameters. ChannelMix transposes are
-built after each layer's all-gather while FSDP retains ownership of parameter
-placement. These dtypes and caches remain valid across CPU offload and GPU reload.
-
-Long-context FP16 teacher scoring can produce WKV readouts larger than 65504.
-The optional `trainer.ref.model_config_kwargs.wkv_output_dtype=float32` keeps
-the recurrent output and its head normalization in FP32 while preserving the
-exported FP16 weights. This requires FlashRWKV2's FP32-output/readout support
-and the corresponding `transformers-rwkv` config support in the prepared
-environment. The validated local revisions are FlashRWKV2
-`fd29c063aeecc27ef0142e9bce28331fdc846831` and `transformers-rwkv`
-`b8643244727e7d5e1c4a2be90c26e6bb5118f3b8`; the public dependency pins do not
-yet include these patches. Record the installed revisions with the run config.
+The frozen AntiDoom teacher and the student both execute in BF16 with FP32 WKV
+state. The teacher's FSDP reference worker scores fixed rollouts with the same
+FlashRWKV2 operators as the student forward.
 
 `MAX_GENERATE_LENGTH=16384` extends the training response horizon. With TOP-D or
 STOPD, each request is limited by the remaining space in the configured
@@ -668,7 +652,7 @@ Training metrics, evaluation scores, and sampled trajectories are uploaded to W&
 detailed training rollout dumps are written under `$OUTPUT_ROOT/exports/dumped_rollouts`.
 `OUTPUT_ROOT` defaults to `$HOME/skyrl-rwkv-runs/$RUN_NAME`.
 
-`STUDENT_MODEL`, `TEACHER_MODEL`, `TEACHER_DTYPE`, `MAX_GENERATE_LENGTH`, `DATA_DIR`, `TRAIN_FILE`, `TEST_FILE`, `NUM_GPUS`,
+`STUDENT_MODEL`, `TEACHER_MODEL`, `MAX_GENERATE_LENGTH`, `DATA_DIR`, `TRAIN_FILE`, `TEST_FILE`, `NUM_GPUS`,
 `MICRO_BATCH_SIZE`, `MICRO_FORWARD_BATCH_SIZE`, `MINI_BATCH_SIZE`, `LR`, `USE_NORA`,
 `LORA_RANK`, `LORA_ALPHA`, `LORA_TARGET_MODULES`, `LOGGER`, `RUN_NAME`, and `OUTPUT_ROOT`
 accept environment overrides.
@@ -699,8 +683,7 @@ for explicit checkpoint resumption and the paired eight-GPU benchmark.
 ### Optional NoRA policy
 
 The launcher enables NoRA by default, using the same PEFT fork and FP32 normalization
-as AntiDoom. Install the pinned fork with the command in "Antidoom FTPO with NoRA"
-after preparing the RWKV environment, then warm the exact interpreter's native cache:
+as AntiDoom. Warm the exact interpreter's native cache:
 
 ```bash
 MAX_JOBS=2 bash examples/train/rwkv/run_rwkv_on_policy_distill.sh --prepare-flashrwkv2 \
@@ -726,7 +709,7 @@ With policy `fsdp_size=1`, every GPU keeps a complete frozen base and synchroniz
 adapter gradients once per optimizer step. The teacher shards its parameters across
 all eight GPUs to reduce host storage during colocation offload.
 Weight sync computes the normalized update and adds it to each base projection in
-FP32, then streams complete FP16 weights through the native transfer engine.
+FP32, then streams complete BF16 weights through the native transfer engine.
 It leaves the live training parameters untouched and resets recurrent inference
 caches through the existing weight-sync lifecycle. Resumable checkpoints retain
 the adapter and optimizer; periodic HF exports contain complete merged weights.
@@ -1157,8 +1140,8 @@ SQL
 `export-benchmarks` reads the producer's
 [native RWKV task registry](https://github.com/rwkv-rs/lighteval-rwkv/tree/c5475e27a1e58184c9a6cdbd30572ec1ae601dd7)
 using **this project's interpreter**. Keep that source checkout at the stated
-revision. Install its dataset-loader dependencies in the SkyRL `.venv`, with
-existing package versions constrained:
+revision. The `[rwkv]` extra installs LightEval-RWKV and its dataset-loader
+dependencies. Its fixed math-parser versions are installed only while exporting:
 
 ```bash
 uv run --isolated --no-config --no-project uv pip freeze \
@@ -1166,18 +1149,6 @@ uv run --isolated --no-config --no-project uv pip freeze \
   > /tmp/antidoom_existing_constraints.txt 2> /tmp/results_antidoom_constraints.log
 rg '^(antlr4-python3-runtime|latex2sympy2-extended)==' \
   /tmp/antidoom_existing_constraints.txt > /tmp/antidoom_math_constraints.txt
-uv run --isolated --no-config --no-project uv pip install \
-  --python .venv/bin/python --constraint /tmp/antidoom_existing_constraints.txt \
-  'inspect-ai>=0.3.140' 'GitPython>=3.1.41' 'termcolor==2.3.0' \
-  pytablewriter colorlog 'aenum==3.1.15' 'nltk==3.10.3' scikit-learn \
-  sacrebleu 'rouge-score==0.1.2' sentencepiece pycountry langcodes jsonlines \
-  aiolimiter diskcache more-itertools \
-  > /tmp/results_antidoom_export_install.log 2>&1
-uv run --isolated --no-config --no-project uv pip install \
-  --python .venv/bin/python --no-deps \
-  'lighteval @ git+https://github.com/rwkv-rs/lighteval-rwkv@c5475e27a1e58184c9a6cdbd30572ec1ae601dd7' \
-  > /tmp/results_antidoom_native_export_install.log 2>&1
-# Use the native registry's fixed math-parser versions while exporting.
 uv run --isolated --no-config --no-project uv pip install \
   --python .venv/bin/python --no-deps \
   'latex2sympy2-extended==1.0.6' 'antlr4-python3-runtime==4.13.2' \
@@ -1236,19 +1207,7 @@ The mix revision defaults to `79ff2d479c5e59ea9973a66a7ca9ce8b703f9c7b`.
 Every added row contains only its original prompt and source metadata. All
 model responses are generated with the selected RWKV checkpoint in the next step.
 
-Install [Joluck/NoRA](https://github.com/Joluck/NoRA)'s PEFT fork in the project's
-existing RWKV `.venv`. Its fixed revision is
-`4669c35ce0ffd027456272ee5050c0f58ac8d22a`. This replaces PEFT with
-`0.19.2.dev0` without changing the other installed packages. The project lock
-continues to pin the standard PEFT dependency. Run this example through the
-explicit project interpreter so a project sync does not replace NoRA.
-
 ```bash
-uv run --isolated --no-config --no-project uv pip install \
-  --python .venv/bin/python --no-deps \
-  'peft @ git+https://github.com/Joluck/NoRA@4669c35ce0ffd027456272ee5050c0f58ac8d22a#subdirectory=peft' \
-  > /tmp/results_antidoom_install.log 2>&1
-
 # Download the original Transformers checkpoint from the official RWKV repo.
 uv run --isolated --no-config --no-project .venv/bin/hf download \
   rwkv-rs/rwkv7-g1-st --revision b672701cccf4bddcc66f65c8c9a468b776c9836a \
@@ -1361,8 +1320,8 @@ backward. WKV recurrence retains its existing implementation. ChannelMix
 five targets above preserve this example's training recipe. Each sample's
 hidden state is selected before the output-head projection, so a batch of B
 samples produces B vocabulary rows. PEFT continues to manage disabling,
-saving, loading, and merging adapters. Native FP16 inference absorbs Head
-and any ChannelMix adapters before the full-model merge probe. Each FTPO
+saving, loading, and merging adapters. The merge absorbs Head and any
+ChannelMix adapters before the full-model merge probe. Each FTPO
 sample scores a single next-token position. The loss keeps the notebook's
 margin 2, non-target logit MSE coefficient 0.4, target coefficient 0.05 and
 target tolerance 0.5. Reference logits come from the frozen base with the
@@ -1411,7 +1370,7 @@ adapter is automatically absorbed with `merge_and_unload(safe_merge=True)`.
 `train/merged` contains full HF weights, tokenizer, generation configurations
 and `merge_metrics.json`. NoRA's column normalization is computed in FP32,
 then the updates are absorbed in FP32 and the complete model is exported in
-FP16 for vLLM inference. The merge checks the FP16 adapter and absorbed model's
+BF16 for vLLM inference. The merge checks the BF16 adapter and absorbed model's
 next-token log probabilities and records their KL divergence. The output head
 is absorbed before the native RWKV inference probe, which reads its weight
 directly; a separate FP32 check verifies the head's adapter/merged projection.

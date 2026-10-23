@@ -311,10 +311,6 @@ class HFModelWrapper(nn.Module):
                 # https://github.com/huggingface/peft/issues/137
                 self.model.enable_input_require_grads()
                 resolved_target_modules = resolve_lora_target_modules(self.model, target_modules, train_attn, train_mlp)
-                if use_nora and "use_nora" not in LoraConfig.__dataclass_fields__:
-                    raise RuntimeError(
-                        "Install the NoRA PEFT fork used by AntiDoom; see examples/train/rwkv/README.md."
-                    )
                 lora_config = LoraConfig(
                     task_type=TaskType.CAUSAL_LM,
                     r=lora_rank,
@@ -1124,8 +1120,6 @@ def get_llm_for_sequence_regression(
     if use_nora:
         if config.model_type != "rwkv" or lora_rank <= 0:
             raise ValueError("NoRA critic training requires an RWKV model and a positive LoRA rank.")
-        if "use_nora" not in LoraConfig.__dataclass_fields__:
-            raise RuntimeError("Install the NoRA PEFT fork used by AntiDoom; see examples/train/rwkv/README.md.")
     if config.model_type == "rwkv":
         # FlashRWKV2 requires native BF16, including evaluation and FSDP master weights.
         bf16 = True

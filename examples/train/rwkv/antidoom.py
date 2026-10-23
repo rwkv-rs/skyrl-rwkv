@@ -1259,8 +1259,6 @@ def train(args):
     from skyrl.backends.skyrl_train.distributed.fsdp_utils import layered_summon_lora_params
     from skyrl.train.config import FSDPConfig, OptimizerConfig
 
-    if "use_nora" not in LoraConfig.__dataclass_fields__:
-        raise RuntimeError(f"Install Joluck/NoRA at {NORA_REVISION} in the project .venv; see the RWKV README.")
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     dist.init_process_group("nccl")

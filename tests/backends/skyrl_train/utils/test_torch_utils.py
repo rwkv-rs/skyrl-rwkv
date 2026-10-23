@@ -7,6 +7,7 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
     chunked_cross_entropy_from_log_probs,
     chunked_entropy_from_logits,
     logprobs_from_logits,
+    logprobs_from_logits_vllm,
 )
 
 
@@ -141,3 +142,22 @@ def test_chunked_entropy_from_logits_attention_mask_shape_validation():
     correct_mask = torch.ones(2, 3, dtype=torch.float32)
     result = chunked_entropy_from_logits(logits, attention_mask=correct_mask)
     assert result.shape == (2, 3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="vLLM's logprob kernel requires CUDA")
+def test_logprobs_from_logits_vllm_matches_rollout_kernel_and_softmax_gradient():
+    from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
+
+    torch.manual_seed(0)
+    logits = (torch.randn(2, 37, 65536, device="cuda") * 4).requires_grad_()
+    labels = torch.randint(0, 65536, (2, 37), device="cuda")
+
+    actual = logprobs_from_logits_vllm(logits, labels)
+    expected = compute_token_logprobs(logits.detach().view(-1, 65536), labels.view(-1, 1))[:, 0].view(2, 37)
+    assert torch.equal(actual, expected)
+
+    weights = torch.randn_like(actual)
+    (actual * weights).sum().backward()
+    reference = logits.detach().clone().requires_grad_()
+    (reference.log_softmax(-1).gather(-1, labels[..., None])[..., 0] * weights).sum().backward()
+    torch.testing.assert_close(logits.grad, reference.grad, atol=1e-6, rtol=1e-5)

@@ -41,6 +41,7 @@ from skyrl.backends.skyrl_train.utils.sample_support_replay import (
 from skyrl.backends.skyrl_train.utils.torch_utils import (
     chunked_entropy_from_logits,
     logprobs_from_logits,
+    logprobs_from_logits_vllm,
 )
 
 # RwkvCache._chunk_length: full-sequence kernels operate on 16-token chunks.
@@ -377,7 +378,7 @@ class HFModelWrapper(nn.Module):
             with torch.autocast(device_type=ids.device.type, enabled=False):
                 result = self.model(ids, past_key_values=previous_cache, use_cache=True)
             logits = result["logits"] / temperature
-            token_logprobs = logprobs_from_logits(logits, targets, inplace_backward=True)
+            token_logprobs = logprobs_from_logits_vllm(logits, targets)
             token_entropy = (
                 self.chunked_entropy_from_logits_fn(
                     logits,
@@ -545,11 +546,8 @@ class HFModelWrapper(nn.Module):
                     sample_support,
                     sample_support_logprobs,
                 )
-            bucket_log_probs = logprobs_from_logits(
-                bucket_logits,
-                bucket_labels,
-                inplace_backward=True,
-            )
+            # Match vLLM-RWKV's rollout logprobs bitwise for identical logits.
+            bucket_log_probs = logprobs_from_logits_vllm(bucket_logits, bucket_labels)
             if response_only:
                 output_positions = (padded_length - bucket_lengths).unsqueeze(-1) + head_positions
                 bucket_log_probs = bucket_log_probs.new_zeros((len(bucket_indices), padded_length)).scatter_add(

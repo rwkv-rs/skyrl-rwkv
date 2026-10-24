@@ -114,22 +114,42 @@ class FsdpWeightSource(WeightSource):
 
 
 class FsdpLoraWeightSource(FsdpWeightSource):
-    """Stream FP32-merged NoRA projections through the complete-weight transport."""
+    """Stream the frozen base weights and unmerged FP32 NoRA adapters.
+
+    vLLM-RWKV passes the adapters to the same FlashRWKV2 operators as the
+    training forward, so rollouts reproduce the trainer's NoRA arithmetic.
+    PEFT names map to ``<module>.weight``, ``<module>.lora_A.weight`` and
+    ``<module>.lora_B.weight``; adapters keep their FP32 training dtype.
+    """
+
+    def _named_tensors(self) -> Iterator[Tuple[str, torch.Tensor]]:
+        for name, param in self._model.get_base_model().state_dict().items():
+            name = re.sub(r"\.(lora_[AB])\.[^.]+\.weight$", r".\1.weight", name.replace(".base_layer.", "."))
+            yield f"{self._prefix}{name}", param
+
+    def _dtype_of(self, name: str, param: torch.Tensor) -> torch.dtype:
+        return param.dtype if ".lora_A." in name or ".lora_B." in name else self._dtype
 
     def metadata(self) -> List[ParamMeta]:
         return [
-            ParamMeta(f"{self._prefix}{name.replace('.base_layer.', '.')}", self._dtype, tuple(param.shape))
-            for name, param in self._model.get_base_model().state_dict().items()
-            if ".lora_A." not in name and ".lora_B." not in name
+            ParamMeta(name, self._dtype_of(name, param), tuple(param.shape)) for name, param in self._named_tensors()
         ]
 
     def __iter__(self) -> Iterator[Tuple[str, torch.Tensor]]:
-        from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
-            iter_merged_lora_weights,
-        )
-
-        for name, weight in iter_merged_lora_weights(self._model):
-            yield f"{self._prefix}{name}", weight.to(self._dtype).detach().contiguous()
+        # The caller selects this rank's CUDA device before iterating.
+        device = torch.cuda.current_device() if torch.cuda.is_available() else None
+        for name, param in self._named_tensors():
+            if device is not None:
+                param = param.to(device, non_blocking=True)
+            full = materialize_full_tensor(param)
+            # Keep each yielded item independent from the live PEFT parameter.
+            # Adapter tensors are FP32, so ``to(...).detach().contiguous()`` may
+            # otherwise return an alias; an optimizer update before the next
+            # sync would mutate a tensor already handed to the transfer engine.
+            yield (
+                name,
+                full.to(self._dtype_of(name, param)).detach().contiguous().clone(),
+            )
 
 
 class MegatronWeightSource(WeightSource):

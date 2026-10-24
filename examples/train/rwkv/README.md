@@ -370,12 +370,14 @@ normalization and loss reduction use the existing trainer controls. The original
 `gae` estimator and other algorithms retain their existing behavior.
 
 For an initial synchronous run, reuse the existing RWKV launcher with explicit
-algorithm overrides and a pretrained critic. A smaller critic mini-batch gives
-two critic optimizer steps for each actor step. This is a starting configuration,
-not a validated convergence recipe:
+algorithm overrides and a pretrained critic. A smaller critic mini-batch together
+with `trainer.critic_update_epochs_per_batch=2` trains every rollout twice for
+each actor pass, matching `miles-values` `num_critic_epochs=2`. This is a
+starting configuration, not a validated convergence recipe:
 
 ```bash
-CRITIC_DIR="$PWD/outputs/rwkv7-g1k-1.5b-20260930-ctx25600-value-nora-r8/best"
+CRITIC_BASE="$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600"
+CRITIC_CHECKPOINT="${CRITIC_CHECKPOINT:?Set this to a native value-pretraining step_N checkpoint}"
 RUN_NAME=rwkv7-g1k-1.5b-20260930-ctx25600-gsm8k-sao \
 MICRO_BATCH_SIZE=4 \
 bash examples/train/rwkv/run_rwkv_flashreinforce.sh \
@@ -383,9 +385,15 @@ bash examples/train/rwkv/run_rwkv_flashreinforce.sh \
   trainer.algorithm.policy_loss_type=rollout_is \
   trainer.algorithm.gae_adaptive.alpha=1.5 \
   trainer.algorithm.gae_adaptive.critic_lambd=1.0 \
+  trainer.critic_update_epochs_per_batch=2 \
   trainer.algorithm.eps_clip_low=0.3 \
   trainer.algorithm.eps_clip_high=5.0 \
-  trainer.critic.model.path="$CRITIC_DIR" \
+  trainer.critic.model.path="$CRITIC_BASE" \
+  trainer.critic.resume_path="$CRITIC_CHECKPOINT" \
+  trainer.critic.model.lora.use_nora=true \
+  trainer.critic.model.lora.rank=8 \
+  trainer.critic.model.lora.alpha=8 \
+  trainer.critic.model.lora.target_modules="['mlp.key','mlp.value']" \
   trainer.critic.model_config_kwargs.wkv_mode=fp32io16 \
   trainer.critic_mini_batch_size=64 \
   generator.inference_engine.engine_init_kwargs.logprobs_mode=raw_logprobs \

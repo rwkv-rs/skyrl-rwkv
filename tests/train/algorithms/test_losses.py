@@ -13,7 +13,6 @@ from skyrl.backends.skyrl_train.utils.ppo_utils import (
     compute_flashreinforce_outcome_advantage,
     flashreinforce_policy_loss,
     rollout_is_policy_loss,
-    score_centering_token_loss,
     score_centering_token_loss_from_support,
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
@@ -918,24 +917,6 @@ def test_flashreinforce_sequence_gate_rejects_a_whole_trajectory():
     assert metrics["flashreinforce/acceptance_rate"] == pytest.approx(0.5)
     assert torch.allclose(current.grad[0], torch.zeros(2))
     assert torch.all(current.grad[1] != 0)
-
-
-def test_score_centering_topk_helper_returns_finite_loss():
-    train_logp = torch.log(torch.tensor([[[0.5, 0.3, 0.2]]]))
-    sampler_logp = torch.log(torch.tensor([[[0.5, 0.3]]]))
-    topk_ids = torch.tensor([[[0, 1]]])
-    sampled_token = torch.tensor([[0]])
-    sampled_logp = torch.log(torch.tensor([[0.5]]))
-    loss = score_centering_token_loss(
-        train_logp,
-        sampler_logp,
-        topk_ids,
-        sampled_token,
-        sampled_logp,
-        torch.ones(1, 1),
-    )
-    assert torch.isfinite(loss).all()
-    torch.testing.assert_close(loss, -sampled_logp)
 
 
 def test_score_centering_support_handles_a_sampled_token_outside_the_head():

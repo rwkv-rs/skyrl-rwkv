@@ -415,10 +415,6 @@ def dump_train_results(
             if trajectory_metadata is not None:
                 entry.update(trajectory_metadata)
             entry.update(_trajectory_debug_fields(tokenizer, response_ids, loss_mask, stop_reason))
-            if env_class == "gsm8k":
-                from skyrl_gym.envs.gsm8k.utils import extract_solution
-
-                entry["extracted_answer"] = extract_solution(response)
             stream.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 

@@ -7,8 +7,8 @@ from threading import Event, get_ident
 from unittest.mock import MagicMock, patch
 
 import pytest
-import wandb
 
+import wandb
 from skyrl.train.utils.rwkv_trajectory_logging import RWKVTrajectoryLogger
 from skyrl.train.utils.tracking import Tracking
 

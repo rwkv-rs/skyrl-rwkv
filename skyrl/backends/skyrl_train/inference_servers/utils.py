@@ -123,6 +123,29 @@ def _apply_serialized_fp8_weight_sync_defaults(
     engine_kwargs["hf_overrides"] = hf_overrides
 
 
+def _apply_rwkv_lora_overrides(cfg: SkyRLTrainConfig, engine_kwargs: Dict[str, Any]) -> None:
+    """Declare a NoRA policy's unmerged adapters to vLLM-RWKV.
+
+    Weight sync streams the frozen base and FP32 adapters, and vLLM-RWKV passes
+    them to the same FlashRWKV2 operators as the training forward.
+    """
+    lora_cfg = cfg.trainer.policy.model.lora
+    if not lora_cfg.use_nora:
+        return
+    hf_overrides_value = engine_kwargs.get("hf_overrides")
+    hf_overrides = {} if hf_overrides_value is None else copy.deepcopy(hf_overrides_value)
+    if not isinstance(hf_overrides, dict):
+        raise ValueError("engine_init_kwargs.hf_overrides must be a dict for a NoRA policy")
+    target_modules = lora_cfg.target_modules
+    hf_overrides["rwkv_lora"] = {
+        "r": lora_cfg.rank,
+        "lora_alpha": lora_cfg.alpha,
+        "use_nora": True,
+        "target_modules": [target_modules] if isinstance(target_modules, str) else list(target_modules),
+    }
+    engine_kwargs["hf_overrides"] = hf_overrides
+
+
 def _get_vllm_logprobs_mode(cfg: SkyRLTrainConfig) -> str:
     """Allow RWKV Rapid-Sampling's raw logprobs for an unmodified rollout distribution."""
     if cfg.generator.inference_engine.engine_init_kwargs.get("logprobs_mode") != "raw_logprobs":
@@ -161,7 +184,8 @@ def _validate_logprobs_mode(engine_kwargs: Dict[str, Any], *, context: str, expe
 def _uses_lora_weight_sync(cfg: SkyRLTrainConfig) -> bool:
     """Return True when the trainer syncs LoRA adapters (not merged weights).
 
-    FSDP syncs adapters for ordinary LoRA, and complete merged weights for NoRA.
+    FSDP syncs adapters for ordinary LoRA through vLLM's LoRA manager. NoRA streams
+    the frozen base and raw adapters through the complete-weight transport.
     Megatron merges LoRA into the base weights by default
     (``merge_lora=True``), so the inference engine should not enable LoRA.
     """
@@ -340,6 +364,7 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
         engine_kwargs,
         cfg.trainer.policy.model.path,
     )
+    _apply_rwkv_lora_overrides(cfg, engine_kwargs)
     for key, value in engine_kwargs.items():
         setattr(args, key, value)
 

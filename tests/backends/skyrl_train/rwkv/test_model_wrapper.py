@@ -19,8 +19,8 @@ from skyrl.backends.skyrl_train.utils.sample_support import (
     CompactSampleSupport,
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
-from skyrl.backends.skyrl_train.workers import model_wrapper as model_wrapper_module
 from skyrl.backends.skyrl_train.weight_sync.sources import FsdpWeightSource
+from skyrl.backends.skyrl_train.workers import model_wrapper as model_wrapper_module
 from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
     FSDPCriticWorkerBase,
     FSDPPolicyWorkerBase,

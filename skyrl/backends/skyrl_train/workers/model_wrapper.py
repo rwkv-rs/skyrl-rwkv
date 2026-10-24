@@ -52,6 +52,23 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
 RWKV_CHUNK_LENGTH = 16
 
 
+def _patch_rwkv_training_state_contract() -> None:
+    """Keep FlashRWKV2 recurrent training states FP32 and contiguous."""
+    from transformers.models.rwkv.modeling_rwkv import RwkvAttention
+
+    if getattr(RwkvAttention, "_skyrl_fp32_state_contract", False):
+        return
+    original_training_forward = RwkvAttention._training_forward
+
+    def training_forward(self, hidden_states, v_first, attention_shift, wkv_state, training_metadata):
+        if wkv_state is not None:
+            wkv_state = wkv_state.to(dtype=torch.float32).contiguous()
+        return original_training_forward(self, hidden_states, v_first, attention_shift, wkv_state, training_metadata)
+
+    RwkvAttention._training_forward = training_forward
+    RwkvAttention._skyrl_fp32_state_contract = True
+
+
 @dataclass(frozen=True)
 class _SampleSupportChannels:
     """Token-aligned metadata transformed alongside model inputs."""
@@ -353,6 +370,7 @@ class HFModelWrapper(nn.Module):
         model_config = getattr(self.model, "config", None)
         self.is_rwkv = getattr(model_config, "model_type", None) == "rwkv"
         if self.is_rwkv:
+            _patch_rwkv_training_state_contract()
             if self.remove_microbatch_padding:
                 raise ValueError("RWKV does not support remove_microbatch_padding=true")
             if self.sequence_parallel_size > 1:
@@ -1113,6 +1131,7 @@ def get_llm_for_sequence_regression(
         # FlashRWKV2 requires native BF16, including evaluation and FSDP master weights.
         bf16 = True
         config._attn_implementation = "eager"
+        _patch_rwkv_training_state_contract()
     else:
         config._attn_implementation = "flash_attention_2" if use_flash_attention_2 else "sdpa"
 

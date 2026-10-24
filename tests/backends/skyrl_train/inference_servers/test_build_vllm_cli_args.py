@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from skyrl.backends.skyrl_train.inference_servers.utils import (
+    _apply_rwkv_lora_overrides,
     _apply_serialized_fp8_weight_sync_defaults,
     _get_vllm_logprobs_mode,
     build_vllm_cli_args,
@@ -36,6 +37,27 @@ def test_raw_logprobs_requires_rwkv_and_an_unmodified_distribution(monkeypatch, 
     else:
         with pytest.raises(ValueError, match="unmodified rollout distribution"):
             _get_vllm_logprobs_mode(cfg)
+
+
+@pytest.mark.parametrize("use_nora", [False, True])
+def test_nora_policy_declares_unmerged_adapters_to_vllm(use_nora):
+    cfg = SkyRLTrainConfig()
+    lora_cfg = cfg.trainer.policy.model.lora
+    lora_cfg.use_nora, lora_cfg.rank, lora_cfg.alpha = use_nora, 64, 32
+    lora_cfg.target_modules = ["r_proj", "mlp.value", "lm_head"]
+    engine_kwargs = {"hf_overrides": {"rope_theta": 10000.0}}
+
+    _apply_rwkv_lora_overrides(cfg, engine_kwargs)
+
+    expected = {"rope_theta": 10000.0}
+    if use_nora:
+        expected["rwkv_lora"] = {
+            "r": 64,
+            "lora_alpha": 32,
+            "use_nora": True,
+            "target_modules": ["r_proj", "mlp.value", "lm_head"],
+        }
+    assert engine_kwargs["hf_overrides"] == expected
 
 
 def test_serialized_fp8_weight_sync_defaults_configure_vllm_checkpoint_fp8(monkeypatch):

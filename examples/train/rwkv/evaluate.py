@@ -6,6 +6,7 @@ budgets are adapted to this experiment's explicit total-context limit.
 """
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -25,6 +26,10 @@ def create_eval_server_pool(cfg, worker_locations):
     from skyrl.backends.skyrl_train.inference_servers.utils import build_vllm_cli_args
     from skyrl.backends.skyrl_train.inference_servers.vllm_server_actor import VLLMServerActor
 
+    # The servers load a complete merged HF export, without policy adapters.
+    cfg = copy.deepcopy(cfg)
+    cfg.trainer.policy.model.lora.rank = 0
+    cfg.trainer.policy.model.lora.use_nora = False
     args = build_vllm_cli_args(cfg)
     args.tensor_parallel_size = args.pipeline_parallel_size = args.data_parallel_size = 1
     args.enable_sleep_mode = False

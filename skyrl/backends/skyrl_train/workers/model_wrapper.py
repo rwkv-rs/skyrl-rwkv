@@ -1111,7 +1111,7 @@ def get_llm_for_sequence_regression(
         nf4_config = None
 
     if meta_init:
-        from transformers.modeling_utils import no_init_weights
+        from transformers.initialization import no_init_weights
 
         with no_init_weights(), torch.device("meta"):
             model = cls_class(config)

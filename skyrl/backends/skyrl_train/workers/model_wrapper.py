@@ -918,9 +918,36 @@ def _get_critic_model(
             recurrent_ids = input_ids.new_zeros((input_ids.shape[0], length))
             for index, length in enumerate(lengths.tolist()):
                 recurrent_ids[index, :length] = input_ids[index, attention_mask[index].bool()]
+            base_model = getattr(self, self.base_model_prefix)
+            was_training = base_model.training
+            # RWKV's recurrent cache is an FP32 state contract.  The critic
+            # worker evaluates under autocast and no_grad, which would select
+            # the inference cache path and let a BF16 state reach FlashRWKV.
+            # Keep this full-sequence value pass on the training kernels; they
+            # preserve FP32 state semantics and RWKV has no dropout.
+            if not was_training:
+                base_model.train()
             with torch.autocast(device_type=input_ids.device.type, enabled=False):
-                with torch.set_grad_enabled(torch.is_grad_enabled() and not self.freeze_backbone):
-                    outputs = getattr(self, self.base_model_prefix)(recurrent_ids, use_cache=False)
+                try:
+                    with torch.set_grad_enabled(torch.is_grad_enabled() and not self.freeze_backbone):
+                        # Keep each TileLang launch below CUDA's grid-y limit
+                        # for long SAO contexts.  The HF RWKV cache carries the
+                        # recurrent state between chunks and remains FP32.
+                        chunk_size = RWKV_CHUNK_LENGTH * 512
+                        cache = None
+                        hidden_chunks = []
+                        for start in range(0, length, chunk_size):
+                            end = min(start + chunk_size, length)
+                            chunk_kwargs = {"use_cache": True}
+                            if cache is not None:
+                                chunk_kwargs["past_key_values"] = cache
+                            chunk_outputs = base_model(recurrent_ids[:, start:end], **chunk_kwargs)
+                            hidden_chunks.append(chunk_outputs["last_hidden_state"])
+                            cache = chunk_outputs["past_key_values"]
+                        outputs = chunk_outputs
+                        outputs["last_hidden_state"] = torch.cat(hidden_chunks, dim=1)
+                finally:
+                    base_model.train(was_training)
                 hidden_states = outputs["last_hidden_state"]
                 value_head = getattr(self, self.value_head_prefix)
                 recurrent_values = value_head(hidden_states.to(value_head.weight.dtype)).squeeze(-1)

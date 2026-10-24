@@ -348,7 +348,7 @@ Initialize the actor from the rollout checkpoint. For a NoRA critic, set
 `trainer.critic.model.path` to its original base and `trainer.critic.resume_path`
 to the selected native offline `step_N` checkpoint, preserving its unmerged
 adapter computation. Set `trainer.critic.model.lora.use_nora=true`, `rank=8`,
-`alpha=8`, and `target_modules=[mlp.key,mlp.value]` under the same `lora` config.
+`alpha=8`, and `target_modules=[r_proj,k_proj,v_proj,o_proj]` under the same `lora` config.
 The original backbone weights stay frozen; Channel-mixing adapters and the full
 FP32 value head train. Native resume requires the same adapter targets and rank
 as the saved run; choose the targets before pretraining a new critic.
@@ -393,7 +393,7 @@ bash examples/train/rwkv/run_rwkv_flashreinforce.sh \
   trainer.critic.model.lora.use_nora=true \
   trainer.critic.model.lora.rank=8 \
   trainer.critic.model.lora.alpha=8 \
-  trainer.critic.model.lora.target_modules="['mlp.key','mlp.value']" \
+  trainer.critic.model.lora.target_modules="['r_proj','k_proj','v_proj','o_proj']" \
   trainer.critic.model_config_kwargs.wkv_mode=fp32io16 \
   trainer.critic_mini_batch_size=64 \
   generator.inference_engine.engine_init_kwargs.logprobs_mode=raw_logprobs \

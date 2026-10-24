@@ -861,8 +861,13 @@ class RayPPOTrainer:
         )
         critic_steps_per_train_batch = 0
         if cfg.trainer.critic.model.path:
+            critic_update_epochs = (
+                cfg.trainer.critic_update_epochs_per_batch
+                if cfg.trainer.critic_update_epochs_per_batch is not None
+                else cfg.trainer.update_epochs_per_batch
+            )
             critic_steps_per_train_batch = (
-                cfg.trainer.train_batch_size // cfg.trainer.critic_mini_batch_size * cfg.trainer.update_epochs_per_batch
+                cfg.trainer.train_batch_size // cfg.trainer.critic_mini_batch_size * critic_update_epochs
             )
         policy_num_training_steps = (
             self.total_training_steps * policy_steps_per_train_batch if self.total_training_steps is not None else None
@@ -1718,8 +1723,13 @@ class RayPPOTrainer:
         # serialization is fully off the critical path during training.
         all_chunk_refs = self.dispatch.stage_data(model, data, boundaries)
 
-        # Training loop over epochs and mini-batches
-        for _epoch in range(self.cfg.trainer.update_epochs_per_batch):
+        # Training loop over epochs and mini-batches. Critic epochs are separate
+        # because SAO trains the value model on the same rollout more than once
+        # while keeping one actor pass.
+        update_epochs = self.cfg.trainer.update_epochs_per_batch
+        if model == "critic" and self.cfg.trainer.critic_update_epochs_per_batch is not None:
+            update_epochs = self.cfg.trainer.critic_update_epochs_per_batch
+        for _epoch in range(update_epochs):
             for chunk_refs in all_chunk_refs:
                 status = self.dispatch.forward_backward_from_staged(model, chunk_refs)
                 for k, v in status.metrics.items():

@@ -1775,6 +1775,14 @@ class TrainerConfig(BaseConfig):
     update_epochs_per_batch: int = 1
     """Number of gradient update passes over each training batch.
     Equivalent to the concept of "PPO epochs", where the same experience is iterated over multiple times."""
+    critic_update_epochs_per_batch: Optional[int] = None
+    """Number of critic update passes over each training batch.
+
+    This is independent from ``update_epochs_per_batch`` so SAO-style recipes can
+    train the critic on the same rollout more than once while keeping one actor
+    update pass. When unset, the critic follows ``update_epochs_per_batch`` to
+    preserve existing recipes.
+    """
     train_batch_size: int = 1024
     """Batch size of prompts used for each dataloader step.
 
@@ -1920,6 +1928,9 @@ class TrainerConfig(BaseConfig):
 
         if self.train_critic_and_policy_parallel and self.placement.colocate_all:
             raise ValueError("train_critic_and_policy_parallel requires placement.colocate_all=False.")
+
+        if self.critic_update_epochs_per_batch is not None and self.critic_update_epochs_per_batch <= 0:
+            raise ValueError("critic_update_epochs_per_batch must be positive")
 
         if self.policy.model.lora.use_nora:
             if self.strategy != "fsdp" or self.policy.model.lora.rank <= 0:

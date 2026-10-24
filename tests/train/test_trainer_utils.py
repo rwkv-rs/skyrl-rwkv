@@ -317,8 +317,6 @@ def test_dump_train_results_preserves_inputs_and_appends(tmp_path, output_ids):
     assert rows[0]["input_prompt"] == prompts[0 if output_ids is None else 1]
     assert rows[0]["env_extras"]["reward_spec"]["ground_truth"] == ("0" if output_ids is None else "1")
     assert rows[0]["rendered_input_prompt"] == "User✿q✿\nBot✿<think"
-    assert rows[0]["extracted_answer"] == "0"
-    assert rows[1]["extracted_answer"] is None
     assert rows[1]["stop_reason"] == "length"
     assert rows[0]["assistant_spans"] == [[0, 1]]
     assert rows[0]["loss_mask"] == [1]

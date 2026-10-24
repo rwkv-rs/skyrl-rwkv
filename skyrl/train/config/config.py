@@ -2204,7 +2204,7 @@ class SkyRLTrainConfig(BaseConfig):
             self.generator.inference_engine.sample_support_top_k = rollout_is.score_centering_top_k
             self.generator.inference_engine.sample_support_logprobs_mode = "raw_logprobs"
         if flashreinforce.score_centering:
-            if self.trainer.algorithm.policy_loss_type not in ("flashreinforce", "flash_reinforce"):
+            if self.trainer.algorithm.policy_loss_type != "flashreinforce":
                 raise ValueError("flashreinforce.score_centering requires policy_loss_type=flashreinforce")
             if self.trainer.strategy != "fsdp":
                 raise ValueError("flashreinforce.score_centering currently requires trainer.strategy=fsdp")

@@ -29,7 +29,7 @@ async def test_train_epoch_end_saving(monkeypatch, save_at_epoch_end, exhaust_ea
     cfg = example_dummy_config()
     cfg.trainer.epochs = 2
     cfg.trainer.policy_mini_batch_size = 2
-    cfg.trainer.algorithm.policy_loss_type = "flashreinforce"
+    cfg.trainer.algorithm.policy_loss_type = "rollout_is"
     cfg.trainer.algorithm.zero_variance_filter = exhaust_early
     cfg.trainer.placement.colocate_all = False
     cfg.trainer.fully_async.enabled = True

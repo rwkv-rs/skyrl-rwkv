@@ -241,7 +241,7 @@ selects the backbone projections; the value head is always trained in full.
 Omitting `--use-nora` retains full-parameter critic training.
 
 For larger critics, set `--max-ckpts-to-keep 3` to retain only the latest three
-`step_*` checkpoints, including their HF exports. Cleanup runs after a successful
+`global_step_*` checkpoints, including their HF exports. Cleanup runs after a successful
 save and preserves the separate `best/` export. The default `-1` keeps all
 checkpoints. Saving and validation still follow `--save-steps` (default 50).
 

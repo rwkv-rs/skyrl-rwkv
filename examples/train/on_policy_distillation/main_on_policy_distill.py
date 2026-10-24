@@ -613,6 +613,7 @@ class FullyAsyncOnPolicyDistillationTrainer(FullyAsyncRayPPOTrainer, OnPolicyDis
     """Native async scheduling with OPD/TOP-D losses and complete STOPD checkpoints."""
 
     _streaming_supports_token_mean = True
+    _streaming_supported_estimators = ("grpo", "no_op")
     _preserve_epoch_shuffle = True
 
     async def eval(self, vllm_metrics_scraper=None):

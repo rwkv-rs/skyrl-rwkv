@@ -275,7 +275,7 @@ def _load_checkpoint_weights(
         load_rwkv_checkpoint_weights,
     )
 
-    if model.config.model_type == "rwkv":
+    if getattr(getattr(model, "config", None), "model_type", None) == "rwkv":
         return load_rwkv_checkpoint_weights(model, list(weights))
     params_dict: dict[str, torch.nn.Parameter] | None = None
     ordinary_weights: list[tuple[str, torch.Tensor]] = []

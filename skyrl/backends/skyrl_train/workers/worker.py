@@ -1165,7 +1165,7 @@ class PolicyWorkerBase(Worker):
             }
             if resolved_loss_name == "async_opd":
                 policy_loss_kwargs["teacher_log_probs"] = base_action_log_probs
-            if resolved_loss_name in ("flashreinforce", "flash_reinforce"):
+            if resolved_loss_name == "flashreinforce":
                 policy_loss_kwargs["real_rows"] = loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
             if score_centering:
                 policy_loss_kwargs["score_centering_train_logprobs"] = output["score_centering_train_logprobs"]
@@ -1463,7 +1463,7 @@ class PolicyWorkerBase(Worker):
                 "loss_mask": loss_mask,
                 "rollout_logprobs": rollout_action_logprobs,
             }
-            if loss_fn in ("flashreinforce", "flash_reinforce"):
+            if loss_fn == "flashreinforce":
                 policy_loss_kwargs["real_rows"] = loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
             if score_centering:
                 policy_loss_kwargs["score_centering_train_logprobs"] = output["score_centering_train_logprobs"]

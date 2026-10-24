@@ -447,7 +447,6 @@ class AdvantageEstimatorRegistry(BaseFunctionRegistry):
             "reinforce++": [AdvantageEstimator.REINFORCE_PP, compute_reinforce_plus_plus_outcome_advantage],
             "maxrl": [AdvantageEstimator.MAXRL, compute_maxrl_advantage],
             "flashreinforce": [AdvantageEstimator.FLASH_REINFORCE, compute_flashreinforce_outcome_advantage],
-            "flash_reinforce": ["flash_reinforce", compute_flashreinforce_outcome_advantage],
             "bpo": [AdvantageEstimator.BPO, compute_bpo_outcome_advantage],
         }
 
@@ -479,7 +478,6 @@ LOSSES_WITHOUT_OLD_LOGPROBS = frozenset(
         PolicyLossType.ROLLOUT_IS,
         PolicyLossType.DPPO,
         PolicyLossType.FLASH_REINFORCE,
-        "flash_reinforce",
         PolicyLossType.BPO,
     }
 )
@@ -495,6 +493,15 @@ LOSSES_WITH_OLD_LOGPROBS = frozenset(
         PolicyLossType.SAPO,
         PolicyLossType.CROSS_ENTROPY,
         PolicyLossType.IMPORTANCE_SAMPLING,
+    }
+)
+
+# Advantage estimators that need the loss mask in addition to the response mask.
+ADVANTAGE_ESTIMATORS_WITH_LOSS_MASK = frozenset(
+    {
+        AdvantageEstimator.FLASH_REINFORCE,
+        AdvantageEstimator.BPO,
+        AdvantageEstimator.GAE_ADAPTIVE,
     }
 )
 
@@ -532,7 +539,6 @@ class PolicyLossRegistry(BaseFunctionRegistry):
             "dppo": [PolicyLossType.DPPO, dppo_policy_loss],
             "rollout_is": [PolicyLossType.ROLLOUT_IS, rollout_is_policy_loss],
             "flashreinforce": [PolicyLossType.FLASH_REINFORCE, flashreinforce_policy_loss],
-            "flash_reinforce": ["flash_reinforce", flashreinforce_policy_loss],
             "bpo": [PolicyLossType.BPO, bpo_policy_loss],
         }
 
@@ -1440,35 +1446,6 @@ def score_centering_token_loss_from_support(
     correction = (residual.detach() * head_score).sum(dim=-1)
     token_weight = weight_fn((trainer_token - sampler_token).exp())
     return -advantage.detach() * (token_weight.detach() * trainer_token - correction)
-
-
-def score_centering_token_loss(
-    train_logp: torch.Tensor,
-    samp_logp: torch.Tensor,
-    topk_ids: torch.Tensor,
-    sampled_token: torch.Tensor,
-    samp_token_logp: torch.Tensor,
-    advantage: torch.Tensor,
-    weight_fn: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
-    eps: float = 1e-6,
-) -> torch.Tensor:
-    """Compute the top-k Score-Centering correction from full trainer logprobs."""
-    if train_logp.shape[:-1] != topk_ids.shape[:-1] or samp_logp.shape != topk_ids.shape:
-        raise ValueError("train_logp and sampler top-k tensors have incompatible shapes")
-    if sampled_token.shape != samp_token_logp.shape or sampled_token.shape != train_logp.shape[:-1]:
-        raise ValueError("sampled token tensors have incompatible shapes")
-
-    head_logp = train_logp.float().gather(-1, topk_ids.long())
-    token_logp = train_logp.float().gather(-1, sampled_token.long().unsqueeze(-1)).squeeze(-1)
-    return score_centering_token_loss_from_support(
-        head_logp,
-        samp_logp,
-        token_logp,
-        samp_token_logp,
-        advantage,
-        weight_fn=weight_fn,
-        eps=eps,
-    )
 
 
 def reduce_loss(

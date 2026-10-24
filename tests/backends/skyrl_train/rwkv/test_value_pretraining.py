@@ -25,14 +25,14 @@ def write_dataset(tmp_path, rows):
 
 
 def test_value_checkpoint_retention_keeps_recent_steps_and_best(tmp_path):
-    for name in ["step_2", "step_50", "step_100", "step_150", "best"]:
+    for name in ["global_step_2", "global_step_50", "global_step_100", "global_step_150", "best"]:
         checkpoint = tmp_path / name
         checkpoint.mkdir()
         (checkpoint / "model.safetensors").write_bytes(b"checkpoint")
-    main_value.cleanup_old_checkpoints(tmp_path, -1)
+    main_value.cleanup_old_checkpoints(str(tmp_path), -1)
     assert len(list(tmp_path.iterdir())) == 5
-    main_value.cleanup_old_checkpoints(tmp_path, 2)
-    assert {path.name for path in tmp_path.iterdir()} == {"step_100", "step_150", "best"}
+    main_value.cleanup_old_checkpoints(str(tmp_path), 2)
+    assert {path.name for path in tmp_path.iterdir()} == {"global_step_100", "global_step_150", "best"}
     assert (tmp_path / "best/model.safetensors").read_bytes() == b"checkpoint"
 
 
@@ -124,11 +124,13 @@ class ToyRwkvModel(torch.nn.Module):
         self.calls = []
         self.autocast_states = []
 
-    def forward(self, input_ids, use_cache):
-        assert not use_cache
+    def forward(self, input_ids, use_cache=False, past_key_values=None):
         self.calls.append(input_ids.detach().clone())
         self.autocast_states.append(torch.is_autocast_enabled(input_ids.device.type))
-        return {"last_hidden_state": self.embed_tokens(input_ids).cumsum(1)}
+        hidden_states = self.embed_tokens(input_ids).cumsum(1)
+        if past_key_values is not None:
+            hidden_states = hidden_states + past_key_values
+        return {"last_hidden_state": hidden_states, "past_key_values": hidden_states[:, -1:]}
 
 
 def make_critic(**kwargs):
@@ -239,13 +241,13 @@ def test_rwkv_nora_critic_updates_and_exports_full_head(
     from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
     from skyrl.train.config import FSDPConfig, ModelConfig, SkyRLLoraConfig
 
-    def causal_forward(self, input_ids, use_cache):
+    def causal_forward(self, input_ids, use_cache=True, past_key_values=None):
         """Exercise real NoRA projections on CPU without the CUDA recurrence."""
         hidden = self.embed_tokens(input_ids).cumsum(1)
         for layer in self.layers:
             hidden = hidden + layer.linear_attn.o_proj(torch.tanh(layer.linear_attn.v_proj(hidden)))
             hidden = hidden + layer.mlp.value(torch.relu(layer.mlp.key(hidden)).square())
-        return {"last_hidden_state": hidden}
+        return {"last_hidden_state": hidden, "past_key_values": None}
 
     monkeypatch.setattr(RwkvModel, "forward", causal_forward)
     model = get_llm_for_sequence_regression(
@@ -326,11 +328,11 @@ def test_rwkv_nora_critic_updates_and_exports_full_head(
 def test_rwkv_head_only_critic_keeps_backbone_and_adapters_fixed(rwkv_checkpoint, monkeypatch, rank):
     from transformers import RwkvModel
 
-    def causal_forward(self, input_ids, use_cache):
+    def causal_forward(self, input_ids, use_cache=True, past_key_values=None):
         hidden = self.embed_tokens(input_ids).cumsum(1)
         for layer in self.layers:
             hidden = hidden + layer.linear_attn.o_proj(torch.tanh(layer.linear_attn.v_proj(hidden)))
-        return {"last_hidden_state": hidden}
+        return {"last_hidden_state": hidden, "past_key_values": None}
 
     monkeypatch.setattr(RwkvModel, "forward", causal_forward)
     model = get_llm_for_sequence_regression(
@@ -408,13 +410,13 @@ def test_value_pretraining_cli_preserves_native_initialization_and_calibration(m
             "--output-dir",
             "value",
             "--resume-path",
-            "/value/step_96",
+            "/value/global_step_96",
             "--freeze-backbone",
             "--model-config-kwargs",
             '{"value_head_calibration":{"scale":10.0,"bias":-4.0}}',
         ]
     )
-    assert calls[0].resume_path == "/value/step_96"
+    assert calls[0].resume_path == "/value/global_step_96"
     assert calls[0].freeze_backbone
     assert calls[0].model_config_kwargs == {"value_head_calibration": {"scale": 10.0, "bias": -4.0}}
 

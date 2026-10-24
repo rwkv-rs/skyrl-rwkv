@@ -882,10 +882,8 @@ class MegatronModelWrapper:
                 "loss_mask": loss_mask,
                 "rollout_logprobs": rollout_action_logprobs,
             }
-            if resolved_loss_name in ("flashreinforce", "flash_reinforce"):
-                policy_loss_kwargs["real_rows"] = (
-                    loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
-                )
+            if resolved_loss_name == "flashreinforce":
+                policy_loss_kwargs["real_rows"] = loss_mask.sum(dim=-1).gt(0) if loss_mask is not None else None
             policy_loss, loss_metrics = current_loss_fn(
                 action_log_probs,
                 old_action_log_probs,

@@ -434,6 +434,9 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
     async_mode = "fully_async"
     _streaming_supports_token_mean = False
     _preserve_epoch_shuffle = False
+    # Advantage estimators whose own batch baseline is group-local, so a
+    # streamed sub-batch yields the same advantage as the full batch.
+    _streaming_supported_estimators: tuple[str, ...] = ("grpo",)
 
     def __init__(self, *args, **kwargs):
         # Extract cfg before base init so we can initialize async-specific knobs used by our overrides.
@@ -555,15 +558,18 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
             raise ValueError(
                 "Gradient streaming requires FSDP, one complete-batch optimizer step, and group-local advantages"
             )
-        if cfg.trainer.algorithm.advantage_estimator not in ("grpo", "no_op"):
-            raise ValueError("Gradient streaming requires GRPO group advantages or OPD token advantages")
+        if cfg.trainer.algorithm.advantage_estimator not in self._streaming_supported_estimators:
+            raise ValueError("Gradient streaming requires group-local advantage estimators")
         if cfg.trainer.algorithm.loss_reduction == "token_mean" and not self._streaming_supports_token_mean:
-            raise ValueError("Streaming token_mean requires OPD; use sequence_mean or prompt_mean for GRPO")
+            raise ValueError(
+                "Streaming token_mean requires an algorithm that owns its token normalization; "
+                "use sequence_mean or prompt_mean"
+            )
         if self._streaming_token_normalization() and (
             cfg.trainer.algorithm.use_kl_loss or cfg.trainer.algorithm.use_entropy_loss
         ):
             raise ValueError(
-                "Streaming OPD token normalization requires the distillation objective without auxiliary losses"
+                "Streaming token normalization requires the algorithm's own objective without auxiliary losses"
             )
         dp = cfg.trainer.placement.policy_num_nodes * cfg.trainer.placement.policy_num_gpus_per_node
         dp = math.lcm(dp, cfg.trainer.placement.ref_num_nodes * cfg.trainer.placement.ref_num_gpus_per_node)
@@ -608,7 +614,7 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         if self._streaming_token_normalization():
             scale = tokens
         elif self.cfg.trainer.algorithm.loss_reduction == "token_mean":
-            # STOPD already divides every ready source by the same lagged C_k.
+            # The loss already divides by a lagged token count over the whole batch.
             scale = 1.0
         else:
             scale = len(groups) / self.mini_batch_size

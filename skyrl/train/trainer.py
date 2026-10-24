@@ -40,8 +40,10 @@ from skyrl.backends.skyrl_train.utils.off_policy_correction_utils import (
     off_policy_correction_enabled,
 )
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
+    ADVANTAGE_ESTIMATORS_WITH_LOSS_MASK,
     LOSSES_WITHOUT_OLD_LOGPROBS,
     AdaptiveKLController,
+    AdvantageEstimator,
     FixedKLController,
     PolicyLossType,
     apply_loss_reduction_to_advantages_minibatch,
@@ -290,6 +292,8 @@ class RayPPOTrainer:
     def _save_best_checkpoint(self, metrics: Dict[str, float]) -> None:
         """Save an evaluated best using the native checkpoint and HF export paths."""
         metric = self.cfg.trainer.metric_for_best_model
+        if metric not in metrics:
+            raise ValueError(f"trainer.metric_for_best_model={metric!r} is not in the eval metrics: {sorted(metrics)}")
         value = metrics[metric]
         if not math.isfinite(value):
             return
@@ -1261,7 +1265,9 @@ class RayPPOTrainer:
             - `["returns"]`: Float[torch.Tensor, "batch_size response_len"]
         """
         token_level_rewards = data["rewards"]
-        flash_advantage = self.cfg.trainer.algorithm.advantage_estimator in ("flashreinforce", "flash_reinforce")
+        estimator = self.cfg.trainer.algorithm.advantage_estimator
+        flash_advantage = estimator == AdvantageEstimator.FLASH_REINFORCE
+        needs_loss_mask = estimator in ADVANTAGE_ESTIMATORS_WITH_LOSS_MASK
         pad_size = data.metadata.get("pad_size", 0)
         real_rows = None
         if flash_advantage:
@@ -1290,11 +1296,7 @@ class RayPPOTrainer:
             #       (batch_size, response_len):        per-step response mask
             last_step_response_mask = data["response_mask"][is_last_step]
             last_step_advantage_mask = data["loss_mask"][is_last_step]
-            last_step_advantage_kwargs = (
-                {"loss_mask": last_step_advantage_mask}
-                if self.cfg.trainer.algorithm.advantage_estimator in ("flashreinforce", "flash_reinforce", "bpo")
-                else {}
-            )
+            last_step_advantage_kwargs = {"loss_mask": last_step_advantage_mask} if needs_loss_mask else {}
             if flash_advantage:
                 last_step_advantage_kwargs["real_rows"] = real_rows[is_last_step]
             last_step_advantages, last_step_returns = ppo_utils.compute_advantages_and_returns(
@@ -1320,12 +1322,7 @@ class RayPPOTrainer:
             advantages = last_step_advantages[traj_ids] * response_mask_float
             returns = last_step_returns[traj_ids] * response_mask_float
         else:
-            advantage_kwargs = (
-                {"loss_mask": data["loss_mask"]}
-                if self.cfg.trainer.algorithm.advantage_estimator
-                in ("flashreinforce", "flash_reinforce", "bpo", "gae_adaptive")
-                else {}
-            )
+            advantage_kwargs = {"loss_mask": data["loss_mask"]} if needs_loss_mask else {}
             if flash_advantage:
                 advantage_kwargs["real_rows"] = real_rows
             advantages, returns = ppo_utils.compute_advantages_and_returns(

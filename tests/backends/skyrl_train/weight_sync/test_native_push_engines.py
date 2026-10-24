@@ -331,8 +331,9 @@ def test_native_receive_repeated_updates_preserve_processed_weights(monkeypatch,
         assert torch.equal(engine.model.model.norm.weight, norm)
         assert target.data_ptr() == original_ptr
 
-    expected_events = ["before", "runtime", "graphs", "after"] if model_type == "rwkv" else ["before", "after"]
+    expected_events = ["before", "runtime", "graphs"] if model_type == "rwkv" else ["before"]
     if backend == "ipc":
         # The release hook runs inside the update lifecycle, before the after-update notification.
-        expected_events.insert(expected_events.index("after"), "close")
+        expected_events.append("close")
+    expected_events.append("after")
     assert events == expected_events * 3

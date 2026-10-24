@@ -453,6 +453,8 @@ class HFModelWrapper(nn.Module):
         batch_size, padded_length = sequences.shape
         valid_lengths = attention_mask.sum(dim=-1)
         response_only = self.rwkv_response_only_head and not enable_score_centering
+        if enable_score_centering and self.rwkv_chunk_size:
+            raise ValueError("score centering is incompatible with rwkv_chunk_size")
         if response_only and response_mask is None:
             raise ValueError("rwkv_response_only_head requires response_mask")
         log_probs = None
@@ -908,6 +910,7 @@ def _get_critic_model(
             self.sequence_parallel_size = sequence_parallel_size
             self.remove_microbatch_padding = remove_microbatch_padding
             self.is_rwkv = config.model_type == "rwkv"
+            self.rwkv_chunk_size = RWKV_CHUNK_LENGTH * 512 if self.is_rwkv else 0
             self.freeze_backbone = False
             if self.is_rwkv:
                 if remove_microbatch_padding:
@@ -951,7 +954,7 @@ def _get_critic_model(
                         # Keep each TileLang launch below CUDA's grid-y limit
                         # for long SAO contexts.  The HF RWKV cache carries the
                         # recurrent state between chunks and remains FP32.
-                        chunk_size = RWKV_CHUNK_LENGTH * 512
+                        chunk_size = self.rwkv_chunk_size
                         cache = None
                         hidden_chunks = []
                         for start in range(0, length, chunk_size):

@@ -138,14 +138,16 @@ class TestFsdpLoraWeightSource:
         meta, pairs = _assert_channels_agree(FsdpLoraWeightSource(model, torch.bfloat16))
         streamed = dict(pairs)
         assert not any("base_layer" in name or ".default." in name for name in streamed)
+        # ``FsdpLoraWeightSource.__iter__`` streams onto the caller's CUDA device.
+        device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu")
         for projection in ("key", "value"):
             layer = getattr(model.get_base_model().model.layers[0].mlp, projection)
             prefix = f"model.layers.0.mlp.{projection}"
-            assert torch.equal(streamed[f"{prefix}.weight"], layer.base_layer.weight)
+            assert torch.equal(streamed[f"{prefix}.weight"], layer.base_layer.weight.to(device))
             for adapter in ("A", "B"):
                 expected = getattr(layer, f"lora_{adapter}")["default"].weight
                 assert streamed[f"{prefix}.lora_{adapter}.weight"].dtype == torch.float32
-                assert torch.equal(streamed[f"{prefix}.lora_{adapter}.weight"], expected.float())
+                assert torch.equal(streamed[f"{prefix}.lora_{adapter}.weight"], expected.float().to(device))
         assert {item.dtype for item in meta if ".lora_" not in item.name} == {torch.bfloat16}
         for name, value in model.state_dict().items():
             torch.testing.assert_close(value, before[name], rtol=0, atol=0)

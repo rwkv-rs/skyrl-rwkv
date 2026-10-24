@@ -12,10 +12,8 @@ import argparse
 import json
 import math
 import os
-import shutil
 import time
 from itertools import islice
-from pathlib import Path
 
 import torch
 import torch.distributed as dist
@@ -33,6 +31,8 @@ from skyrl.train.dataset.value_dataset import (
     ValueDataset,
     value_loss,
 )
+from skyrl.train.utils.tracking import Tracking
+from skyrl.train.utils.trainer_utils import cleanup_old_checkpoints
 from skyrl.utils.tok import get_tokenizer
 
 
@@ -144,21 +144,11 @@ def evaluate(model, dataset, collator, batch_size, device, domains=None):
     return metrics
 
 
-def cleanup_old_checkpoints(checkpoint_base_path, max_checkpoints):
-    """Retain recent value checkpoints, following the native trainer's retention policy."""
-    if max_checkpoints < 0:
-        return
-    checkpoint_dirs = sorted(Path(checkpoint_base_path).glob("step_*"), key=lambda path: int(path.name[5:]))
-    for path in checkpoint_dirs[:-max_checkpoints]:
-        shutil.rmtree(path)
-        logger.info(f"Cleaned up old checkpoint: {path}")
-
-
 def train(args):
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
     torch.cuda.set_device(device)
     dist.init_process_group("nccl")
-    run = None
+    tracker = None
     try:
         tokenizer = get_tokenizer(args.model)
         collator = RewardDataCollator(tokenizer.pad_token_id)
@@ -219,11 +209,10 @@ def train(args):
                 load_lr_scheduler_states=False,
             )
         if dist.get_rank() == 0 and args.report_to == "wandb":
-            import wandb
-
-            run = wandb.init(
-                project=args.wandb_project,
-                name=args.run_name,
+            tracker = Tracking(
+                args.wandb_project,
+                args.run_name,
+                backend="wandb",
                 config={
                     **vars(args),
                     "trainable_parameters": trainable_parameters,
@@ -236,7 +225,7 @@ def train(args):
         def validate_and_save(step, metrics):
             nonlocal best_mse
             metrics.update(evaluate(model, val_dataset, collator, args.batch_size, device, domains=val_domains))
-            checkpoint = os.path.join(args.output_dir, f"step_{step}")
+            checkpoint = os.path.join(args.output_dir, f"global_step_{step}")
             strategy.save_checkpoint(
                 model,
                 checkpoint,
@@ -264,8 +253,8 @@ def train(args):
             validate_and_save(step, metrics)
             if dist.get_rank() == 0:
                 logger.info(f"step={step} {metrics}")
-                if run is not None:
-                    run.log(metrics, step=step)
+                if tracker is not None:
+                    tracker.log(metrics, step=step, commit=True)
         for epoch in range(args.epochs):
             sampler.set_epoch(epoch)
             iterator = iter(loader)
@@ -319,11 +308,11 @@ def train(args):
                     metrics["timing/eval_and_save"] = time.perf_counter() - validation_started
                 if dist.get_rank() == 0:
                     logger.info(f"step={step} {metrics}")
-                    if run is not None:
-                        run.log(metrics, step=step)
+                    if tracker is not None:
+                        tracker.log(metrics, step=step, commit=True)
     finally:
-        if run is not None:
-            run.finish()
+        if tracker is not None:
+            tracker.finish()
         dist.destroy_process_group()
 
 

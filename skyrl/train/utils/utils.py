@@ -134,10 +134,15 @@ def validate_batch_sizes(cfg: SkyRLTrainConfig):
     policy_mini_batch_size_per_gpu = (
         cfg.trainer.policy_mini_batch_size * cfg.generator.n_samples_per_prompt // policy_dp_size
     )
-    # Separate async pools need not divide the logical batch (e.g. seven
-    # learners and one sampler). Native MeshDispatch pads each mini-batch with
-    # loss_mask=0; FSDP's microbatch iterator handles the equal partial tails.
-    padded_async = cfg.trainer.fully_async.enabled and cfg.trainer.strategy == "fsdp"
+    # A separate async learner pool need not divide the mini-batch (e.g. seven
+    # learners and one sampler), so the per-GPU sizes below are not integers.
+    # MeshDispatch pads each mini-batch to a DP multiple with loss_mask=0 rows,
+    # and the FSDP microbatch iterator (drop_last=False) runs the partial tail.
+    padded_async = (
+        cfg.trainer.fully_async.enabled
+        and cfg.trainer.strategy == "fsdp"
+        and cfg.trainer.policy_mini_batch_size * cfg.generator.n_samples_per_prompt % policy_dp_size != 0
+    )
     assert policy_mini_batch_size_per_gpu > 0, (
         f"Invalid policy_mini_batch_size_per_gpu: {policy_mini_batch_size_per_gpu}. "
         f"mini_batch_size={cfg.trainer.policy_mini_batch_size}, "
@@ -504,16 +509,10 @@ def validate_cfg(cfg: SkyRLTrainConfig):
         raise ValueError(
             "rollout_is.score_centering already centers the DIS weight; disable off_policy_correction and use_tis"
         )
-    flash_loss_names = {"flashreinforce", "flash_reinforce"}
-    flash_advantage_names = {"flashreinforce", "flash_reinforce"}
-    flash_enabled = (
-        algorithm.policy_loss_type in flash_loss_names or algorithm.advantage_estimator in flash_advantage_names
-    )
-    if flash_enabled:
-        if (
-            algorithm.policy_loss_type not in flash_loss_names
-            or algorithm.advantage_estimator not in flash_advantage_names
-        ):
+    flash_loss = algorithm.policy_loss_type == "flashreinforce"
+    flash_advantage = algorithm.advantage_estimator == "flashreinforce"
+    if flash_loss or flash_advantage:
+        if not (flash_loss and flash_advantage):
             raise ValueError(
                 "FlashREINFORCE requires trainer.algorithm.policy_loss_type and "
                 "trainer.algorithm.advantage_estimator to both use 'flashreinforce'."

@@ -624,6 +624,12 @@ def test_validate_batch_sizes():
         match="normalized policy_mini_batch_size_per_gpu .* should be divisible by micro_train_batch_size_per_gpu",
     ):
         validate_batch_sizes(cfg)
+    # FSDP fully async only relaxes the per-GPU checks when the learners do not divide the mini-batch.
+    cfg.trainer.fully_async.enabled = True
+    with pytest.raises(AssertionError, match="should be divisible by micro_train_batch_size_per_gpu"):
+        validate_batch_sizes(cfg)
+    cfg.trainer.placement.policy_num_gpus_per_node = 3
+    validate_batch_sizes(cfg)
 
     # Test Case 11: Error case - critic_mini_batch_size_per_gpu not divisible by micro_train_batch_size_per_gpu
     cfg = create_test_config(
@@ -954,6 +960,58 @@ def test_zero_critic_lr_preserves_critic_weights_and_optimizer(parallel):
     assert not optimizers["critic"].state
     assert trainer.all_metrics == {"policy/loss": 1.0}
     assert set(trainer.all_timings) == {"policy_train"}
+
+
+def test_critic_update_epochs_per_batch_multiplies_critic_optimizer_work():
+    from types import SimpleNamespace
+
+    trainer = object.__new__(RayPPOTrainer)
+    trainer.cfg = SkyRLTrainConfig()
+    trainer.cfg.trainer.critic.model.path = "critic"
+    trainer.cfg.trainer.train_critic_and_policy_parallel = False
+    trainer.cfg.trainer.update_epochs_per_batch = 1
+    trainer.cfg.trainer.critic_update_epochs_per_batch = 3
+    trainer.global_step = 0
+    trainer.all_timings = {}
+    trainer.all_metrics = {}
+    trainer.dispatch = MagicMock()
+    trainer.dispatch.stage_data.side_effect = lambda model, batch, boundaries: [
+        (model, batch[start:end]) for start, end in boundaries
+    ]
+    forward_backward_roles = []
+    optim_step_roles = []
+
+    def forward_backward(model, chunk):
+        forward_backward_roles.append(model)
+        return SimpleNamespace(metrics={"loss": 1.0})
+
+    def optim_step(model):
+        optim_step_roles.append(model)
+        return 1.0
+
+    trainer.dispatch.forward_backward_from_staged.side_effect = forward_backward
+    trainer.dispatch.optim_step.side_effect = optim_step
+    data = TrainingInputBatch(
+        {
+            "sequences": torch.ones((2, 3), dtype=torch.long),
+            "response_mask": torch.ones(2, 3, dtype=torch.long),
+            "advantages": torch.ones(2, 3),
+            "loss_mask": torch.ones(2, 3),
+        }
+    )
+    # One mini-batch per model, so the epoch count is the only source of extra work.
+    data.metadata = {"policy_mini_batch_boundaries": [(0, 2)], "critic_mini_batch_boundaries": [(0, 2)]}
+
+    trainer.train_critic_and_policy(data)
+
+    assert forward_backward_roles == ["critic", "critic", "critic", "policy"]
+    assert optim_step_roles == ["critic", "critic", "critic", "policy"]
+    assert trainer.all_metrics == {
+        "policy/loss": 1.0,
+        "critic/loss": 1.0,
+        "policy/grad_norm": 1.0,
+        "critic/grad_norm": 1.0,
+    }
 
 
 @pytest.mark.parametrize("dp_size,real_rows,mini_size", [(3, 10, 5), (7, 1024, 256), (8, 1024, 256)])

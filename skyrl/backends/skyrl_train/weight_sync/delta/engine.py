@@ -81,18 +81,17 @@ class DeltaWeightTransferEngine(WeightTransferEngine[DeltaTransferInitInfo, Delt
         """Finalize layerwise reloading after the checkpoint has been loaded."""
         from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
 
-        if getattr(getattr(self.model, "config", None), "model_type", None) == "rwkv":
-            from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
-                clear_rwkv_cudagraphs,
-                finalize_rwkv_runtime_weights,
-            )
+        with torch.device(self.device):
+            if getattr(getattr(self.model, "config", None), "model_type", None) == "rwkv":
+                from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
+                    clear_rwkv_cudagraphs,
+                    finalize_rwkv_runtime_weights,
+                )
 
-            with torch.device(self.device):
                 finalize_rwkv_runtime_weights(self.model)
                 clear_rwkv_cudagraphs()
-            return
-        with torch.device(self.device):
-            finalize_layerwise_reload(self.model, self.model_config)
+            else:
+                finalize_layerwise_reload(self.model, self.model_config)
         empty_cuda_cache_rocm()
 
     def update_weights(self, update_info: dict[str, Any]) -> None:
@@ -169,7 +168,9 @@ class DeltaWeightTransferEngine(WeightTransferEngine[DeltaTransferInitInfo, Delt
 
         with torch.device(self.device), disable_mtp_completeness_check():
             if getattr(getattr(self.model, "config", None), "model_type", None) == "rwkv":
-                from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import load_rwkv_checkpoint_weights
+                from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
+                    load_rwkv_checkpoint_weights,
+                )
 
                 load_rwkv_checkpoint_weights(self.model, tensors)
             else:

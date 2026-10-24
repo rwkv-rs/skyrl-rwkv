@@ -916,8 +916,8 @@ def _get_critic_model(
             length = int(lengths.max().item())
             length = (length + RWKV_CHUNK_LENGTH - 1) // RWKV_CHUNK_LENGTH * RWKV_CHUNK_LENGTH
             recurrent_ids = input_ids.new_zeros((input_ids.shape[0], length))
-            for index, length in enumerate(lengths.tolist()):
-                recurrent_ids[index, :length] = input_ids[index, attention_mask[index].bool()]
+            for index, sample_length in enumerate(lengths.tolist()):
+                recurrent_ids[index, :sample_length] = input_ids[index, attention_mask[index].bool()]
             base_model = getattr(self, self.base_model_prefix)
             was_training = base_model.training
             # RWKV's recurrent cache is an FP32 state contract.  The critic
@@ -952,12 +952,12 @@ def _get_critic_model(
                 value_head = getattr(self, self.value_head_prefix)
                 recurrent_values = value_head(hidden_states.to(value_head.weight.dtype)).squeeze(-1)
             values = recurrent_values.new_zeros(input_ids.shape)
-            for index, length in enumerate(lengths.tolist()):
-                values[index, attention_mask[index].bool()] = recurrent_values[index, :length]
+            for index, sample_length in enumerate(lengths.tolist()):
+                values[index, attention_mask[index].bool()] = recurrent_values[index, :sample_length]
             if return_output:
                 restored_hidden_states = hidden_states.new_zeros((*input_ids.shape, hidden_states.shape[-1]))
-                for index, length in enumerate(lengths.tolist()):
-                    restored_hidden_states[index, attention_mask[index].bool()] = hidden_states[index, :length]
+                for index, sample_length in enumerate(lengths.tolist()):
+                    restored_hidden_states[index, attention_mask[index].bool()] = hidden_states[index, :sample_length]
                 outputs["last_hidden_state"] = restored_hidden_states
             return values[:, :-1], outputs
 

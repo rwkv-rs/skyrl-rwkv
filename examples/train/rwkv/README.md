@@ -344,14 +344,12 @@ Environment metadata selects `open_think` for Math and `fake_think` for the othe
 domains while preserving the generated token IDs. For a 25600-token training
 context and 8192 generated tokens, set `trainer.max_prompt_length=17408`.
 
-Initialize the actor from the rollout checkpoint. For a NoRA critic, set
-`trainer.critic.model.path` to its original base and `trainer.critic.resume_path`
-to the selected native offline `step_N` checkpoint, preserving its unmerged
-adapter computation. Set `trainer.critic.model.lora.use_nora=true`, `rank=8`,
-`alpha=8`, and `target_modules=[mlp.key,mlp.value]` under the same `lora` config.
-The original backbone weights stay frozen; Channel-mixing adapters and the full
-FP32 value head train. Native resume requires the same adapter targets and rank
-as the saved run; choose the targets before pretraining a new critic.
+For a fresh SAO run, initialize both policy and critic from the same base model
+and set `trainer.critic.resume_path=null`. Set
+`trainer.critic.model.lora.use_nora=true`, `rank=64`, `alpha=64`, and
+`target_modules=[mlp.key,mlp.value]`. The attention backbone stays frozen while
+the MLP adapters and the full FP32 value head train. Do not reuse a critic
+checkpoint produced with different adapter targets.
 
 ### SAO configuration
 
@@ -369,35 +367,20 @@ retaining skip-observation and the separate critic lambda. Advantages are raw;
 normalization and loss reduction use the existing trainer controls. The original
 `gae` estimator and other algorithms retain their existing behavior.
 
-For an initial synchronous run, reuse the existing RWKV launcher with explicit
-algorithm overrides and a pretrained critic. A smaller critic mini-batch together
-with `trainer.critic_update_epochs_per_batch=2` trains every rollout twice for
-each actor pass, matching `miles-values` `num_critic_epochs=2`. This is a
-starting configuration, not a validated convergence recipe:
+The fixed eight-card SAO launcher keeps policy, reference, critic, and eight
+local vLLM engines on GPUs 0--7. A smaller critic mini-batch together with
+`trainer.critic_update_epochs_per_batch=2` trains every rollout twice for each
+actor pass, matching `miles-values` `num_critic_epochs=2`. `test` mode creates
+small parquet prefixes with a row-limited Parquet reader, so it does not load or
+tokenize the full training set:
 
 ```bash
-CRITIC_BASE="$HOME/Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600"
-CRITIC_CHECKPOINT="${CRITIC_CHECKPOINT:?Set this to a native value-pretraining step_N checkpoint}"
-RUN_NAME=rwkv7-g1k-1.5b-20260930-ctx25600-gsm8k-sao \
-MICRO_BATCH_SIZE=4 \
-bash examples/train/rwkv/run_rwkv_flashreinforce.sh \
-  trainer.algorithm.advantage_estimator=gae_adaptive \
-  trainer.algorithm.policy_loss_type=rollout_is \
-  trainer.algorithm.gae_adaptive.alpha=1.5 \
-  trainer.algorithm.gae_adaptive.critic_lambd=1.0 \
-  trainer.critic_update_epochs_per_batch=2 \
-  trainer.algorithm.eps_clip_low=0.3 \
-  trainer.algorithm.eps_clip_high=5.0 \
-  trainer.critic.model.path="$CRITIC_BASE" \
-  trainer.critic.resume_path="$CRITIC_CHECKPOINT" \
-  trainer.critic.model.lora.use_nora=true \
-  trainer.critic.model.lora.rank=8 \
-  trainer.critic.model.lora.alpha=8 \
-  trainer.critic.model.lora.target_modules="['mlp.key','mlp.value']" \
-  trainer.critic.model_config_kwargs.wkv_mode=fp32io16 \
-  trainer.critic_mini_batch_size=64 \
-  generator.inference_engine.engine_init_kwargs.logprobs_mode=raw_logprobs \
-  generator.use_conversation_multi_turn=true \
+# Fast end-to-end smoke test: 256 train rows, 64 validation rows, 2 steps.
+bash examples/train/rwkv/run_rwkv_sao.sh test \
+  > /tmp/results_rwkv_sao_test.log 2>&1
+
+# Full fresh run: base critic, no resume checkpoint, 50 steps on eight GPUs.
+bash examples/train/rwkv/run_rwkv_sao.sh train \
   > /tmp/results_rwkv_sao.log 2>&1
 ```
 

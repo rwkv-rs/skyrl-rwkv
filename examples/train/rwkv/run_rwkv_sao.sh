@@ -2,8 +2,9 @@
 
 set -euo pipefail
 
-# Fixed eight-card synchronous SAO launcher.  `test` prepares a small parquet
-# prefix before starting the same policy/ref/critic placement and update path.
+# Fixed eight-card SAO launcher. `test` prepares a small parquet prefix and
+# disables external logging; the production path uses the full dataset and
+# always records metrics to W&B.
 MODE="${1:-train}"
 if [[ "$MODE" == "test" || "$MODE" == "train" ]]; then
   shift
@@ -23,7 +24,6 @@ fi
 : "${DATA_DIR:=$HOME/data/ultradata-sao}"
 : "${RUN_NAME:=rwkv-g1l-1b-sao-50step-8gpu}"
 : "${OUTPUT_ROOT:=$HOME/skyrl-rwkv-runs/$RUN_NAME}"
-: "${LOGGER:=console}"
 
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 export NUM_GPUS=8 NUM_POLICY_GPUS=8 NUM_INFERENCE_GPUS=8
@@ -40,7 +40,7 @@ export NCCL_SHM_DISABLE="${NCCL_SHM_DISABLE:-0}"
 if [[ "$MODE" == "test" ]]; then
   : "${TEST_TRAIN_SAMPLES:=256}"
   : "${TEST_VAL_SAMPLES:=64}"
-  : "${TEST_STEPS:=2}"
+  : "${TEST_STEPS:=10}"
   : "${TEST_MAX_PROMPT_LENGTH:=17408}"
   : "${TEST_MAX_GENERATE_LENGTH:=512}"
   : "${TEST_DATA_DIR:=$HOME/.cache/skyrl-rwkv/sao-test-${TEST_TRAIN_SAMPLES}-${TEST_VAL_SAMPLES}}"
@@ -77,6 +77,7 @@ PY
   MAX_PROMPT_LENGTH="$TEST_MAX_PROMPT_LENGTH"
   MAX_GENERATE_LENGTH="$TEST_MAX_GENERATE_LENGTH"
   RUN_NAME="${RUN_NAME}-test"
+  LOGGER=console
 else
   TRAIN_DATA="$DATA_DIR/train.parquet"
   VAL_DATA="$DATA_DIR/validation.parquet"
@@ -88,6 +89,7 @@ else
   MAX_STEPS=50
   MAX_PROMPT_LENGTH=24576
   MAX_GENERATE_LENGTH=8192
+  LOGGER=wandb
 fi
 
 RUN_ROOT="${OUTPUT_ROOT%/*}/$RUN_NAME"

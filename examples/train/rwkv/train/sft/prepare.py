@@ -6,7 +6,7 @@ curriculum_sampler.py's checkpointable sampler.
 Usage from the repository root::
 
     uv run --isolated --no-project .venv/bin/python \\
-        -m examples.train.rwkv.prepare_sft \\
+        -m examples.train.rwkv.train.sft.prepare \\
         --input ~/Datasets/Nemotron-SFT-Math-v4 --output ~/data/rwkv-direct-sft
 """
 

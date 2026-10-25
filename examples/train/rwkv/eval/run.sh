@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+PROJECT_ROOT="$(cd "$ROOT/../../.." && pwd)"
+PYTHON="${PYTHON:-$PROJECT_ROOT/.venv/bin/python3}"
+MODEL="${MODEL:?Set MODEL to the HF RWKV checkpoint to evaluate}"
+OUTPUT="${OUTPUT:?Set OUTPUT to the checkpoint evaluation directory}"
+STEP="${STEP:-0}"
+NUM_GPUS="${NUM_GPUS:-8}"
+[[ "$NUM_GPUS" -eq 8 ]] || { echo 'RWKV evaluation requires NUM_GPUS=8' >&2; exit 2; }
+if [[ "${1:-}" == "--test_mode" || "${1:-}" == "--test-mode" ]]; then
+  export WANDB_MODE=disabled
+  export WANDB_DISABLED=true
+else
+  unset WANDB_DISABLED
+  export WANDB_MODE=online
+fi
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export VLLM_ALLOW_LONG_MAX_MODEL_LEN=1
+export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
+
+BASE_PORT="${BASE_PORT:-19100}"
+ROUTER_PORT="${ROUTER_PORT:-19200}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.65}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-1024}"
+MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
+PIDS=()
+URLS=()
+mkdir -p "$OUTPUT"
+cleanup() {
+  for pid in "${PIDS[@]}"; do
+    kill -- "-$pid" 2>/dev/null || true
+  done
+  for pid in "${PIDS[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+}
+trap cleanup EXIT INT TERM
+
+for ((gpu = 0; gpu < NUM_GPUS; gpu++)); do
+  port=$((BASE_PORT + gpu))
+  URLS+=("http://127.0.0.1:$port")
+  setsid env CUDA_VISIBLE_DEVICES="$gpu" uv run --isolated --no-config --no-project "$PYTHON" \
+    -m vllm.entrypoints.openai.api_server --model "$MODEL" --served-model-name "$(basename "$MODEL")" \
+    --host 127.0.0.1 --port "$port" --dtype bfloat16 --max-model-len "$MAX_MODEL_LEN" \
+    --max-num-seqs "$MAX_NUM_SEQS" --max-num-batched-tokens 32768 \
+    --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" --enable-prefix-caching \
+    --enable-chunked-prefill --no-enable-log-requests > "$OUTPUT/inference-gpu$gpu.log" 2>&1 &
+  PIDS+=("$!")
+done
+
+ROUTER_ARGS=(--host 127.0.0.1 --port "$ROUTER_PORT" --policy round_robin --worker-urls "${URLS[@]}")
+setsid uv run --isolated --no-config --no-project "$PYTHON" -m vllm_router.launch_router \
+  "${ROUTER_ARGS[@]}" \
+  > "$OUTPUT/router.log" 2>&1 &
+PIDS+=("$!")
+
+deadline=$((SECONDS + 900))
+for ((gpu = 0; gpu < NUM_GPUS; gpu++)); do
+  port=$((BASE_PORT + gpu))
+  until curl --fail --silent --max-time 2 "http://127.0.0.1:$port/health" >/dev/null; do
+    (( SECONDS >= deadline )) && { echo "inference startup timed out on port $port" >&2; exit 1; }
+    sleep 2
+  done
+done
+
+until curl --fail --silent --max-time 2 "http://127.0.0.1:$ROUTER_PORT/health" >/dev/null; do
+  (( SECONDS >= deadline )) && { echo "router startup timed out on port $ROUTER_PORT" >&2; exit 1; }
+  sleep 2
+done
+BASE_URL="http://127.0.0.1:$ROUTER_PORT"
+BASE_URL="$BASE_URL,$BASE_URL,$BASE_URL,$BASE_URL,$BASE_URL,$BASE_URL,$BASE_URL,$BASE_URL"
+ARGS=(--model "$MODEL" --base-url "$BASE_URL" --output "$OUTPUT" --step "$STEP" \
+  --lighteval-project "${LIGHTEVAL_PROJECT:-$HOME/Projects/MachineLearning/lighteval-rwkv}")
+if [[ "${1:-}" == "--test_mode" || "${1:-}" == "--test-mode" ]]; then
+  ARGS+=(--test_mode)
+  shift
+fi
+[[ $# -eq 0 ]] || { echo "unexpected arguments: $*" >&2; exit 2; }
+uv run --isolated --no-config --no-project "$PYTHON" "$ROOT/eval/prepare.py" "${ARGS[@]}"

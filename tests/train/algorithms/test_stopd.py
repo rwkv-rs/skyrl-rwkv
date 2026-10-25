@@ -24,12 +24,12 @@ from examples.train.on_policy_distillation.stopd import (
     request_seed,
     token_weights,
 )
-from examples.train.rwkv.benchmark_stopd import (
+from examples.train.rwkv.train.opd.benchmark_stopd import (
     run_config,
     summarize,
     validate_training_input,
 )
-from examples.train.rwkv.evaluate import set_generation_budgets
+from examples.train.rwkv.eval.evaluate import set_generation_budgets
 from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
     get_vllm_sampling_params,
 )
@@ -245,7 +245,7 @@ async def test_async_lighteval_lends_training_gpus_and_restores_them(monkeypatch
     pool.start.side_effect = start
     pool.shutdown.side_effect = lambda: events.append("shutdown")
     create_pool = MagicMock(return_value=pool)
-    monkeypatch.setattr("examples.train.rwkv.evaluate.create_eval_server_pool", create_pool)
+    monkeypatch.setattr("examples.train.rwkv.eval.evaluate.create_eval_server_pool", create_pool)
     router = MagicMock()
     router.shutdown.side_effect = lambda: events.append("router_shutdown")
     client = SimpleNamespace(server_urls=["http://sampler"] + pool.get_server_urls())
@@ -715,7 +715,7 @@ def test_benchmark_replays_complete_configuration_and_checkpoint(tmp_path, monke
     original["trainer"]["policy"]["model"]["path"] = "rwkv7-g1k-1.5b-20260930-ctx25600"
     calls = []
     monkeypatch.setattr(
-        "examples.train.rwkv.benchmark_stopd.subprocess.run", lambda *args, **kwargs: calls.append(args)
+        "examples.train.rwkv.train.opd.benchmark_stopd.subprocess.run", lambda *args, **kwargs: calls.append(args)
     )
     source = tmp_path / "global_step_50"
     for mode in ("vanilla", "stopd"):

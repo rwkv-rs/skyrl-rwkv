@@ -13,7 +13,7 @@ if [[ ${1:-} == show ]]; then
   shift
   remote+='exec uv run --isolated --no-sync --extra rwkv python temp/show_details.py'
 else
-  remote+='exec bash examples/train/rwkv/run_rwkv_flashreinforce.sh'
+  remote+='exec bash examples/train/rwkv/train/flashreinforce/run.sh'
 fi
 for arg in "$@"; do
   printf -v quoted '%q' "$arg"

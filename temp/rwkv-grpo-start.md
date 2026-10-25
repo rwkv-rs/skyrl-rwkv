@@ -38,7 +38,7 @@ export MODEL_DIR="$MODEL_ROOT/$MODEL_SUBFOLDER"
 训练前在同一个 `.venv` 和持久化扩展缓存中完成 FlashRWKV2 的单进程预编译：
 
 ```bash
-MAX_JOBS=2 bash examples/train/rwkv/run_rwkv_grpo.sh --prepare-flashrwkv2
+MAX_JOBS=2 bash examples/train/rwkv/train/flashreinforce/run.sh --prepare-flashrwkv2
 ```
 
 该步骤调用 vLLM-RWKV 的实际 loader，并验证 `.so` 产物；训练入口只接受已就绪的缓存，不会让 Ray/vLLM worker 现场编译。
@@ -104,7 +104,7 @@ nvidia-smi
 MODEL_DIR="$MODEL_DIR" \
 NUM_GPUS=8 \
 MICRO_BATCH_SIZE=2 \
-bash examples/train/rwkv/run_rwkv_grpo.sh
+bash examples/train/rwkv/train/flashreinforce/run.sh
 ```
 
 脚本默认配置如下：
@@ -129,7 +129,7 @@ rwkv7-g1j-1.5b-gsm8k-grpo-50step
 如果显存不足，只把每卡 micro-batch 调为 `1`：
 
 ```bash
-MICRO_BATCH_SIZE=1 bash examples/train/rwkv/run_rwkv_grpo.sh
+MICRO_BATCH_SIZE=1 bash examples/train/rwkv/train/flashreinforce/run.sh
 ```
 
 不要因此修改全局 `train_batch_size` 或 `policy_mini_batch_size`。

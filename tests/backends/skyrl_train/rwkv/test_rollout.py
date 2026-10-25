@@ -11,7 +11,8 @@ from types import SimpleNamespace
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parents[4]))
-from examples.train.rwkv import build_value_data, rollout
+from examples.train.rwkv.train.common import rollout
+from examples.train.rwkv.train.sao import build_value_data
 
 
 class Tokenizer:
@@ -117,7 +118,7 @@ def test_ultradata_native_rewards_match_rollout(
 def test_prepare_ultradata_rl_keeps_lazy_rewards_and_question_split(tmp_path):
     import pyarrow.parquet as pq
 
-    from examples.train.rwkv.prepare_opd import prepare
+    from examples.train.rwkv.train.opd.prepare import prepare
 
     source = tmp_path / "source"
     source.mkdir()
@@ -715,7 +716,7 @@ def test_build_value_data_preserves_tokens_masks_outcomes_and_uuid_split(tmp_pat
                 "--isolated",
                 "--no-project",
                 sys.executable,
-                str(root / "examples/train/rwkv/build_value_data.py"),
+                str(root / "examples/train/rwkv/train/sao/build_value_data.py"),
                 "--input",
                 str(token_rollout_run),
                 "--output",
@@ -931,7 +932,7 @@ def test_rwkv_native_artifact_preflight_rejects_unmatched_install_before_loading
 ):
     from unittest.mock import MagicMock
 
-    from examples.train.rwkv import prepare_flashrwkv2 as preparation
+    from examples.train.rwkv.train.common import prepare_flashrwkv2 as preparation
 
     (tmp_path / "pyproject.toml").write_text('[tool.uv.sources.vllm]\nrev = "project-pin"\n')
     monkeypatch.chdir(tmp_path)
@@ -956,7 +957,7 @@ def test_rwkv_native_artifact_preflight_rejects_unmatched_install_before_loading
 def test_rwkv_native_artifact_environment_records_verified_installed_revision(tmp_path, monkeypatch):
     from unittest.mock import MagicMock
 
-    from examples.train.rwkv import prepare_flashrwkv2 as preparation
+    from examples.train.rwkv.train.common import prepare_flashrwkv2 as preparation
 
     (tmp_path / "pyproject.toml").write_text('[tool.uv.sources.vllm]\nrev = "matched-install"\n')
     monkeypatch.chdir(tmp_path)

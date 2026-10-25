@@ -12,7 +12,7 @@ from peft import LoraConfig, TaskType, get_peft_model
 from transformers import AutoConfig, LlamaConfig, LlamaForCausalLM
 
 sys.path.insert(0, str(Path(__file__).parents[4]))
-from examples.train.rwkv import antidoom
+from examples.train.rwkv.train.antidoom import train as antidoom
 
 
 class Tokenizer:

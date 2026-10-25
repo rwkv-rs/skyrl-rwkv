@@ -56,6 +56,61 @@ else:
     CPUOffloadPolicy, FSDPModule, MixedPrecisionPolicy = None, None, None
 
 
+_DEFAULT_SST_TARGET_MODULES = (
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    # RWKV projections used by the native NoRA recipe.
+    "r_proj",
+    "mlp.key",
+    "mlp.value",
+)
+
+
+class _SSTProjector:
+    """Keep the free-to-free singular subspace for one dense weight matrix."""
+
+    def __init__(self, weight: torch.Tensor, rank: float) -> None:
+        self.rank = rank
+        self.free_left: Optional[torch.Tensor] = None
+        self.free_right: Optional[torch.Tensor] = None
+        self.refresh(weight)
+
+    def refresh(self, weight: torch.Tensor) -> None:
+        """Recompute free singular bases from the current reference weight."""
+        weight = weight.detach().float()
+        if weight.ndim != 2:
+            raise ValueError(f"SST only supports matrices, got shape {tuple(weight.shape)}")
+        rows, cols = weight.shape
+        rank = min(rows, cols)
+        protected = min(int(self.rank * rank), rank)
+        if protected == rank:
+            self.free_left = weight.new_empty((rows, 0))
+            self.free_right = weight.new_empty((cols, 0))
+            return
+        # full_matrices=False gives a compact basis and lets the protected
+        # fraction stay cheap even for wide RWKV projections.
+        u, _, vh = torch.linalg.svd(weight, full_matrices=False)
+        self.free_left = u[:, protected:].contiguous()
+        self.free_right = vh[protected:].transpose(0, 1).contiguous()
+
+    def project(self, delta: torch.Tensor) -> torch.Tensor:
+        """Project an optimizer update onto the free-to-free block."""
+        if self.free_left is None or self.free_right is None:
+            return delta
+        if self.free_left.shape[1] == 0 or self.free_right.shape[1] == 0:
+            return torch.zeros_like(delta)
+        left = self.free_left.to(device=delta.device, dtype=torch.float32)
+        right = self.free_right.to(device=delta.device, dtype=torch.float32)
+        delta_float = delta.float()
+        projected = left @ (left.transpose(0, 1) @ delta_float @ right) @ right.transpose(0, 1)
+        return projected.to(dtype=delta.dtype)
+
+
 class FSDPStrategy(DistributedStrategy):
     """
     The strategy for training with FSDP.
@@ -92,6 +147,22 @@ class FSDPStrategy(DistributedStrategy):
 
         # LoRA related configs
         self.is_lora = self.model_config.lora.rank > 0 if self.model_config is not None else False
+        self.sst = bool(getattr(optimizer_config, "sst", False)) if optimizer_config is not None else False
+        if self.sst and self.is_lora:
+            raise ValueError("SST requires full-parameter training and cannot be combined with LoRA or NoRA.")
+        self.sst_rank = float(getattr(optimizer_config, "sst_rank", 0.99)) if optimizer_config is not None else 0.99
+        self.sst_refresh_interval = (
+            int(getattr(optimizer_config, "sst_refresh_interval", 0)) if optimizer_config is not None else 0
+        )
+        if self.sst and not 0 <= self.sst_rank < 1:
+            raise ValueError(f"sst_rank must be in [0, 1), got {self.sst_rank}")
+        if self.sst and self.sst_refresh_interval < 0:
+            raise ValueError(f"sst_refresh_interval must be non-negative, got {self.sst_refresh_interval}")
+        configured_targets = getattr(optimizer_config, "sst_target_modules", None) if optimizer_config else None
+        self.sst_target_modules = tuple(configured_targets or _DEFAULT_SST_TARGET_MODULES)
+        self._sst_projectors: dict[str, _SSTProjector] = {}
+        self._sst_warned = False
+        self._sst_step = 0
 
         self.time_steps = defaultdict(int)
 
@@ -179,7 +250,17 @@ class FSDPStrategy(DistributedStrategy):
             optimizer.zero_grad()
             return grad_norm
 
+        before = {}
+        if self.sst:
+            before = {
+                name: parameter.detach().clone()
+                for name, parameter in model.named_parameters()
+                if name in self._sst_projectors and parameter.ndim == 2
+            }
         optimizer.step()
+        if self.sst:
+            self._sst_step += 1
+            self._project_sst_updates(model, before)
         if scheduler is not None:
             scheduler.step()
         optimizer.zero_grad()
@@ -262,6 +343,10 @@ class FSDPStrategy(DistributedStrategy):
     def _fsdp_init_train_model(self, model, optimizer, scheduler):
         """Initialize a model for training with FSDP"""
         is_wrapped = isinstance(model, HFModelWrapper)
+        if self.sst:
+            # SST needs the unsharded reference matrix to compute its bases.
+            # Capture it before composable FSDP replaces parameters with shards.
+            self._init_sst_projectors(model.model if is_wrapped else model)
         fsdp_module = self._fsdp_init_model(model, is_train=True, is_wrapped=is_wrapped)
 
         optim_config = self.optimizer_config
@@ -290,6 +375,97 @@ class FSDPStrategy(DistributedStrategy):
             model = fsdp_module
 
         return model, new_optimizer, lr_scheduler
+
+    def _init_sst_projectors(self, module: nn.Module) -> None:
+        """Build SST bases for the configured dense projection parameters."""
+        self._sst_projectors.clear()
+        for name, parameter in module.named_parameters():
+            matches_target = any(
+                name == target
+                or name.startswith(f"{target}.")
+                or name.endswith(f".{target}")
+                or f".{target}." in name
+                for target in self.sst_target_modules
+            )
+            if parameter.ndim != 2 or not matches_target:
+                continue
+            if parameter.is_meta:
+                continue
+            try:
+                self._sst_projectors[name] = _SSTProjector(parameter.detach(), self.sst_rank)
+            except (RuntimeError, ValueError) as exc:
+                logger.warning("Skipping SST basis for {}: {}", name, exc)
+        if not self._sst_projectors:
+            logger.warning("SST is enabled but no matching dense projection parameters were found.")
+
+    def _project_sst_updates(self, model: nn.Module, before: dict[str, torch.Tensor]) -> None:
+        """Replace constrained optimizer updates with their SST projections."""
+        from torch.distributed.tensor import DTensor
+
+        named_parameters = dict(model.named_parameters())
+        for name, projector in self._sst_projectors.items():
+            parameter = named_parameters.get(name)
+            old = before.get(name)
+            if parameter is None or old is None or parameter.ndim != 2 or tuple(parameter.shape) != tuple(old.shape):
+                continue
+            try:
+                with torch.no_grad():
+                    if isinstance(parameter, DTensor):
+                        delta = parameter.to_local() - old.to_local()
+                        projected = self._project_sst_dtensor_delta(parameter, projector, delta)
+                        local = old.to_local() + projected
+                        parameter.copy_(DTensor.from_local(local, parameter.device_mesh, parameter.placements))
+                    else:
+                        delta = parameter.detach() - old
+                        parameter.copy_(old + projector.project(delta))
+            except (RuntimeError, TypeError, ValueError) as exc:
+                if not self._sst_warned:
+                    logger.warning("SST could not project sharded parameters in this FSDP setup: {}", exc)
+                    self._sst_warned = True
+                continue
+            if self.sst_refresh_interval and self._sst_step % self.sst_refresh_interval == 0:
+                try:
+                    reference = parameter.full_tensor() if isinstance(parameter, DTensor) else parameter.detach()
+                    projector.refresh(reference)
+                except (RuntimeError, ValueError) as exc:
+                    if not self._sst_warned:
+                        logger.warning("SST basis refresh was skipped: {}", exc)
+                        self._sst_warned = True
+
+    @staticmethod
+    def _project_sst_dtensor_delta(parameter, projector: _SSTProjector, delta: torch.Tensor) -> torch.Tensor:
+        """Project a row- or column-sharded FSDP2 update without materializing the parameter."""
+        from torch.distributed.tensor import DTensor, Replicate, Shard
+
+        placements = parameter.placements
+        shard = next((placement for placement in placements if isinstance(placement, Shard)), None)
+        if shard is None:
+            return projector.project(delta)
+
+        left = projector.free_left.to(device=delta.device, dtype=torch.float32)
+        right = projector.free_right.to(device=delta.device, dtype=torch.float32)
+        delta_float = delta.float()
+        if shard.dim == 0:
+            # Rows are sharded: apply the input-side projector locally, gather
+            # rows, then apply the output-side projector before redistributing.
+            local = delta_float @ right @ right.transpose(0, 1)
+            global_delta = DTensor.from_local(
+                local, parameter.device_mesh, parameter.placements
+            ).full_tensor()
+            global_projected = left @ (left.transpose(0, 1) @ global_delta)
+        elif shard.dim == 1:
+            # Columns are sharded: the output-side projection is local, then
+            # the input-side projection is applied after gathering columns.
+            local = left @ (left.transpose(0, 1) @ delta_float)
+            global_delta = DTensor.from_local(
+                local, parameter.device_mesh, parameter.placements
+            ).full_tensor()
+            global_projected = global_delta @ right @ right.transpose(0, 1)
+        else:
+            raise ValueError(f"Unsupported SST shard dimension {shard.dim}")
+        replicated_placements = tuple(Replicate() for _ in parameter.placements)
+        replicated = DTensor.from_local(global_projected, parameter.device_mesh, replicated_placements)
+        return replicated.redistribute(parameter.device_mesh, placements).to_local().to(dtype=delta.dtype)
 
     def _fsdp_init_eval_model(self, model):
         """Initialize a model for evaluation with FSDP"""

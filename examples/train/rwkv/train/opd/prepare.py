@@ -2,16 +2,20 @@
 
 import argparse
 import json
+import sys
 from collections import Counter
 from contextlib import ExitStack
 from pathlib import Path
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 
 import orjson
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from examples.train.rwkv.build_value_data import question_split
-from examples.train.rwkv.rollout import DOMAINS
+from examples.train.rwkv.train.sao.build_value_data import question_split
+from examples.train.rwkv.train.common.rollout import DOMAINS
 
 
 def prepare(input_dir: Path, output: Path, task_rewards=False, validation_fraction=0.0, seed=42):

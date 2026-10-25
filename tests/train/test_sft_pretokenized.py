@@ -21,7 +21,7 @@ def test_direct_nemotron_sft_preserves_original_cot_and_question_split(tmp_path)
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    from examples.train.rwkv.prepare_sft import expert_rows, validation_question
+    from examples.train.rwkv.train.sft.prepare import expert_rows, validation_question
 
     reasoning = "Original expert reasoning\n" * 10000
     source = [

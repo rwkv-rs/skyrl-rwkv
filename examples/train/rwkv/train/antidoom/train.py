@@ -3,7 +3,7 @@
 Repetition detection and FTPO objective adapted from Liquid4All/antidoom
 (Apache-2.0) and Liquid4All/cookbook/finetuning/notebooks/antidoom_with_trl.ipynb.
 Changes: exact RWKV rollout IDs, native SkyRL FSDPStrategy, NoRA, and automatic
-merge. Generation follows examples.train.rwkv.rollout's vLLM token API.
+merge. Generation follows examples.train.rwkv.train.common.rollout's vLLM token API.
 """
 
 import argparse
@@ -26,6 +26,9 @@ from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[5]))
 
 import numpy as np
 import torch
@@ -724,7 +727,7 @@ async def generate(args):
     import aiohttp
     from datasets import load_dataset
     from transformers import AutoConfig
-    from examples.train.rwkv.rollout import ROLLOUT_SAMPLING_PARAMS, SAMPLING_PARAMS, start_servers
+    from examples.train.rwkv.train.common.rollout import ROLLOUT_SAMPLING_PARAMS, SAMPLING_PARAMS, start_servers
 
     soft_limit, hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
     if soft_limit < args.concurrency + 1024:

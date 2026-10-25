@@ -29,7 +29,7 @@ from examples.train.on_policy_distillation.main_on_policy_distill import (
 )
 from examples.train.on_policy_distillation.stopd import STOPD
 from examples.train.on_policy_distillation.topd import topd_stopd_policy_loss
-from examples.train.rwkv.prepare_flashrwkv2 import check
+from examples.train.rwkv.train.common.prepare_flashrwkv2 import check
 from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
 from skyrl.backends.skyrl_train.utils.ppo_utils import ppo_policy_loss
 from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
@@ -337,7 +337,7 @@ def compare_teacher_precision(args, cfg, rank, world, emit):
     """Separate teacher weight rounding from compute precision on fixed states."""
     from transformers import AutoModelForCausalLM
 
-    from examples.train.rwkv.antidoom import load_model
+    from examples.train.rwkv.train.antidoom.train import load_model
 
     rows = []
     with args.rollouts.open() as handle:

@@ -311,7 +311,7 @@ class OnPolicyDistillationTrainer(RayPPOTrainer):
             "--no-project",
             sys.executable,
             "-m",
-            "examples.train.rwkv.evaluate",
+            "examples.train.rwkv.eval.evaluate",
             "--project",
             config.project,
             "--url",
@@ -620,7 +620,7 @@ class FullyAsyncOnPolicyDistillationTrainer(FullyAsyncRayPPOTrainer, OnPolicyDis
         if self.cfg.trainer.algorithm.lighteval.project is None:
             return await super().eval(vllm_metrics_scraper=vllm_metrics_scraper)
 
-        from examples.train.rwkv.evaluate import create_eval_server_pool
+        from examples.train.rwkv.eval.evaluate import create_eval_server_pool
         from skyrl.backends.skyrl_train.inference_servers.setup import build_new_inference_client
 
         async with self._staleness_manager.pause_generation(self._generation_failure):

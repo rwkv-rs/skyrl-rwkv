@@ -374,7 +374,7 @@ def test_stopd_warmup_matches_full_topd_without_randomization():
 @pytest.mark.parametrize("displacement", [0.0, 0.1, 0.7])
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_explicit_prefix_objective_matches_signed_loss_gradient(displacement, asynchronous):
-    from examples.train.rwkv.audit_topd import reference_loss_gradient
+    from examples.train.rwkv.train.opd.audit_topd import reference_loss_gradient
 
     obj = trainer()
     obj.cfg.trainer.algorithm.async_opd = asynchronous

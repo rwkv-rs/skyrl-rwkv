@@ -46,7 +46,7 @@ def denominator_from_rollouts(rows):
 
 def stop_baseline(pid):
     process = psutil.Process(pid)
-    if not any("run_rwkv_on_policy_distill.sh" in arg for arg in process.cmdline()):
+    if not any("train/opd/run.sh" in arg for arg in process.cmdline()):
         raise ValueError("baseline-pid must identify the current RWKV OPD launcher")
     children = process.children(recursive=True)
     for child in children:
@@ -91,7 +91,7 @@ def run_config(project, config, output, mode, checkpoint, start_step, steps, blo
     )
     output.mkdir(parents=True, exist_ok=False)
     (output / "config.json").write_text(json.dumps(cfg, indent=2) + "\n")
-    command = ["bash", str(project / "examples/train/rwkv/run_rwkv_on_policy_distill.sh")]
+    command = ["bash", str(project / "examples/train/rwkv/train/opd/run.sh")]
     command.extend(f"{key}={json.dumps(value)}" for key, value in cfg.items())
     env = os.environ | {"RAY_ADDRESS": "local", "PYTHONPATH": f"{project}:{project / 'skyrl-gym'}"}
     print(f"Starting {mode}: checkpoint step {start_step}, {steps} updates", flush=True)
@@ -241,7 +241,7 @@ def continue_training(project, original, checkpoint, output):
         initial_denominator=None,
     )
     output.mkdir(parents=True, exist_ok=False)
-    command = ["bash", str(project / "examples/train/rwkv/run_rwkv_on_policy_distill.sh")]
+    command = ["bash", str(project / "examples/train/rwkv/train/opd/run.sh")]
     command.extend(f"{key}={json.dumps(value)}" for key, value in cfg.items())
     env = os.environ | {"RAY_ADDRESS": "local", "PYTHONPATH": f"{project}:{project / 'skyrl-gym'}"}
     with (output / "console.log").open("w") as handle:

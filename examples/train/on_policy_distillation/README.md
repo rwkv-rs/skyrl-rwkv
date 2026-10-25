@@ -42,7 +42,7 @@ continues to generate complete responses.
 STOPD is disabled by default. Enable it through the same OPD entry point:
 
 ```bash
-bash examples/train/rwkv/run_rwkv_on_policy_distill.sh \
+bash examples/train/rwkv/train/opd/run.sh \
   trainer.algorithm.stopd.enabled=true \
   trainer.algorithm.stopd.block=128 \
   trainer.algorithm.stopd.warmup_steps=25
@@ -68,7 +68,7 @@ position after warmup:
 
 ```bash
 uv run --isolated --no-project .venv/bin/python3 \
-  examples/train/rwkv/benchmark_stopd.py \
+  examples/train/rwkv/train/opd/benchmark_stopd.py \
   --checkpoint <global_step_directory> --output <new_benchmark_directory>
 ```
 
@@ -124,7 +124,7 @@ mini-batch size, clipping defaults, and proximal-teacher coefficient:
 
 ```bash
 USE_TOPD=true USE_STOPD=true \
-  bash examples/train/rwkv/run_rwkv_on_policy_distill.sh \
+  bash examples/train/rwkv/train/opd/run.sh \
   trainer.resume_mode=from_path \
   trainer.resume_path=<latest_complete_checkpoint>
 ```

@@ -49,7 +49,7 @@ from skyrl.train.generators.utils import (
 from skyrl.train.trainer import RayPPOTrainer
 from skyrl.train.utils import Timer
 from skyrl.train.utils.async_utils import BackgroundFailure, cancel_background_tasks
-from skyrl.train.utils.metrics import ScalarGauges, TrainingPhaseGauge
+from skyrl.train.utils.metrics import ScalarGauges, TrainingPhaseGauge, nvtx_range
 from skyrl.train.utils.trainer_utils import (
     ResumeMode,
     build_dataloader,
@@ -453,6 +453,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         self.sample_full_batch = cfg.trainer.fully_async.sample_full_batch
 
         self._phase_gauge = TrainingPhaseGauge()
+        # Producer-side capacity waits are the async analogue of trainer
+        # starvation: generation is ready to submit work but the learner has
+        # not advanced the staleness window yet.
+        self._training_wait_seconds = 0.0
+        self._training_wait_events = 0
 
         self._gen_buffer_maxsize = self.mini_batch_size * (self.max_staleness_steps + 1)
         self._loop_gauges = ScalarGauges()
@@ -826,6 +831,13 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                                 cur_generation_group_mini_batch,
                                 cur_dropped_groups,
                             )
+                        # Count the actual prompt + response tokens represented by this
+                        # iteration before the batch is consumed by the trainer.  This is
+                        # the numerator for the end-to-end TGS metric; unlike the
+                        # trainer-only tokens/sec metric it includes rollout and all
+                        # synchronization time in the denominator.
+                        attention_mask = training_input.get("attention_mask") if training_input is not None else None
+                        iteration_token_count = int(attention_mask.sum().item()) if attention_mask is not None else 0
 
                         # 3. Run training and update consumed UIDs.
                         with self._phase_gauge.timed_phase("run_training", self.all_timings):
@@ -875,8 +887,39 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             self.all_metrics.update(eval_metrics)
 
                     # Log metrics for this step after evaluation
+                    iteration_wall_clock = self.all_timings.get("step", 0.0)
+                    rollout_wait = self.all_timings.get("wait_for_generation_buffer", 0.0)
+                    training_wait = self._training_wait_seconds
+                    if iteration_wall_clock > 0:
+                        policy_gpus = (
+                            self.cfg.trainer.placement.policy_num_nodes
+                            * self.cfg.trainer.placement.policy_num_gpus_per_node
+                        )
+                        self.all_metrics.update(
+                            {
+                                "pipeline/rwt_seconds": rollout_wait,
+                                "pipeline/rwt_pct_iteration": 100.0 * rollout_wait / iteration_wall_clock,
+                                "pipeline/twt_seconds": training_wait,
+                                "pipeline/twt_pct_iteration": 100.0 * training_wait / iteration_wall_clock,
+                                "pipeline/training_wait_events": self._training_wait_events,
+                                "pipeline/iteration_total_tokens": iteration_token_count,
+                                "pipeline/tgs_full_iteration": (
+                                    iteration_token_count / (iteration_wall_clock * policy_gpus)
+                                    if policy_gpus > 0
+                                    else 0.0
+                                ),
+                            }
+                        )
+                        for phase_name, phase_seconds in self.all_timings.items():
+                            if phase_name in {"step", "wait_for_generation_buffer"}:
+                                continue
+                            self.all_metrics[f"pipeline/phase_pct/{phase_name}"] = (
+                                100.0 * phase_seconds / iteration_wall_clock
+                            )
                     self.tracker.log(self.all_metrics, step=self.global_step, commit=False)
                     self.all_metrics = {}
+                    self._training_wait_seconds = 0.0
+                    self._training_wait_events = 0
 
                     # 7. Checkpointing. At interval and optionally at the last step of each epoch.
                     is_epoch_end = trained_steps_this_epoch == self.num_steps_per_epoch
@@ -1179,7 +1222,8 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         # calculate advantages and returns / along with tensorboard logging
         with Timer("compute_advantages_and_returns", self.all_timings):
-            training_input = await asyncio.to_thread(self.compute_advantages_and_returns, training_input)
+            with nvtx_range("advantage_computation"):
+                training_input = await asyncio.to_thread(self.compute_advantages_and_returns, training_input)
             # remove some unwanted keys
             for key in ["rewards"]:
                 training_input.pop(key)
@@ -1194,19 +1238,22 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
 
         # train policy/critic model
         with Timer("train_critic_and_policy", self.all_timings):
-            if self.cfg.trainer.fully_async.streaming_batch_size:
-                gradient_scale = 1.0 / self._streaming_tokens if self._streaming_token_normalization() else 1.0
-                grad_norm = await asyncio.to_thread(self.dispatch.optim_step, "policy", gradient_scale=gradient_scale)
-                status = reduce_metrics(self._streaming_metrics, sum_loss_metrics=True)
-                for key in ("final_loss", "policy_loss"):
-                    if key in status:
-                        status[key] *= gradient_scale
-                status["grad_norm"] = grad_norm
-                self.all_metrics.update({f"policy/{key}": value for key, value in status.items()})
-                self._finish_streaming_step(training_input)
-                self.all_metrics["async/streamed_groups"] = self.mini_batch_size
-            else:
-                status = await asyncio.to_thread(self.train_critic_and_policy, training_input)
+            with nvtx_range("actor_update"):
+                if self.cfg.trainer.fully_async.streaming_batch_size:
+                    gradient_scale = 1.0 / self._streaming_tokens if self._streaming_token_normalization() else 1.0
+                    grad_norm = await asyncio.to_thread(
+                        self.dispatch.optim_step, "policy", gradient_scale=gradient_scale
+                    )
+                    status = reduce_metrics(self._streaming_metrics, sum_loss_metrics=True)
+                    for key in ("final_loss", "policy_loss"):
+                        if key in status:
+                            status[key] *= gradient_scale
+                    status["grad_norm"] = grad_norm
+                    self.all_metrics.update({f"policy/{key}": value for key, value in status.items()})
+                    self._finish_streaming_step(training_input)
+                    self.all_metrics["async/streamed_groups"] = self.mini_batch_size
+                else:
+                    status = await asyncio.to_thread(self.train_critic_and_policy, training_input)
 
         return status
 
@@ -1243,7 +1290,11 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                         self.global_step,
                     )
                     assert all(uid == uids[0] for uid in uids), "Expect all uids to be the same"
+                    wait_started = time.perf_counter()
                     submission_order = await self._staleness_manager.acquire_submission_slot()
+                    training_wait = time.perf_counter() - wait_started
+                    self._training_wait_seconds = getattr(self, "_training_wait_seconds", 0.0) + training_wait
+                    self._training_wait_events = getattr(self, "_training_wait_events", 0) + int(training_wait > 1e-6)
                     slot_acquired = True
                 generation_batch_step = None
                 if self.async_mode != "fully_async":
@@ -1502,9 +1553,10 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
         )
 
         # Per-token reward conversion (kept groups only) + reward metrics over the kept+dropped view.
-        generator_output, uids = self.postprocess_generator_output(
-            generator_output, uids, metrics_generator_output=metrics_generator_output, metrics_uids=metrics_uids
-        )
+        with Timer("reward_computation", self.all_timings), nvtx_range("reward_computation"):
+            generator_output, uids = self.postprocess_generator_output(
+                generator_output, uids, metrics_generator_output=metrics_generator_output, metrics_uids=metrics_uids
+            )
 
         # print example just for debugging
         vis = self.tokenizer.decode(generator_output["response_ids"][0])

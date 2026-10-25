@@ -1482,6 +1482,11 @@ def get_ray_pg_ready_with_timeout(pg: PlacementGroup, timeout: int = 60):
     try:
         ray.get(pg.ready(), timeout=timeout)
     except Exception as e:
+        # A timed-out placement group otherwise remains pending in Ray.  The
+        # next task retry then sees those reserved bundles and can report a
+        # misleading "insufficient GPU resources" error even after the
+        # original request has failed.
+        ray.util.remove_placement_group(pg)
         # Extract resource demands from the placement group
         bundles = pg.bundle_specs
         total_gpus = sum(bundle.get("GPU", 0) for bundle in bundles)

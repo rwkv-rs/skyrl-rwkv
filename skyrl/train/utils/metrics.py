@@ -14,6 +14,28 @@ from loguru import logger
 
 from skyrl.train.utils.utils import Timer
 
+
+@contextmanager
+def nvtx_range(name: str):
+    """Annotate a timed trainer block for Nsight Systems/Compute when CUDA is available."""
+    pushed = False
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.nvtx.range_push(f"skyrl:{name}")
+            pushed = True
+    except (ImportError, RuntimeError):
+        pass
+    try:
+        yield
+    finally:
+        if pushed:
+            import torch
+
+            torch.cuda.nvtx.range_pop()
+
+
 # Macro-phases of one async training step. Each name is the Timer key for that block, so the same
 # phase shows up in wandb as timing/<name>. Generation is not a phase: it runs in the background
 # across all of them, and its activity is tracked separately by the buffer-depth gauges.
@@ -62,7 +84,7 @@ class TrainingPhaseGauge:
     @contextmanager
     def timed_phase(self, name: str, timings: Dict[str, float]):
         """Time the block as wandb ``timing/<name>`` and mark ``name`` the active phase for its duration."""
-        with Timer(name, timings), self.phase(name):
+        with Timer(name, timings), self.phase(name), nvtx_range(name):
             yield
 
 

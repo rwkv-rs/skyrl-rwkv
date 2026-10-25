@@ -37,9 +37,7 @@ def _write_manifests(root: Path, model: str, endpoints: list[str]) -> tuple[Path
         )
     )
     benchmarks = root / "benchmarks.toml"
-    benchmarks.write_text(
-        "maths = [\n" + "\n".join(f'  "{name}",' for _, name, _ in BENCHMARKS) + "\n]\n"
-    )
+    benchmarks.write_text("maths = [\n" + "\n".join(f'  "{name}",' for _, name, _ in BENCHMARKS) + "\n]\n")
     return models, benchmarks
 
 
@@ -81,19 +79,12 @@ def evaluate(args: argparse.Namespace) -> Path:
     from src.rwkv_eval.main import RWKVRegistry
     from src.rwkv_eval.main import evaluate as producer_evaluate
 
-    endpoints = [
-        url.strip().rstrip("/") for url in args.base_url.split(",") if url.strip()
-    ]
+    endpoints = [url.strip().rstrip("/") for url in args.base_url.split(",") if url.strip()]
     if len(endpoints) != 8:
         raise ValueError(f"expected eight inference endpoints, got {len(endpoints)}")
     model_name = Path(args.model).name
-    models_path, benchmarks_path = _write_manifests(
-        args.output / ".manifests", model_name, endpoints
-    )
-    models = tuple(
-        ModelEndpoint(url, "EMPTY", model_name, args.max_num_seqs, args.context_length)
-        for url in endpoints
-    )
+    models_path, benchmarks_path = _write_manifests(args.output / ".manifests", model_name, endpoints)
+    models = tuple(ModelEndpoint(url, "EMPTY", model_name, args.max_num_seqs, args.context_length) for url in endpoints)
     benchmarks = tuple(BenchmarkSpec(field, name) for field, name, _ in BENCHMARKS)
 
     def run_producer(output_dir: Path):
@@ -112,9 +103,7 @@ def evaluate(args: argparse.Namespace) -> Path:
 
     scores, failures = run_producer(args.output / "avg")
     if failures:
-        raise RuntimeError(
-            f"lighteval-rwkv returned {len(failures)} failed avg benchmark records"
-        )
+        raise RuntimeError(f"lighteval-rwkv returned {len(failures)} failed avg benchmark records")
 
     original_update = RWKVRegistry._update_task_configs
 
@@ -139,16 +128,12 @@ def evaluate(args: argparse.Namespace) -> Path:
     finally:
         RWKVRegistry._update_task_configs = original_update
     if pass_failures:
-        raise RuntimeError(
-            f"lighteval-rwkv returned {len(pass_failures)} failed pass benchmark records"
-        )
+        raise RuntimeError(f"lighteval-rwkv returned {len(pass_failures)} failed pass benchmark records")
     pass_by_name = {score.benchmark_name: float(score.score) for score in pass_scores}
 
     rows = []
     for score in scores:
-        k = next(
-            expected for _, name, expected in BENCHMARKS if name == score.benchmark_name
-        )
+        k = next(expected for _, name, expected in BENCHMARKS if name == score.benchmark_name)
         value = float(score.score)
         rows.append(
             {
@@ -161,9 +146,7 @@ def evaluate(args: argparse.Namespace) -> Path:
         )
     args.output.mkdir(parents=True, exist_ok=True)
     metrics = {f"eval/{row['benchmark']}/avg@{row['k']}": row["avg"] for row in rows}
-    metrics.update(
-        {f"eval/{row['benchmark']}/pass@{row['k']}": row["pass"] for row in rows}
-    )
+    metrics.update({f"eval/{row['benchmark']}/pass@{row['k']}": row["pass"] for row in rows})
     result = {
         "global_step": args.step,
         "rows": rows,

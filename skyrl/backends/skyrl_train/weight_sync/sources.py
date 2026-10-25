@@ -114,42 +114,41 @@ class FsdpWeightSource(WeightSource):
 
 
 class FsdpLoraWeightSource(FsdpWeightSource):
-    """Stream the frozen base weights and unmerged FP32 NoRA adapters.
+    """Stream FP32-merged NoRA projections through complete-weight transport.
 
-    vLLM-RWKV passes the adapters to the same FlashRWKV2 operators as the
-    training forward, so rollouts reproduce the trainer's NoRA arithmetic.
-    PEFT names map to ``<module>.weight``, ``<module>.lora_A.weight`` and
-    ``<module>.lora_B.weight``; adapters keep their FP32 training dtype.
+    The native vLLM-RWKV model exposes ordinary projection weights and does
+    not construct PEFT ``lora_A``/``lora_B`` modules.  Merge the normalized
+    adapters using the same helper as HF export so every received name and
+    tensor has the layout vLLM loads.
     """
 
-    def _named_tensors(self) -> Iterator[Tuple[str, torch.Tensor]]:
-        for name, param in self._model.get_base_model().state_dict().items():
-            name = re.sub(r"\.(lora_[AB])\.[^.]+\.weight$", r".\1.weight", name.replace(".base_layer.", "."))
-            yield f"{self._prefix}{name}", param
-
-    def _dtype_of(self, name: str, param: torch.Tensor) -> torch.dtype:
-        return param.dtype if ".lora_A." in name or ".lora_B." in name else self._dtype
+    def _merged_names(self) -> Iterator[Tuple[str, torch.Tensor]]:
+        """Yield the names and shapes emitted by ``iter_merged_lora_weights``."""
+        base_model = self._model.get_base_model()
+        modules = dict(base_model.named_modules())
+        for name, param in base_model.state_dict().items():
+            if ".lora_A." in name or ".lora_B." in name or ".original_module." in name:
+                continue
+            if ".modules_to_save." in name:
+                module_name, adapter_weight = name.split(".modules_to_save.", 1)
+                adapter_prefix = f"{modules[module_name].active_adapters[0]}."
+                if adapter_weight.startswith(adapter_prefix):
+                    yield f"{module_name}.{adapter_weight.removeprefix(adapter_prefix)}", param
+                continue
+            yield name.replace(".base_layer.", "."), param
 
     def metadata(self) -> List[ParamMeta]:
         return [
-            ParamMeta(name, self._dtype_of(name, param), tuple(param.shape)) for name, param in self._named_tensors()
+            ParamMeta(f"{self._prefix}{name}", self._dtype, tuple(param.shape)) for name, param in self._merged_names()
         ]
 
     def __iter__(self) -> Iterator[Tuple[str, torch.Tensor]]:
-        # The caller selects this rank's CUDA device before iterating.
-        device = torch.cuda.current_device() if torch.cuda.is_available() else None
-        for name, param in self._named_tensors():
-            if device is not None:
-                param = param.to(device, non_blocking=True)
-            full = materialize_full_tensor(param)
-            # Keep each yielded item independent from the live PEFT parameter.
-            # Adapter tensors are FP32, so ``to(...).detach().contiguous()`` may
-            # otherwise return an alias; an optimizer update before the next
-            # sync would mutate a tensor already handed to the transfer engine.
-            yield (
-                name,
-                full.to(self._dtype_of(name, param)).detach().contiguous().clone(),
-            )
+        from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
+            iter_merged_lora_weights,
+        )
+
+        for name, weight in iter_merged_lora_weights(self._model):
+            yield f"{self._prefix}{name}", weight.to(self._dtype).detach().contiguous().clone()
 
 
 class MegatronWeightSource(WeightSource):

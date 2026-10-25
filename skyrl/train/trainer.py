@@ -87,6 +87,7 @@ from skyrl.train.utils.callbacks import (
     TrainingCallback,
     TrainingControl,
 )
+from skyrl.train.utils.metrics import nvtx_range
 from skyrl.train.utils.ray_gpu_monitor import RayGpuMonitor
 from skyrl.train.utils.tracking import Tracking
 from skyrl.train.utils.trainer_utils import (
@@ -1521,22 +1522,25 @@ class RayPPOTrainer:
         values = None
         base_log_probs = None
         action_log_probs = None
+        timings = getattr(self, "all_timings", None)
 
         # Critic forward (dispatch handles offload/backload automatically)
         if self.has_critic:
-            values = self._execute_forward_pass(
-                "critic",
-                data_fwd_pass,
-                key="values",
-                mini_batch_boundaries=training_input.metadata.get("critic_mini_batch_boundaries"),
-            )
+            with Timer("critic_forward", timings), nvtx_range("critic_forward"):
+                values = self._execute_forward_pass(
+                    "critic",
+                    data_fwd_pass,
+                    key="values",
+                    mini_batch_boundaries=training_input.metadata.get("critic_mini_batch_boundaries"),
+                )
 
         # Ref forward. The ref model is not trained, so there is no forward_backward to match
         # its packing against -> always a single full-batch forward (boundaries=None).
         if self.ref_model is not None:
-            base_log_probs = self._execute_forward_pass(
-                "ref", data_fwd_pass, key="logprobs", mini_batch_boundaries=None
-            )
+            with Timer("reference_forward", timings), nvtx_range("reference_forward"):
+                base_log_probs = self._execute_forward_pass(
+                    "ref", data_fwd_pass, key="logprobs", mini_batch_boundaries=None
+                )
             self.dispatch.empty_cache("ref")
 
         # Policy forward. Skipped for losses that optimize against rollout logprobs (see
@@ -1544,12 +1548,13 @@ class RayPPOTrainer:
         if self._skip_policy_forward(training_input):
             action_log_probs = None
         else:
-            action_log_probs = self._execute_forward_pass(
-                "policy",
-                data_fwd_pass,
-                key="logprobs",
-                mini_batch_boundaries=training_input.metadata.get("policy_mini_batch_boundaries"),
-            )
+            with Timer("old_log_prob_forward", timings), nvtx_range("old_log_prob_forward"):
+                action_log_probs = self._execute_forward_pass(
+                    "policy",
+                    data_fwd_pass,
+                    key="logprobs",
+                    mini_batch_boundaries=training_input.metadata.get("policy_mini_batch_boundaries"),
+                )
 
         # Empty cache after all forward passes
         self.dispatch.empty_cache()

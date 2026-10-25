@@ -77,7 +77,7 @@ class RayGpuMonitor:
 
         self._urls = discover_ray_metrics_urls()
         if not self._urls:
-            logger.warning("RayGpuMonitor: no Ray metrics endpoints found — GPU monitoring disabled.")
+            logger.debug("RayGpuMonitor: no Ray metrics endpoints found — GPU monitoring disabled.")
             return
 
         self._running = True

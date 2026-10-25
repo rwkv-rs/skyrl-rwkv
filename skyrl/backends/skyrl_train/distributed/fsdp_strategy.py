@@ -381,10 +381,7 @@ class FSDPStrategy(DistributedStrategy):
         self._sst_projectors.clear()
         for name, parameter in module.named_parameters():
             matches_target = any(
-                name == target
-                or name.startswith(f"{target}.")
-                or name.endswith(f".{target}")
-                or f".{target}." in name
+                name == target or name.startswith(f"{target}.") or name.endswith(f".{target}") or f".{target}." in name
                 for target in self.sst_target_modules
             )
             if parameter.ndim != 2 or not matches_target:
@@ -449,17 +446,13 @@ class FSDPStrategy(DistributedStrategy):
             # Rows are sharded: apply the input-side projector locally, gather
             # rows, then apply the output-side projector before redistributing.
             local = delta_float @ right @ right.transpose(0, 1)
-            global_delta = DTensor.from_local(
-                local, parameter.device_mesh, parameter.placements
-            ).full_tensor()
+            global_delta = DTensor.from_local(local, parameter.device_mesh, parameter.placements).full_tensor()
             global_projected = left @ (left.transpose(0, 1) @ global_delta)
         elif shard.dim == 1:
             # Columns are sharded: the output-side projection is local, then
             # the input-side projection is applied after gathering columns.
             local = left @ (left.transpose(0, 1) @ delta_float)
-            global_delta = DTensor.from_local(
-                local, parameter.device_mesh, parameter.placements
-            ).full_tensor()
+            global_delta = DTensor.from_local(local, parameter.device_mesh, parameter.placements).full_tensor()
             global_projected = global_delta @ right @ right.transpose(0, 1)
         else:
             raise ValueError(f"Unsupported SST shard dimension {shard.dim}")

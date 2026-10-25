@@ -670,6 +670,7 @@ def test_discover_ray_metrics_urls_filters_dead_and_missing(monkeypatch):
         {"Alive": False, "NodeManagerAddress": "10.0.0.2", "MetricsExportPort": 51002},
         {"Alive": True, "NodeManagerAddress": "10.0.0.3", "MetricsExportPort": None},
         {"Alive": True, "NodeManagerAddress": "10.0.0.4", "MetricsExportPort": 51004},
+        {"Alive": True, "NodeManagerAddress": "10.0.0.5", "MetricsExportPort": -1},
     ]
     monkeypatch.setattr(
         "skyrl.train.utils.vllm_metrics_scraper.ray.nodes",

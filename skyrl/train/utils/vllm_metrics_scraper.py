@@ -179,9 +179,9 @@ def discover_ray_metrics_urls() -> List[str]:
             continue
         ip = node.get("NodeManagerAddress")
         port = node.get("MetricsExportPort")
-        if not ip or not port:
+        if not ip or port is None or int(port) <= 0:
             continue
-        urls.append(format_http_url(ip, port, "/metrics"))
+        urls.append(format_http_url(ip, int(port), "/metrics"))
     return urls
 
 
@@ -232,7 +232,7 @@ class VLLMMetricsScraper:
         self._active_since: Optional[float] = None  # start of the current un-paused span
         self._paused: bool = False
         if not self._urls:
-            logger.warning(
+            logger.debug(
                 "VLLMMetricsScraper: ray.nodes() returned no metrics endpoints; "
                 "engine metrics will not appear in wandb."
             )

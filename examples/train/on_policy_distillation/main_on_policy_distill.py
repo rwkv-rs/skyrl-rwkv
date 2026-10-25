@@ -681,7 +681,12 @@ def main() -> None:
     validate_stopd_cfg(cfg)
 
     initialize_ray(cfg)
-    ray.get(skyrl_entrypoint.remote(cfg))
+    try:
+        ray.get(skyrl_entrypoint.remote(cfg))
+    finally:
+        # Release placement groups and inference actors owned by this driver
+        # before a subsequent benchmark or Ray task retry starts.
+        ray.shutdown()
 
 
 if __name__ == "__main__":

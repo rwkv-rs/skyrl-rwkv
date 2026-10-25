@@ -261,8 +261,18 @@ class BasePPOExp:
         self._decode_server_groups = server_setup.decode_server_groups
 
         if is_colocated:
-            # Callers must invoke get_inference_client() from a sync context (no running event loop).
-            asyncio.run(client.sleep())
+            # Callers invoke get_inference_client() from a sync context (no
+            # running event loop).  Close the temporary loop's HTTP session
+            # before training creates its long-lived event loop; otherwise the
+            # session from this startup-only loop is garbage-collected as an
+            # unclosed aiohttp client during colocated teardown.
+            async def sleep_and_close_client() -> None:
+                try:
+                    await client.sleep()
+                finally:
+                    await client.teardown()
+
+            asyncio.run(sleep_and_close_client())
             logger.info("HTTP Inference: Colocated mode - slept inference engines after startup")
 
         return client
@@ -398,6 +408,12 @@ class BasePPOExp:
                         await trainer.finalize_metrics(run_status)
                     except Exception as finalization_error:
                         logger.warning(f"Could not finalize run metrics: {finalization_error}")
+                    inference_client = getattr(trainer, "inference_engine_client", None)
+                    if inference_client is not None:
+                        try:
+                            await inference_client.teardown()
+                        except Exception as teardown_error:
+                            logger.warning(f"Could not close inference client: {teardown_error}")
 
             asyncio.run(train_and_finalize())
             status = "success"

@@ -18,7 +18,13 @@ def test_entrypoint_finalizes_before_exception_logging(fail):
     events = []
     tracker = Tracking("test", "test", backend="console")
     tracker.log_exception = Mock(side_effect=lambda *args, **kwargs: events.append("exception"))
-    trainer = SimpleNamespace(tracker=tracker, global_step=0, flush_pending_metrics=Mock())
+    inference_client = SimpleNamespace(teardown=AsyncMock())
+    trainer = SimpleNamespace(
+        tracker=tracker,
+        global_step=0,
+        flush_pending_metrics=Mock(),
+        inference_engine_client=inference_client,
+    )
 
     async def train():
         if fail:
@@ -46,6 +52,7 @@ def test_entrypoint_finalizes_before_exception_logging(fail):
         exp.run()
         assert events == ["success"]
     assert tracker.run_status == ("failed" if fail else "success")
+    inference_client.teardown.assert_awaited_once()
 
 
 @pytest.mark.asyncio

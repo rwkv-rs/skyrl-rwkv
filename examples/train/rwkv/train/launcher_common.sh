@@ -14,6 +14,10 @@ export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$PROJECT_ROOT/.venv}"
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$HOME/.cache/skyrl-rwkv}"
 export TORCH_EXTENSIONS_DIR="${TORCH_EXTENSIONS_DIR:-$XDG_CACHE_HOME/torch_extensions}"
+# The repository contains the separately packaged skyrl-gym project.  Export
+# both roots so every launcher works when invoked directly, without requiring
+# callers to repair imports in their shell first.
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/skyrl-gym${PYTHONPATH:+:$PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 export NUM_GPUS="${NUM_GPUS:-8}"
 export RAY_ADDRESS="${RAY_ADDRESS:-local}"

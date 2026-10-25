@@ -11,3 +11,10 @@ optimizer's ordinary moments and applied update scale. It is mutually
 exclusive with NoRA; set `SST_RANK` (default `0.99`) and
 `SST_REFRESH_INTERVAL` (default `0`, no refresh) to control the protected
 fraction and basis refresh cadence.
+
+The eight-GPU profile uses a length-grouped batch of 128 with two examples per
+rank microbatch, four persistent dataloader workers, and asynchronous batch
+collation. Test mode uses a 32-example batch and five steps. Checkpoint
+evaluation is launched through `eval/run.sh` with all eight inference GPUs;
+override `EVAL_NUM_GPUS` only when deliberately measuring a smaller evaluation
+placement.

@@ -7,7 +7,15 @@ DATA_DIR="${DATA_DIR:-$HOME/data/rwkv-direct-sft}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-$HOME/skyrl-rwkv-runs/rwkv7-g1k-sft}"
 RUN_NAME="${RUN_NAME:-rwkv7-g1k-sft}"
 TEST_MODE=false
-if [[ "${1:-}" == "--test_mode" || "${1:-}" == "--test-mode" ]]; then TEST_MODE=true; shift; fi
+SST=false
+FORWARD_ARGS=()
+for arg in "$@"; do
+  case "$arg" in
+    --test_mode|--test-mode) TEST_MODE=true ;;
+    --sst) SST=true ;;
+    *) FORWARD_ARGS+=("$arg") ;;
+  esac
+done
 configure_wandb "$TEST_MODE"
 if [[ "$TEST_MODE" == true ]]; then LOGGER=console; else LOGGER=wandb; fi
 
@@ -22,6 +30,10 @@ else
 fi
 
 USE_NORA="${USE_NORA:-false}"
+if [[ "$SST" == true && "$USE_NORA" == true ]]; then
+  echo "--sst is mutually exclusive with USE_NORA=true; SST requires full-parameter SFT." >&2
+  exit 2
+fi
 LORA_RANK="${LORA_RANK:-256}"
 LORA_OVERRIDES=(model.lora.use_nora="$USE_NORA")
 if [[ "$USE_NORA" == true ]]; then
@@ -43,9 +55,10 @@ run_rwkv_python -m skyrl.train.main_sft \
   placement.num_nodes=1 placement.num_gpus_per_node=8 fsdp_config.fsdp_size=8 fsdp_config.reshard_after_forward=false \
   fsdp_config.sync_gradients_each_microbatch=false optimizer_config.lr="${LEARNING_RATE:-1e-6}" \
   optimizer_config.max_grad_norm=1.0 optimizer_config.scheduler=cosine optimizer_config.offload_after_step=false \
+  sst="$SST" sst_rank="${SST_RANK:-0.99}" sst_refresh_interval="${SST_REFRESH_INTERVAL:-0}" \
   sampler=custom sampler_class_path=examples.train.rwkv.train.sft.prepare.LengthGroupedSampler \
   "sampler_kwargs={batch_size: $BATCH_SIZE, seed: 0}" seed=0 dataloader_num_workers=2 \
   dataloader_persistent_workers=true num_workers=0 ckpt_path="$OUTPUT_ROOT/checkpoints" \
   export_path="$OUTPUT_ROOT/hf_exports" ckpt_interval=50 eval_interval=50 hf_save_interval=50 \
   eval_before_train=true max_ckpts_to_keep=2 logger="$LOGGER" project_name=skyrl-rwkv run_name="$RUN_NAME" \
-  "eval_command=$EVAL_COMMAND" "eval_command_metrics_path=$EVAL_ROOT/global_step_{global_step}/eval_metrics.json" "$@"
+  "eval_command=$EVAL_COMMAND" "eval_command_metrics_path=$EVAL_ROOT/global_step_{global_step}/eval_metrics.json" "${FORWARD_ARGS[@]}"

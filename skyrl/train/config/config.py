@@ -252,6 +252,14 @@ class OptimizerConfig(BaseConfig):
     """Extra scheduler arguments forwarded to Transformers by the FSDP backend.
     For ``cosine_with_min_lr``, use ``min_lr_rate`` for a fraction of the peak
     learning rate, or ``min_lr`` for an absolute decay floor."""
+    sst: bool = False
+    """Project full-parameter updates with Subspace Tuning (SST)."""
+    sst_rank: float = 0.99
+    """Fraction of singular directions protected by SST."""
+    sst_refresh_interval: int = 0
+    """Recompute SST bases every this many optimizer steps; zero keeps the initial bases."""
+    sst_target_modules: Optional[List[str]] = None
+    """Parameter-name suffixes constrained by SST; ``None`` uses attention/MLP and RWKV projections."""
 
 
 @dataclass

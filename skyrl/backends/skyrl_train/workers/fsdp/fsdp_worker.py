@@ -67,7 +67,8 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
         is_multimodal = hasattr(model_config, "vision_config") and model_config.vision_config is not None
         self._is_multimodal_lm_only = self.cfg.policy.language_model_only and is_multimodal
         use_meta = should_use_meta_init(
-            use_meta_tensor=not model_config.tie_word_embeddings, mesh=self.strategy.device_mesh
+            use_meta_tensor=not model_config.tie_word_embeddings and not self.strategy.sst,
+            mesh=self.strategy.device_mesh,
         )
 
         wrapped_model = HFModelWrapper(

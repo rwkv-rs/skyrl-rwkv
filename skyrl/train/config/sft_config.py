@@ -124,6 +124,12 @@ class SFTConfig(BaseConfig):
     # ---- Reused SkyRL config objects ----
     model: ModelConfig = field(default_factory=lambda: ModelConfig(path="Qwen/Qwen3-0.6B"))
     optimizer_config: OptimizerConfig = field(default_factory=OptimizerConfig)
+    sst: bool = False
+    """Enable Subspace Tuning for full-parameter SFT."""
+    sst_rank: float = 0.99
+    """Fraction of singular directions protected by Subspace Tuning."""
+    sst_refresh_interval: int = 0
+    """Refresh the protected SST basis every this many optimizer steps; zero disables refresh."""
     placement: SFTPlacementConfig = field(default_factory=SFTPlacementConfig)
     megatron_config: MegatronConfig = field(
         default_factory=lambda: MegatronConfig(
@@ -588,6 +594,16 @@ def validate_sft_cfg(cfg: SFTConfig) -> None:
     if cfg.max_training_steps is not None and cfg.max_training_steps <= 0:
         raise ValueError(f"max_training_steps must be > 0, got {cfg.max_training_steps}")
 
+    if cfg.sst:
+        if cfg.strategy != "fsdp":
+            raise ValueError("sst=True requires strategy='fsdp'.")
+        if cfg.model.lora.rank > 0 or cfg.model.lora.use_nora:
+            raise ValueError("sst=True requires full-parameter SFT and is mutually exclusive with LoRA/NoRA.")
+        if not 0 <= cfg.sst_rank < 1:
+            raise ValueError(f"sst_rank must be in [0, 1), got {cfg.sst_rank}")
+        if cfg.sst_refresh_interval < 0:
+            raise ValueError(f"sst_refresh_interval must be non-negative, got {cfg.sst_refresh_interval}")
+
     # Dataloader / sampler config
     if cfg.sampler not in _VALID_SAMPLERS:
         raise ValueError(f"Unknown sampler '{cfg.sampler}'. Must be one of {_VALID_SAMPLERS}.")
@@ -667,6 +683,9 @@ def build_skyrl_config_for_sft(sft_cfg: SFTConfig) -> SkyRLTrainConfig:
 
     # Optimizer -- direct assignment (same type: OptimizerConfig)
     cfg.trainer.policy.optimizer_config = sft_cfg.optimizer_config
+    cfg.trainer.policy.optimizer_config.sst = sft_cfg.sst
+    cfg.trainer.policy.optimizer_config.sst_rank = sft_cfg.sst_rank
+    cfg.trainer.policy.optimizer_config.sst_refresh_interval = sft_cfg.sst_refresh_interval
 
     # Placement -- map SFTPlacementConfig fields to PlacementConfig
     cfg.trainer.placement.policy_num_nodes = sft_cfg.placement.num_nodes

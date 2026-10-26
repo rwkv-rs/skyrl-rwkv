@@ -19,7 +19,7 @@ dependencies = [
     # Floor tracks the transformers pin below: transformers 5.16.1 requires
     # tokenizers>=0.23.1.
     "tokenizers>=0.23.1",
-    "transformers>=5.6.1,<=5.16.1",
+    "transformers>=5.6.1,<=5.21.0.dev0",
     "typer>=0.17.4",
     "peft==0.18.1",
     "hf_transfer",
@@ -146,9 +146,9 @@ fsdp = [
 rwkv = [
     "skyrl[skyrl-train]",
     "torch==2.13.0; sys_platform == 'linux'",
-    "transformers==5.16.0.dev0; sys_platform == 'linux'",
+    "transformers==5.21.0.dev0; sys_platform == 'linux'",
     "vllm; sys_platform == 'linux'",
-    "FlashRWKV2==0.1.0a16; sys_platform == 'linux'",
+    "FlashRWKV2==0.1.0a17; sys_platform == 'linux'",
     "tokenizers; sys_platform == 'linux'",
     # Native RWKV LightEval benchmarks and rollout summary plots.
     "lighteval; sys_platform == 'linux'",
@@ -343,7 +343,7 @@ override-dependencies = [
     # Widen Bridge's bound without overriding RWKV's direct Git requirement.
     { package = { name = "megatron-bridge" }, dependencies = ["transformers>=5.6.1,<=5.16.1; sys_platform == 'linux'"] },
     # Keep the RWKV Transformers source selected by this project.
-    { package = { name = "vllm", version = "0.23.1rc1.dev5450+g7e2db182c.rwkv" }, dependencies = ["transformers==5.16.0.dev0; sys_platform == 'linux'"] },
+    { package = { name = "vllm", version = "0.23.1rc1.dev5461+g2852a7b1d.rwkv" }, dependencies = ["transformers==5.21.0.dev0; sys_platform == 'linux'"] },
     # NoRA PEFT fork (based on PEFT 0.19.2.dev0) for RWKV NoRA training and merging.
     "peft @ git+https://github.com/Joluck/NoRA@4669c35ce0ffd027456272ee5050c0f58ac8d22a#subdirectory=peft",
     "megatron-core>=0.16.0; sys_platform == 'linux'",
@@ -386,7 +386,7 @@ override-dependencies = [
     #     tilelang 0.1.9  + ffi 0.1.12  -> AttributeError
     #     tilelang 0.1.13 + ffi 0.1.12  -> import OK
     # 0.1.13 is the first tilelang whose bound (`>=0.1.11,<0.1.13`) admits 0.1.12.
-    # FlashRWKV2 0.1.0a16 pins tilelang==0.1.15, which keeps the same ffi bound.
+    # FlashRWKV2 0.1.0a17 pins tilelang==0.1.15, which keeps the same ffi bound.
     "tilelang==0.1.15; sys_platform == 'linux'",
     "apache-tvm-ffi==0.1.12; sys_platform == 'linux'",
     # vLLM 0.31.0 pins nvidia-cutlass-dsl==4.7.1; held at 4.8.0 here (flashinfer
@@ -410,8 +410,50 @@ override-dependencies = [
 # locking read their dependencies without downloading unused backend binaries.
 [[tool.uv.dependency-metadata]]
 name = "flashinfer-cubin"
-version = "0.6.18.post1"
+version = "0.7.0.post1"
 requires-python = ">=3.8"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache-sm80"
+version = "0.7.0.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache-sm89"
+version = "0.7.0.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache-sm90a"
+version = "0.7.0.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache-sm100a"
+version = "0.7.0.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache-sm103a"
+version = "0.7.0.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache-sm110a"
+version = "0.7.0.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache-sm121a"
+version = "0.7.0.post1+cu130"
+requires-python = ">=3.9"
 requires-dist = []
 
 # lighteval-rwkv pins latex2sympy2_extended==1.0.6; keep SkyRL's math-verify parser
@@ -495,7 +537,8 @@ fast-hadamard-transform = { FAST_HADAMARD_TRANSFORM_FORCE_BUILD = "TRUE"}
 # only adds CUPTI's include dir and fails with `cuda.h: No such file or directory` unless
 # the toolkit's headers are on the default include path, so skip building it.
 nvidia-resiliency-ext = { STRAGGLER_DET_SKIP_CUPTI_EXT_BUILD = "1" }
-vllm = { VLLM_BUILD_PROFILE = "rwkv" }
+# Keep Git dependency metadata independent of the local CUDA toolkit version.
+vllm = { VLLM_BUILD_PROFILE = "rwkv", VLLM_SKIP_VERSION_SUFFIX = "1" }
 
 
 [[tool.uv.index]]
@@ -537,8 +580,8 @@ explicit = true
 [tool.uv.sources]
 skyrl-gym = { path = "./skyrl-gym", editable = true }
 skycap = { path = "./skycap", editable = true }
-transformers = { git = "https://github.com/rwkv-rs/transformers-rwkv", rev = "f163615d2a7c60aa1df5c292874d56cbe878219f", extra = "rwkv" }
-vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "7e2db182cc3e89239ff7c867f275bcfcb09cc105", extra = "rwkv" }
+transformers = { git = "https://github.com/rwkv-rs/transformers-rwkv", rev = "f93dd4e01e0b565ef0390f76c6726d1d121ebbab", extra = "rwkv" }
+vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "2852a7b1d597f6e2131ec801de331b886471cd95", extra = "rwkv" }
 lighteval = { git = "https://github.com/rwkv-rs/lighteval-rwkv", rev = "c5475e27a1e58184c9a6cdbd30572ec1ae601dd7", extra = "rwkv" }
 tokenizers = { git = "https://github.com/rwkv-rs/tokenizers-rwkv", rev = "c5d8dde5ff49c70e4656199d5033a84e03c21b2b", subdirectory = "bindings/python", extra = "rwkv" }
 # Match torch's CUDA variant (cu130).

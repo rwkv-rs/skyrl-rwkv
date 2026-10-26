@@ -904,13 +904,19 @@ def test_http_failure_stops_pipeline_and_keeps_external_server(tmp_path, tokeniz
     assert summary["Knowledge"]["num_questions"] == 0
 
 
-def test_partial_startup_failure_cleans_only_owned_process_groups(tmp_path, tokenizer, monkeypatch):
+@pytest.mark.parametrize("tuning_mode", [None, "tune"])
+def test_partial_startup_failure_cleans_only_owned_process_groups(tmp_path, tokenizer, monkeypatch, tuning_mode):
     processes, killed = [], []
 
     class Process:
         def __init__(self, command, *, env, stdout, stderr, start_new_session):
             self.pid = 90000 + len(processes)
             self.device = env["CUDA_VISIBLE_DEVICES"]
+            assert env["XDG_CACHE_HOME"] == "/shared/cache"
+            assert env["TORCH_EXTENSIONS_DIR"] == "/shared/extensions"
+            assert env["FLASHRWKV2_CACHE_DIR"] == "/shared/flashrwkv2"
+            assert env["VLLM_RWKV_TUNING_MODE"] == (tuning_mode or "require")
+            assert env["VLLM_RWKV_TUNING_LEGACY_DIR"] == "/shared/legacy/namespace"
             if command[-1] == "--check":
                 self.returncode = 0
             else:
@@ -927,6 +933,14 @@ def test_partial_startup_failure_cleans_only_owned_process_groups(tmp_path, toke
 
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=SimpleNamespace(device_count=lambda: 2)))
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "2,5")
+    monkeypatch.setenv("XDG_CACHE_HOME", "/shared/cache")
+    monkeypatch.setenv("TORCH_EXTENSIONS_DIR", "/shared/extensions")
+    monkeypatch.setenv("FLASHRWKV2_CACHE_DIR", "/shared/flashrwkv2")
+    monkeypatch.setenv("VLLM_RWKV_TUNING_LEGACY_DIR", "/shared/legacy/namespace")
+    if tuning_mode is None:
+        monkeypatch.delenv("VLLM_RWKV_TUNING_MODE", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_RWKV_TUNING_MODE", tuning_mode)
     monkeypatch.setattr(rollout.asyncio, "create_subprocess_exec", create_subprocess_exec)
     monkeypatch.setattr(rollout.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
     with pytest.raises(RuntimeError, match="vLLM exited"):
@@ -1037,9 +1051,7 @@ def test_rwkv_native_artifact_preflight_rejects_unmatched_install_before_loading
     load.assert_not_called()
 
 
-def test_rwkv_native_artifact_environment_records_verified_installed_revision(tmp_path, monkeypatch):
-    from unittest.mock import MagicMock
-
+def test_rwkv_native_artifact_environment_records_verified_installed_revision(tmp_path, monkeypatch, capsys):
     from examples.train.rwkv.train.common import prepare_flashrwkv2 as preparation
 
     (tmp_path / "pyproject.toml").write_text('[tool.uv.sources.vllm]\nrev = "matched-install"\n')
@@ -1053,7 +1065,10 @@ def test_rwkv_native_artifact_environment_records_verified_installed_revision(tm
     monkeypatch.setattr(preparation.importlib.metadata, "version", lambda name: "test-version")
     library = tmp_path / "extension.so"
     library.write_bytes(b"mock native artifact")
-    monkeypatch.setattr(preparation, "_load_flashrwkv2", MagicMock())
+    cache_root = tmp_path / "shared-cache"
+    monkeypatch.setattr(
+        preparation, "_load_flashrwkv2", lambda: SimpleNamespace(get_tuning_cache_dir=lambda: cache_root)
+    )
     monkeypatch.setattr(
         preparation,
         "load_extension",
@@ -1066,3 +1081,7 @@ def test_rwkv_native_artifact_environment_records_verified_installed_revision(tm
     environment = json.loads((tmp_path / "environment.json").read_text())
     assert environment["vllm_rwkv_commit"] == "matched-install"
     assert environment["build"] == "cached"
+    assert environment["cache_root"] == str(cache_root)
+    output = capsys.readouterr().out
+    assert "native build: cached" in output
+    assert "Model dispatch coverage: pending vLLM worker preparation" in output

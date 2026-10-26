@@ -270,11 +270,9 @@ async def start_servers(
         raise RuntimeError("No visible CUDA GPUs; provide --base-url for external engines")
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     devices = visible.split(",")[:count] if visible is not None else [str(index) for index in range(count)]
-    cache_root = Path.home() / ".cache/skyrl-rwkv"
     env = {
         **os.environ,
-        "XDG_CACHE_HOME": str(cache_root),
-        "TORCH_EXTENSIONS_DIR": str(cache_root / "torch_extensions"),
+        "VLLM_RWKV_TUNING_MODE": os.environ.get("VLLM_RWKV_TUNING_MODE", "require"),
         "OMP_NUM_THREADS": "1",
         "MKL_NUM_THREADS": "1",
         # RWKV has no fixed positional embeddings; prefill remains chunked.

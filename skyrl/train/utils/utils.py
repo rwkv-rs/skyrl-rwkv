@@ -1283,6 +1283,13 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         "HF_TOKEN",
         "HF_HUB_OFFLINE",
         "HF_ENDPOINT",
+        # Keep kernel preparation and Ray actors on the driver's cache paths.
+        "FLASHRWKV2_CACHE_DIR",
+        "VLLM_RWKV_TUNING_MODE",
+        "VLLM_RWKV_TUNING_LEGACY_DIR",
+        "XDG_CACHE_HOME",
+        "TORCH_HOME",
+        "TORCH_EXTENSIONS_DIR",
         "PYTORCH_CUDA_ALLOC_CONF",
         # Selects the DSA indexer top-k backend under dsa_kernel_backend=cudnn
         # (patches/megatron/patch_dsa_hybrid_indexer.py); read in the Megatron workers.

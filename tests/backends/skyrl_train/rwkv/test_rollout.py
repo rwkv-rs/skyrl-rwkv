@@ -143,6 +143,89 @@ def test_prepare_ultradata_rl_keeps_lazy_rewards_and_question_split(tmp_path):
     assert {row["env_class"] for row in pq.read_table(opd_output).to_pylist()} == {"aime"}
 
 
+def test_filter_ultradata_removes_only_rwkv_pass_rate_one(tmp_path):
+    from examples.train.rwkv.get_ultradata_rwkv import filter_dataset
+
+    source = tmp_path / "source"
+    counts_by_domain = {
+        "Math": {"correct": 4},
+        "Code": {"correct": 3, "wrong": 1},
+        "Long_Context": {"wrong": 4},
+        "Knowledge": {"correct": 2, "unanswered": 2},
+    }
+    source.mkdir()
+    for domain in counts_by_domain:
+        dataset_row(source, domain, f"{domain}_1", "question", "answer")
+
+    rollout_output = tmp_path / "rollout"
+    rollout_output.mkdir()
+    with (rollout_output / "correct_counts_by_question.jsonl").open("w") as handle:
+        for domain, counts in counts_by_domain.items():
+            handle.write(json.dumps({"uuid": f"{domain}_1", "domain": domain, "counts": counts}) + "\n")
+
+    output = tmp_path / "filtered"
+    manifest = filter_dataset.filter_dataset(source, rollout_output, output, expected_samples=4)
+
+    assert manifest["total_removed_pass_rate_1"] == 1
+    assert manifest["total_kept_rows"] == 3
+    assert not (output / "Math" / "part.jsonl").read_text()
+    assert [
+        json.loads((output / domain / "part.jsonl").read_text())["uuid"]
+        for domain in ("Code", "Long_Context", "Knowledge")
+    ] == ["Code_1", "Long_Context_1", "Knowledge_1"]
+
+
+def test_prepare_source_normalizes_public_upstream_records(tmp_path, monkeypatch):
+    from examples.train.rwkv.get_ultradata_rwkv import prepare_source
+
+    fixtures = {
+        "dapo": {"prompt": [{"role": "user", "content": "math"}], "reward_model": {"ground_truth": "4"}},
+        "deepscaler": {"problem": "scale", "answer": "5"},
+        "deepmath": {"question": "deep", "final_answer": "6"},
+        "science": {"input": "science", "expected_answer": "A"},
+        "hotpot": {
+            "question": "who?",
+            "answer": "Ada",
+            "context": {"title": ["Paper"], "sentences": [["Ada worked here."]]},
+        },
+        "qasper": {
+            "abstract": "Abstract",
+            "full_text": [{"section_name": "Body", "paragraphs": ["Evidence"]}],
+            "qas": [
+                {
+                    "question": "What?",
+                    "answers": [
+                        {
+                            "answer": {
+                                "unanswerable": False,
+                                "free_form_answer": "Yes",
+                                "extractive_spans": [],
+                                "yes_no": None,
+                            }
+                        }
+                    ],
+                }
+            ],
+        },
+        "hardtests": {
+            "question_content": "print",
+            "public_test_cases": [{"input": "1\n", "output": "1\n"}],
+        },
+    }
+
+    monkeypatch.setattr(prepare_source, "_iter_source_rows", lambda spec: [fixtures[spec.adapter]])
+    output = tmp_path / "source"
+    manifest = prepare_source.prepare(output, limit_per_source=1)
+
+    assert manifest["stage"] == "pre_difficulty_calibration"
+    assert manifest["total_rows"] == len(fixtures)
+    assert {path.parent.name for path in output.glob("*/*.jsonl")} == set(prepare_source.DOMAINS)
+    assert json.loads((output / "Code" / "hardtests.jsonl").read_text())["ground_truth"] == {
+        "inputs": ["1\n"],
+        "outputs": ["1\n"],
+    }
+
+
 def test_code_python_and_cpp_execution():
     fence = chr(96) * 3
     tests = {"inputs": [""], "outputs": ["3\n"]}

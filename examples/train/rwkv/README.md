@@ -38,3 +38,9 @@ Async modes are the throughput-oriented defaults for FlashREINFORCE, OPD, and
 SAO because rollout is the long-pole stage.  Set `ASYNC_MODE=disabled` when a
 fully colocated synchronous comparison is needed; the launchers automatically
 lower the shared-memory microbatch where the colocated path needs it.
+
+To construct an RWKV-specific verifiable RL corpus from the unfiltered,
+normalized source data used to build UltraData-RL-2609, run
+`get_ultradata_rwkv/run.sh`. It evaluates each question with the selected RWKV
+checkpoint and removes only questions with a 1.0 RWKV pass rate; all partially
+solved and unsolved questions remain available for training.

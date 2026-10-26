@@ -280,6 +280,28 @@ def test_runtime_env_forwards_te_block_scale_mode(monkeypatch):
 
 
 @pytest.mark.parametrize("configured", [False, True])
+def test_runtime_env_preserves_kernel_cache_paths(monkeypatch, configured):
+    paths = {
+        "FLASHRWKV2_CACHE_DIR": "/shared/flashrwkv2",
+        "VLLM_RWKV_TUNING_MODE": "require",
+        "VLLM_RWKV_TUNING_LEGACY_DIR": "/shared/legacy/namespace",
+        "XDG_CACHE_HOME": "/shared/cache",
+        "TORCH_HOME": "/shared/torch",
+        "TORCH_EXTENSIONS_DIR": "/shared/torch_extensions",
+    }
+    for name, value in paths.items():
+        if configured:
+            monkeypatch.setenv(name, value)
+        else:
+            monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+
+    env_vars = prepare_runtime_environment(example_dummy_config())
+
+    assert {name: env_vars[name] for name in paths if name in env_vars} == (paths if configured else {})
+
+
+@pytest.mark.parametrize("configured", [False, True])
 def test_runtime_env_preserves_wandb_resume_destination(monkeypatch, configured):
     destination = {
         "WANDB_RUN_ID": "existing-run",

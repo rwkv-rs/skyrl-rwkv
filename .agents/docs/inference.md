@@ -51,6 +51,16 @@ Prefill-Decode disaggregation:
 
 ## Key Config Knobs
 
+RWKV example launchers use the upstream FlashRWKV2 cache rooted at
+`FLASHRWKV2_CACHE_DIR` (default `~/.cache/flashrwkv2`) and default to
+`VLLM_RWKV_TUNING_MODE=require`. Prepare missing actual model dispatches with
+`tune`, optionally revalidating one old namespace through
+`VLLM_RWKV_TUNING_LEGACY_DIR`, then restart in `require` mode before capture.
+All three settings and explicit Torch/XDG paths are forwarded to Ray actors.
+The shared native-extension preflight reports native build readiness; vLLM's
+worker coverage reports establish model tuning readiness. See
+`examples/train/rwkv/train/common/README.md` for the preparation lifecycle.
+
 All under `generator.inference_engine.*`:
 - `enforce_eager` (bool, default true): With `enforce_eager=false`, there can be more mismatch between inference logprobs and trainer logprobs. It is recommended to use off policy correction methods like Truncated Importance Sampling (see `docs/content/docs/algorithms/off_policy_correction.mdx` for details) to prevent logprobs drift. 
 - `gpu_memory_utilization` (float, default 0.8)

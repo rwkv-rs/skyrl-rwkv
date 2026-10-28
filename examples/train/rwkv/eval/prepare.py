@@ -29,7 +29,7 @@ BENCHMARKS = (
 
 
 def _write_manifests(
-    root: Path, model: str, endpoints: list[str], *, max_num_seqs: int = 1024, context_length: int = 32768
+    root: Path, model: str, endpoints: list[str], *, max_num_seqs: int = 128, context_length: int = 32768
 ) -> tuple[Path, Path]:
     """Write private model and benchmark manifests for the stable producer."""
     root.mkdir(parents=True, exist_ok=True)
@@ -282,7 +282,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--step", type=int, required=True)
     parser.add_argument("--context-length", type=int, default=32768)
-    parser.add_argument("--max-num-seqs", type=int, default=1024)
+    parser.add_argument("--max-num-seqs", type=int, default=128)
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--benchmarks", type=Path)
     parser.add_argument("--served-model-name")

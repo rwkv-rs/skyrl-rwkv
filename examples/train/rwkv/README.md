@@ -20,6 +20,13 @@ training settings target eight Pro6000 GPUs and use `wkv_mode=fp32io16`.
 reuses the stable `lighteval-rwkv` producer for GSM8K, MATH500, AIME24, AIME25,
 and AIMO avg@k/pass@k evaluation.
 
+Evaluation defaults to 128 concurrent sequences per worker, matching the OPD
+launcher. RWKV startup profiles CUDA graphs before allocating the final state
+cache budget: the 61-layer, 4096-hidden model needs about 61.95 MiB of FP32 state
+and BF16 shifts per sequence. Its 1024-sequence startup state alone uses 61.95 GiB;
+128 sequences use 7.74 GiB, leaving room for weights and tuning workspaces. The
+32768-token context and batch limits stay unchanged.
+
 Before evaluation on a new GPU/model profile, run `eval/run.sh --prepare-flashrwkv2`
 with the same `MODEL`, `OUTPUT` and serving environment settings. It starts the
 same eight workers with `VLLM_RWKV_TUNING_MODE=tune`, waits for every worker and

@@ -24,8 +24,12 @@ Evaluation defaults to 128 concurrent sequences per worker, matching the OPD
 launcher. RWKV startup profiles CUDA graphs before allocating the final state
 cache budget: the 61-layer, 4096-hidden model needs about 61.95 MiB of FP32 state
 and BF16 shifts per sequence. Its 1024-sequence startup state alone uses 61.95 GiB;
-128 sequences use 7.74 GiB, leaving room for weights and tuning workspaces. The
-32768-token context and batch limits stay unchanged.
+128 sequences use 7.74 GiB, leaving room for weights and tuning workspaces.
+The context remains 32768 tokens. Chunked prefill schedules at most 8192 tokens
+per batch without truncating the context. FULL CUDA graphs use power-of-two
+capture sizes from 1 through 8192, so batches pad up to a prepared graph size.
+This keeps verified profile coverage while bounding the number and size of
+startup tuning workloads.
 
 Before evaluation on a new GPU/model profile, run `eval/run.sh --prepare-flashrwkv2`
 with the same `MODEL`, `OUTPUT` and serving environment settings. It starts the

@@ -90,7 +90,8 @@ for ((gpu = 0; gpu < NUM_GPUS; gpu++)); do
     -m vllm.entrypoints.openai.api_server --model "$MODEL" --served-model-name "$SERVED_MODEL_NAME" \
     --host 127.0.0.1 --port "$port" --dtype bfloat16 --max-model-len "$MAX_MODEL_LEN" \
     --mamba-ssm-cache-dtype float32 \
-    --max-num-seqs "$MAX_NUM_SEQS" --max-num-batched-tokens 32768 \
+    --max-num-seqs "$MAX_NUM_SEQS" --max-num-batched-tokens 8192 \
+    --compilation-config '{"mode":0,"cudagraph_mode":"FULL","cudagraph_capture_sizes":[1,2,4,8,16,32,64,128,256,512,1024,2048,4096,8192]}' \
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" --enable-prefix-caching \
     --enable-chunked-prefill --no-enable-log-requests > "$OUTPUT/inference-gpu$gpu.log" 2>&1 &
   PIDS+=("$!")

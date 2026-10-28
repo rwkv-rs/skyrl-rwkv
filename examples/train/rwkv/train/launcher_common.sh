@@ -31,9 +31,8 @@ run_rwkv_training() {
     run_rwkv_python "$@"
     return
   fi
-  timeout --signal=TERM --kill-after=120s "${TRAIN_MAX_SECONDS:?Set TRAIN_MAX_SECONDS}s" \
-    uv run --isolated --no-config --no-project "$PYTHON" "$@" || return "$?"
-  run_rwkv_python "$RWKV_ROOT/eval/prepare.py" --after-train "$RWKV_TRAIN_EVAL"
+  run_rwkv_python "$RWKV_ROOT/eval/prepare.py" --train-and-evaluate "$RWKV_TRAIN_EVAL" \
+    uv run --isolated --no-config --no-project "$PYTHON" "$@"
 }
 
 configure_wandb() {

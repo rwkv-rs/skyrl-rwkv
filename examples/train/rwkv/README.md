@@ -53,7 +53,13 @@ producer environment. skyrl-rwkv publishes the resulting metrics to W&B. The
 `eval/prepare.py` adapter accepts `--producer-timeout` in seconds (default: 21600).
 
 SFT, FlashREINFORCE and OPD support a bounded training-and-evaluation lifecycle
-through `RWKV_TRAIN_EVAL=<json-path>` and `TRAIN_MAX_SECONDS=<seconds>`. After
+through `RWKV_TRAIN_EVAL=<json-path>` and `TRAIN_MAX_SECONDS=<seconds>`. The launcher
+persists a sibling `.progress.json` with training, publication, evaluation and callback progress.
+Restart the same launcher with the same configuration to continue the unfinished phase and its remaining
+budget. Use native SFT `resume_from=latest` or RL `trainer.resume_mode=latest` to restore the latest saved
+training checkpoint. A completed training phase is skipped when only evaluation needs to resume.
+Candidate publication carries a configuration receipt and is atomic; unrelated existing weights are preserved.
+After
 training succeeds and releases its Ray resources, the launcher publishes the
 specified HF export, runs a probe, and calls the supplied acceptance command.
 Only a passing probe runs full confirmation. The JSON contains:

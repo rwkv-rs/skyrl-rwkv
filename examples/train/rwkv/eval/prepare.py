@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from pathlib import Path
 
 BENCHMARKS = (
@@ -77,10 +78,58 @@ def _log_wandb(step: int, rows: list[dict[str, object]]) -> None:
 
 
 def evaluate(args: argparse.Namespace) -> Path:
-    """Evaluate one checkpoint through the existing eight-worker producer."""
+    """Run the producer in its own environment and publish checkpoint metrics."""
+    args.output = args.output.expanduser().resolve()
+    args.lighteval_project = args.lighteval_project.expanduser().resolve()
+    project = args.lighteval_project
+    python = project / ".venv/bin/python"
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join((str(project / "src"), str(project)))}
+    timeout = args.producer_timeout
+    if not args.benchmarks:
+        # The Math profile uses the producer's existing avg/pass configuration in an isolated worker.
+        subprocess.run(
+            [str(python), str(Path(__file__).resolve()), "--math-worker", json.dumps(vars(args), default=str)],
+            cwd=project, env=env, check=True, timeout=timeout,
+        )
+        result = json.loads((args.output / "result.json").read_text())
+        _log_wandb(args.step, result["rows"])
+        return args.output / "eval_metrics.json"
+
+    endpoints = [url.strip().rstrip("/") for url in args.base_url.split(",") if url.strip()]
+    if len(endpoints) != 8:
+        raise ValueError(f"expected eight inference endpoints, got {len(endpoints)}")
+    models_path, benchmarks_path = _write_manifests(
+        args.output / ".manifests", args.served_model_name or Path(args.model).name, endpoints,
+        max_num_seqs=args.max_num_seqs, context_length=args.context_length,
+    )
+    shutil.copyfile(args.benchmarks, benchmarks_path)
+    command = [
+        str(python), "-m", "src.rwkv_eval.main", "--models", str(models_path),
+        "--benchmarks", str(benchmarks_path), "--prompt-template", args.prompt_template,
+        "--seed", str(args.seed), "--output-dir", str(args.output), "--no-upload",
+    ]
+    if args.max_samples is not None:
+        command.extend(("--max-samples", str(args.max_samples)))
+    if args.test_mode:
+        command.append("--test-mode")
+    subprocess.run(command, cwd=project, env=env, check=True, timeout=timeout)
+    scores = [json.loads(path.read_text()) for path in sorted((args.output / "scores").glob("*/*.json"))]
+    expected = {name for names in tomllib.loads(benchmarks_path.read_text()).values() for name in names}
+    if not scores or {score["benchmark_name"] for score in scores} != expected or len(scores) != len(expected):
+        raise RuntimeError("lighteval-rwkv did not publish exactly the requested benchmark scores")
+    if any(score["upload_status"] != "local_only" for score in scores):
+        raise RuntimeError("lighteval-rwkv returned failed benchmark records")
+    output = args.output / "eval_metrics.json"
+    metrics = {f"eval/{score['benchmark_name']}": float(score["score"]) for score in scores}
+    output.write_text(json.dumps(metrics, indent=2) + "\n")
+    return output
+
+
+def _evaluate_math(args: argparse.Namespace) -> Path:
+    """Run the default Math avg/pass profile inside the producer environment."""
     project = args.lighteval_project.expanduser().resolve()
     sys.path[:0] = [str(project / "src"), str(project)]
-    from src.rwkv_eval.configs import BenchmarkSpec, ModelEndpoint, read_benchmarks
+    from src.rwkv_eval.configs import BenchmarkSpec, ModelEndpoint
     from src.rwkv_eval.main import RWKVRegistry
     from src.rwkv_eval.main import evaluate as producer_evaluate
 
@@ -93,13 +142,7 @@ def evaluate(args: argparse.Namespace) -> Path:
         max_num_seqs=args.max_num_seqs, context_length=args.context_length,
     )
     models = tuple(ModelEndpoint(url, "EMPTY", model_name, args.max_num_seqs, args.context_length) for url in endpoints)
-    benchmarks = (
-        read_benchmarks(args.benchmarks)
-        if args.benchmarks
-        else tuple(BenchmarkSpec(field, name) for field, name, _ in BENCHMARKS)
-    )
-    if args.benchmarks:
-        shutil.copyfile(args.benchmarks, benchmarks_path)
+    benchmarks = tuple(BenchmarkSpec(field, name) for field, name, _ in BENCHMARKS)
 
     def run_producer(output_dir: Path):
         return asyncio.run(
@@ -115,15 +158,9 @@ def evaluate(args: argparse.Namespace) -> Path:
             )
         )
 
-    scores, failures = run_producer(args.output if args.benchmarks else args.output / "avg")
+    scores, failures = run_producer(args.output / "avg")
     if failures:
         raise RuntimeError(f"lighteval-rwkv returned {len(failures)} failed benchmark records")
-
-    if args.benchmarks:
-        # External manifests use the producer's own metrics without replacing graders.
-        output = args.output / "eval_metrics.json"
-        output.write_text(json.dumps({f"eval/{s.benchmark_name}": float(s.score) for s in scores}, indent=2) + "\n")
-        return output
 
     original_update = RWKVRegistry._update_task_configs
 
@@ -178,7 +215,6 @@ def evaluate(args: argparse.Namespace) -> Path:
     output.write_text(json.dumps(metrics, indent=2) + "\n")
     (args.output / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     (args.output / "scores.json").write_text(json.dumps(rows, indent=2) + "\n")
-    _log_wandb(args.step, rows)
     return output
 
 
@@ -225,6 +261,12 @@ def main() -> None:
     if len(sys.argv) == 3 and sys.argv[1] == "--after-train":
         after_train(Path(sys.argv[2]))
         return
+    if len(sys.argv) == 3 and sys.argv[1] == "--math-worker":
+        args = argparse.Namespace(**json.loads(sys.argv[2]))
+        for name in ("model", "output", "lighteval_project"):
+            setattr(args, name, Path(getattr(args, name)))
+        _evaluate_math(args)
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument(
@@ -246,10 +288,11 @@ def main() -> None:
     parser.add_argument("--served-model-name")
     parser.add_argument("--prompt-template", default="bot")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--producer-timeout", type=int, default=21600, help="Producer wall-time limit in seconds")
     parser.add_argument("--test_mode", "--test-mode", action="store_true")
     args = parser.parse_args()
-    if args.step < 0 or args.context_length < 1 or args.max_num_seqs < 1:
-        parser.error("step must be non-negative and serving limits must be positive")
+    if args.step < 0 or args.context_length < 1 or args.max_num_seqs < 1 or args.producer_timeout < 1:
+        parser.error("step must be non-negative and serving limits and producer timeout must be positive")
     evaluate(args)
 
 

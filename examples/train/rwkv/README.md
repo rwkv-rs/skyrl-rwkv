@@ -21,11 +21,15 @@ reuses the stable `lighteval-rwkv` producer for GSM8K, MATH500, AIME24, AIME25,
 and AIMO avg@k/pass@k evaluation.
 
 For a complete benchmark manifest, set `BENCHMARKS` to its TOML path and
-`LIGHTEVAL_PROJECT` to the pinned producer checkout. This mode runs the producer
-once with its own metrics, covering every field in the manifest. `SERVED_MODEL_NAME`
+`LIGHTEVAL_PROJECT` to the pinned producer checkout with its own `.venv`. skyrl-rwkv
+calls the producer's public CLI in that environment and reads its score files;
+the two projects retain their required grader dependency versions. This mode runs
+the producer once with its own metrics, covering every field in the manifest. `SERVED_MODEL_NAME`
 sets the model alias used by both vLLM and the producer; `SEED`, `MAX_SAMPLES`,
 and `PROMPT_TEMPLATE` configure the evaluation. The existing fixed Math avg/pass
-profile remains the default when `BENCHMARKS` is unset.
+profile remains the default when `BENCHMARKS` is unset and runs in the same isolated
+producer environment. skyrl-rwkv publishes the resulting metrics to W&B. Both modes
+accept `--producer-timeout` in seconds (default: 21600).
 
 SFT, FlashREINFORCE and OPD support a bounded training-and-evaluation lifecycle
 through `RWKV_TRAIN_EVAL=<json-path>` and `TRAIN_MAX_SECONDS=<seconds>`. After

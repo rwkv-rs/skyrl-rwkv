@@ -20,6 +20,16 @@ training settings target eight Pro6000 GPUs and use `wkv_mode=fp32io16`.
 reuses the stable `lighteval-rwkv` producer for GSM8K, MATH500, AIME24, AIME25,
 and AIMO avg@k/pass@k evaluation.
 
+Before evaluation on a new GPU/model profile, run `eval/run.sh --prepare-flashrwkv2`
+with the same `MODEL`, `OUTPUT` and serving environment settings. It starts the
+same eight workers with `VLLM_RWKV_TUNING_MODE=tune`, waits for every worker and
+the router to become healthy, then stops them without calling the producer.
+Profiles are saved in `FLASHRWKV2_CACHE_DIR` (default: `~/.cache/flashrwkv2`).
+Preparation allows up to 7200 seconds for startup; the calling job enforces its
+overall budget. Evaluation requires verified profiles with tuning mode `require`
+and allows 900 seconds for startup. Either mode fails immediately when a worker
+or router exits and cleans up its remaining processes.
+
 For a complete benchmark manifest, set `BENCHMARKS` to its TOML path and
 `LIGHTEVAL_PROJECT` to the pinned producer checkout with its own `.venv`. skyrl-rwkv
 calls the producer's public CLI in that environment and reads its score files;
@@ -28,8 +38,8 @@ the producer once with its own metrics, covering every field in the manifest. `S
 sets the model alias used by both vLLM and the producer; `SEED`, `MAX_SAMPLES`,
 and `PROMPT_TEMPLATE` configure the evaluation. The existing fixed Math avg/pass
 profile remains the default when `BENCHMARKS` is unset and runs in the same isolated
-producer environment. skyrl-rwkv publishes the resulting metrics to W&B. Both modes
-accept `--producer-timeout` in seconds (default: 21600).
+producer environment. skyrl-rwkv publishes the resulting metrics to W&B. The
+`eval/prepare.py` adapter accepts `--producer-timeout` in seconds (default: 21600).
 
 SFT, FlashREINFORCE and OPD support a bounded training-and-evaluation lifecycle
 through `RWKV_TRAIN_EVAL=<json-path>` and `TRAIN_MAX_SECONDS=<seconds>`. After

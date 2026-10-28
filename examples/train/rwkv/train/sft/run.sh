@@ -56,7 +56,7 @@ run_rwkv_training -m skyrl.train.main_sft \
   "pretokenized_dataset_paths=['$DATA_ROOT/train']" "eval_pretokenized_dataset_paths=['$DATA_ROOT/eval']" \
   'eval_dataset_names=[rwkv]' max_length=null remove_microbatch_padding=false use_sequence_packing=false \
   'model_config_kwargs={wkv_mode: fp32io16}' rwkv_chunk_size="${RWKV_CHUNK_SIZE:-0}" \
-  num_epochs=1 max_training_steps="$MAX_STEPS" \
+  max_training_steps="$MAX_STEPS" \
   batch_size="$BATCH_SIZE" micro_train_batch_size_per_gpu="$MICRO_BATCH_SIZE" \
   placement.num_nodes=1 placement.num_gpus_per_node="$NUM_GPUS" fsdp_config.fsdp_size="$NUM_GPUS" fsdp_config.reshard_after_forward=false \
   fsdp_config.sync_gradients_each_microbatch=false optimizer_config.lr="${LEARNING_RATE:-1e-6}" \

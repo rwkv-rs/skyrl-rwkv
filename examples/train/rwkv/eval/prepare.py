@@ -89,7 +89,10 @@ def evaluate(args: argparse.Namespace) -> Path:
         # The Math profile uses the producer's existing avg/pass configuration in an isolated worker.
         subprocess.run(
             [str(python), str(Path(__file__).resolve()), "--math-worker", json.dumps(vars(args), default=str)],
-            cwd=project, env=env, check=True, timeout=timeout,
+            cwd=project,
+            env=env,
+            check=True,
+            timeout=timeout,
         )
         result = json.loads((args.output / "result.json").read_text())
         _log_wandb(args.step, result["rows"])
@@ -99,14 +102,28 @@ def evaluate(args: argparse.Namespace) -> Path:
     if len(endpoints) != 8:
         raise ValueError(f"expected eight inference endpoints, got {len(endpoints)}")
     models_path, benchmarks_path = _write_manifests(
-        args.output / ".manifests", args.served_model_name or Path(args.model).name, endpoints,
-        max_num_seqs=args.max_num_seqs, context_length=args.context_length,
+        args.output / ".manifests",
+        args.served_model_name or Path(args.model).name,
+        endpoints,
+        max_num_seqs=args.max_num_seqs,
+        context_length=args.context_length,
     )
     shutil.copyfile(args.benchmarks, benchmarks_path)
     command = [
-        str(python), "-m", "src.rwkv_eval.main", "--models", str(models_path),
-        "--benchmarks", str(benchmarks_path), "--prompt-template", args.prompt_template,
-        "--seed", str(args.seed), "--output-dir", str(args.output), "--no-upload",
+        str(python),
+        "-m",
+        "src.rwkv_eval.main",
+        "--models",
+        str(models_path),
+        "--benchmarks",
+        str(benchmarks_path),
+        "--prompt-template",
+        args.prompt_template,
+        "--seed",
+        str(args.seed),
+        "--output-dir",
+        str(args.output),
+        "--no-upload",
     ]
     if args.max_samples is not None:
         command.extend(("--max-samples", str(args.max_samples)))
@@ -122,6 +139,26 @@ def evaluate(args: argparse.Namespace) -> Path:
     output = args.output / "eval_metrics.json"
     metrics = {f"eval/{score['benchmark_name']}": float(score["score"]) for score in scores}
     output.write_text(json.dumps(metrics, indent=2) + "\n")
+    if getattr(args, "probe_max_samples", None) is not None:
+        if args.max_samples is not None:
+            raise ValueError("a cached probe requires a full evaluation")
+        probe = args.output / "probe"
+        with tempfile.TemporaryDirectory(dir=args.output) as directory:
+            backup = Path(directory)
+            shutil.copytree(args.output / "scores", backup / "scores")
+            shutil.copyfile(output, backup / output.name)
+            probe_args = copy.copy(args)
+            probe_args.max_samples = args.probe_max_samples
+            probe_args.probe_max_samples = None
+            try:
+                # Keep the producer output path: it is part of its cache key.
+                # The fixed subset is scored from this full run's cached responses.
+                evaluate(probe_args)
+                shutil.copytree(args.output / "scores", probe / "scores", dirs_exist_ok=True)
+                shutil.copyfile(output, probe / output.name)
+            finally:
+                shutil.copytree(backup / "scores", args.output / "scores", dirs_exist_ok=True)
+                shutil.copyfile(backup / output.name, output)
     return output
 
 
@@ -138,8 +175,11 @@ def _evaluate_math(args: argparse.Namespace) -> Path:
         raise ValueError(f"expected eight inference endpoints, got {len(endpoints)}")
     model_name = args.served_model_name or Path(args.model).name
     models_path, benchmarks_path = _write_manifests(
-        args.output / ".manifests", model_name, endpoints,
-        max_num_seqs=args.max_num_seqs, context_length=args.context_length,
+        args.output / ".manifests",
+        model_name,
+        endpoints,
+        max_num_seqs=args.max_num_seqs,
+        context_length=args.context_length,
     )
     models = tuple(ModelEndpoint(url, "EMPTY", model_name, args.max_num_seqs, args.context_length) for url in endpoints)
     benchmarks = tuple(BenchmarkSpec(field, name) for field, name, _ in BENCHMARKS)
@@ -246,9 +286,17 @@ def after_train(path: Path) -> None:
             "MAX_SAMPLES": str(settings.get("max_samples") or ""),
         }
         subprocess.run(
-            ["timeout", "--signal=TERM", "--kill-after=120s", f"{settings['seconds']}s",
-             "bash", str(Path(__file__).with_name("run.sh"))],
-            env=env, check=True, timeout=settings["seconds"] + 180,
+            [
+                "timeout",
+                "--signal=TERM",
+                "--kill-after=120s",
+                f"{settings['seconds']}s",
+                "bash",
+                str(Path(__file__).with_name("run.sh")),
+            ],
+            env=env,
+            check=True,
+            timeout=settings["seconds"] + 180,
         )
         # The orchestrator records provenance and the gate result while GPUs are still handed over.
         result = subprocess.run([*spec["callback"], size], check=False, timeout=60)
@@ -284,6 +332,7 @@ def main() -> None:
     parser.add_argument("--context-length", type=int, default=32768)
     parser.add_argument("--max-num-seqs", type=int, default=128)
     parser.add_argument("--max-samples", type=int)
+    parser.add_argument("--probe-max-samples", type=int, help="Score a subset from the completed full-run cache")
     parser.add_argument("--benchmarks", type=Path)
     parser.add_argument("--served-model-name")
     parser.add_argument("--prompt-template", default="bot")
@@ -293,6 +342,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.step < 0 or args.context_length < 1 or args.max_num_seqs < 1 or args.producer_timeout < 1:
         parser.error("step must be non-negative and serving limits and producer timeout must be positive")
+    if args.probe_max_samples is not None and (args.probe_max_samples < 1 or args.max_samples is not None):
+        parser.error("--probe-max-samples requires a full evaluation and a positive subset size")
     evaluate(args)
 
 

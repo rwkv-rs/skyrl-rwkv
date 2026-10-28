@@ -134,6 +134,7 @@ ARGS=(--model "$MODEL" --base-url "$BASE_URL" --output "$OUTPUT" --step "$STEP" 
   --lighteval-project "${LIGHTEVAL_PROJECT:-$HOME/Projects/MachineLearning/lighteval-rwkv}")
 [[ -z "${BENCHMARKS:-}" ]] || ARGS+=(--benchmarks "$BENCHMARKS")
 [[ -z "${MAX_SAMPLES:-}" ]] || ARGS+=(--max-samples "$MAX_SAMPLES")
+[[ -z "${BASELINE_PROBE_MAX_SAMPLES:-}" ]] || ARGS+=(--probe-max-samples "$BASELINE_PROBE_MAX_SAMPLES")
 if [[ "$TEST_MODE" == true ]]; then
   ARGS+=(--test_mode)
 fi

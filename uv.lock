@@ -4812,7 +4812,7 @@ wheels = [
 [[package]]
 name = "lighteval"
 version = "0.13.1.dev0"
-source = { git = "https://github.com/rwkv-rs/lighteval-rwkv?rev=c5475e27a1e58184c9a6cdbd30572ec1ae601dd7#c5475e27a1e58184c9a6cdbd30572ec1ae601dd7" }
+source = { git = "https://github.com/rwkv-rs/lighteval-rwkv?rev=2fdd34e9cf42e3af06089e02c5c77e483ef46c85#2fdd34e9cf42e3af06089e02c5c77e483ef46c85" }
 dependencies = [
     { name = "accelerate", marker = "sys_platform == 'linux'" },
     { name = "aenum", marker = "sys_platform == 'linux'" },
@@ -10737,7 +10737,7 @@ requires-dist = [
     { name = "jax", extras = ["cuda13"], marker = "sys_platform == 'linux' and extra == 'gpu'", specifier = ">=0.7.2" },
     { name = "jax", extras = ["tpu"], marker = "platform_machine == 'x86_64' and sys_platform == 'linux' and extra == 'tpu'", specifier = ">=0.7.2" },
     { name = "jaxtyping", marker = "extra == 'skyrl-train'" },
-    { name = "lighteval", marker = "sys_platform == 'linux' and extra == 'rwkv'", git = "https://github.com/rwkv-rs/lighteval-rwkv?rev=c5475e27a1e58184c9a6cdbd30572ec1ae601dd7" },
+    { name = "lighteval", marker = "sys_platform == 'linux' and extra == 'rwkv'", git = "https://github.com/rwkv-rs/lighteval-rwkv?rev=2fdd34e9cf42e3af06089e02c5c77e483ef46c85" },
     { name = "litellm", marker = "extra == 'dev'" },
     { name = "litellm", marker = "extra == 'miniswe'" },
     { name = "loguru", marker = "extra == 'skyrl-train'" },

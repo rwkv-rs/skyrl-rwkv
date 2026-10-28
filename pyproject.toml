@@ -582,7 +582,7 @@ skyrl-gym = { path = "./skyrl-gym", editable = true }
 skycap = { path = "./skycap", editable = true }
 transformers = { git = "https://github.com/rwkv-rs/transformers-rwkv", rev = "f93dd4e01e0b565ef0390f76c6726d1d121ebbab", extra = "rwkv" }
 vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "2852a7b1d597f6e2131ec801de331b886471cd95", extra = "rwkv" }
-lighteval = { git = "https://github.com/rwkv-rs/lighteval-rwkv", rev = "c5475e27a1e58184c9a6cdbd30572ec1ae601dd7", extra = "rwkv" }
+lighteval = { git = "https://github.com/rwkv-rs/lighteval-rwkv", rev = "2fdd34e9cf42e3af06089e02c5c77e483ef46c85", extra = "rwkv" }
 tokenizers = { git = "https://github.com/rwkv-rs/tokenizers-rwkv", rev = "c5d8dde5ff49c70e4656199d5033a84e03c21b2b", subdirectory = "bindings/python", extra = "rwkv" }
 # Match torch's CUDA variant (cu130).
 flashinfer-jit-cache = { index = "flashinfer-cu130", marker = "sys_platform == 'linux'" }

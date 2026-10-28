@@ -12,7 +12,10 @@ import asyncio
 import copy
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 BENCHMARKS = (
@@ -24,7 +27,9 @@ BENCHMARKS = (
 )
 
 
-def _write_manifests(root: Path, model: str, endpoints: list[str]) -> tuple[Path, Path]:
+def _write_manifests(
+    root: Path, model: str, endpoints: list[str], *, max_num_seqs: int = 1024, context_length: int = 32768
+) -> tuple[Path, Path]:
     """Write private model and benchmark manifests for the stable producer."""
     root.mkdir(parents=True, exist_ok=True)
     models = root / "models.toml"
@@ -32,7 +37,7 @@ def _write_manifests(root: Path, model: str, endpoints: list[str]) -> tuple[Path
         "\n".join(
             "[[model]]\n"
             f'url = "{url}"\napi_key = "EMPTY"\nmodel_name = "{model}"\n'
-            "max_num_seqs = 1024\nctx_len = 32768\n"
+            f"max_num_seqs = {max_num_seqs}\nctx_len = {context_length}\n"
             for url in endpoints
         )
     )
@@ -75,24 +80,33 @@ def evaluate(args: argparse.Namespace) -> Path:
     """Evaluate one checkpoint through the existing eight-worker producer."""
     project = args.lighteval_project.expanduser().resolve()
     sys.path[:0] = [str(project / "src"), str(project)]
-    from src.rwkv_eval.configs import BenchmarkSpec, ModelEndpoint
+    from src.rwkv_eval.configs import BenchmarkSpec, ModelEndpoint, read_benchmarks
     from src.rwkv_eval.main import RWKVRegistry
     from src.rwkv_eval.main import evaluate as producer_evaluate
 
     endpoints = [url.strip().rstrip("/") for url in args.base_url.split(",") if url.strip()]
     if len(endpoints) != 8:
         raise ValueError(f"expected eight inference endpoints, got {len(endpoints)}")
-    model_name = Path(args.model).name
-    models_path, benchmarks_path = _write_manifests(args.output / ".manifests", model_name, endpoints)
+    model_name = args.served_model_name or Path(args.model).name
+    models_path, benchmarks_path = _write_manifests(
+        args.output / ".manifests", model_name, endpoints,
+        max_num_seqs=args.max_num_seqs, context_length=args.context_length,
+    )
     models = tuple(ModelEndpoint(url, "EMPTY", model_name, args.max_num_seqs, args.context_length) for url in endpoints)
-    benchmarks = tuple(BenchmarkSpec(field, name) for field, name, _ in BENCHMARKS)
+    benchmarks = (
+        read_benchmarks(args.benchmarks)
+        if args.benchmarks
+        else tuple(BenchmarkSpec(field, name) for field, name, _ in BENCHMARKS)
+    )
+    if args.benchmarks:
+        shutil.copyfile(args.benchmarks, benchmarks_path)
 
     def run_producer(output_dir: Path):
         return asyncio.run(
             producer_evaluate(
                 models,
                 benchmarks,
-                prompt_template="bot",
+                prompt_template=args.prompt_template,
                 max_samples=args.max_samples,
                 test_mode=args.test_mode,
                 seed=args.seed,
@@ -101,9 +115,15 @@ def evaluate(args: argparse.Namespace) -> Path:
             )
         )
 
-    scores, failures = run_producer(args.output / "avg")
+    scores, failures = run_producer(args.output if args.benchmarks else args.output / "avg")
     if failures:
-        raise RuntimeError(f"lighteval-rwkv returned {len(failures)} failed avg benchmark records")
+        raise RuntimeError(f"lighteval-rwkv returned {len(failures)} failed benchmark records")
+
+    if args.benchmarks:
+        # External manifests use the producer's own metrics without replacing graders.
+        output = args.output / "eval_metrics.json"
+        output.write_text(json.dumps({f"eval/{s.benchmark_name}": float(s.score) for s in scores}, indent=2) + "\n")
+        return output
 
     original_update = RWKVRegistry._update_task_configs
 
@@ -162,7 +182,49 @@ def evaluate(args: argparse.Namespace) -> Path:
     return output
 
 
+def after_train(path: Path) -> None:
+    """Publish an exact export, evaluate it, and confirm a passing probe at full size.
+
+    The caller supplies a JSON argv for its acceptance callback. Exit 0 requests
+    full confirmation, exit 1 rejects the probe; other failures stop the lifecycle.
+    Evaluation has its own wall budget after the training process exits.
+    """
+    spec = json.loads(path.read_text())
+    source, model = Path(spec["export"]).expanduser(), Path(spec["model"]).expanduser()
+    if not (source / "config.json").is_file():
+        raise ValueError(f"missing HF export: {source}")
+    if model.exists():
+        raise FileExistsError(f"candidate already exists: {model}")
+    model.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=f".{model.name}-", dir=model.parent) as directory:
+        staging = Path(directory) / "model"
+        shutil.copytree(source, staging)
+        staging.rename(model)
+    for size in ("probe", "full"):
+        settings = spec[size]
+        env = {
+            **os.environ,
+            **spec["env"],
+            "MODEL": str(model),
+            "OUTPUT": settings["output"],
+            "MAX_SAMPLES": str(settings.get("max_samples") or ""),
+        }
+        subprocess.run(
+            ["timeout", "--signal=TERM", "--kill-after=120s", f"{settings['seconds']}s",
+             "bash", str(Path(__file__).with_name("run.sh"))],
+            env=env, check=True, timeout=settings["seconds"] + 180,
+        )
+        # The orchestrator records provenance and the gate result while GPUs are still handed over.
+        result = subprocess.run([*spec["callback"], size], check=False, timeout=60)
+        if result.returncode == 1:
+            return
+        result.check_returncode()
+
+
 def main() -> None:
+    if len(sys.argv) == 3 and sys.argv[1] == "--after-train":
+        after_train(Path(sys.argv[2]))
+        return
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument(
@@ -180,6 +242,9 @@ def main() -> None:
     parser.add_argument("--context-length", type=int, default=32768)
     parser.add_argument("--max-num-seqs", type=int, default=1024)
     parser.add_argument("--max-samples", type=int)
+    parser.add_argument("--benchmarks", type=Path)
+    parser.add_argument("--served-model-name")
+    parser.add_argument("--prompt-template", default="bot")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--test_mode", "--test-mode", action="store_true")
     args = parser.parse_args()

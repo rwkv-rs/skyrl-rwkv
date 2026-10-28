@@ -6,6 +6,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PROJECT_ROOT="$(cd "$ROOT/../../.." && pwd)"
 PYTHON="${PYTHON:-$PROJECT_ROOT/.venv/bin/python3}"
 MODEL="${MODEL:?Set MODEL to the HF RWKV checkpoint to evaluate}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-$(basename "$MODEL")}"
 OUTPUT="${OUTPUT:?Set OUTPUT to the checkpoint evaluation directory}"
 STEP="${STEP:-0}"
 NUM_GPUS="${NUM_GPUS:-8}"
@@ -32,21 +33,37 @@ PIDS=()
 URLS=()
 mkdir -p "$OUTPUT"
 cleanup() {
+  trap - EXIT INT TERM
   for pid in "${PIDS[@]}"; do
-    kill -- "-$pid" 2>/dev/null || true
+    kill -TERM -- "-$pid" 2>/dev/null || true
+  done
+  local deadline=$((SECONDS + 30)) running
+  while (( SECONDS < deadline )); do
+    running=false
+    for pid in "${PIDS[@]}"; do
+      if kill -0 -- "-$pid" 2>/dev/null; then running=true; fi
+    done
+    [[ "$running" == true ]] || break
+    sleep 1
+  done
+  for pid in "${PIDS[@]}"; do
+    kill -KILL -- "-$pid" 2>/dev/null || true
   done
   for pid in "${PIDS[@]}"; do
     wait "$pid" 2>/dev/null || true
   done
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 for ((gpu = 0; gpu < NUM_GPUS; gpu++)); do
   port=$((BASE_PORT + gpu))
   URLS+=("http://127.0.0.1:$port")
   setsid env CUDA_VISIBLE_DEVICES="$gpu" uv run --isolated --no-config --no-project "$PYTHON" \
-    -m vllm.entrypoints.openai.api_server --model "$MODEL" --served-model-name "$(basename "$MODEL")" \
+    -m vllm.entrypoints.openai.api_server --model "$MODEL" --served-model-name "$SERVED_MODEL_NAME" \
     --host 127.0.0.1 --port "$port" --dtype bfloat16 --max-model-len "$MAX_MODEL_LEN" \
+    --mamba-ssm-cache-dtype float32 \
     --max-num-seqs "$MAX_NUM_SEQS" --max-num-batched-tokens 32768 \
     --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" --enable-prefix-caching \
     --enable-chunked-prefill --no-enable-log-requests > "$OUTPUT/inference-gpu$gpu.log" 2>&1 &
@@ -75,7 +92,11 @@ done
 BASE_URL="http://127.0.0.1:$ROUTER_PORT"
 BASE_URL="$BASE_URL,$BASE_URL,$BASE_URL,$BASE_URL,$BASE_URL,$BASE_URL,$BASE_URL,$BASE_URL"
 ARGS=(--model "$MODEL" --base-url "$BASE_URL" --output "$OUTPUT" --step "$STEP" \
+  --served-model-name "$SERVED_MODEL_NAME" --seed "${SEED:-42}" \
+  --context-length "$MAX_MODEL_LEN" --max-num-seqs "$MAX_NUM_SEQS" --prompt-template "${PROMPT_TEMPLATE:-bot}" \
   --lighteval-project "${LIGHTEVAL_PROJECT:-$HOME/Projects/MachineLearning/lighteval-rwkv}")
+[[ -z "${BENCHMARKS:-}" ]] || ARGS+=(--benchmarks "$BENCHMARKS")
+[[ -z "${MAX_SAMPLES:-}" ]] || ARGS+=(--max-samples "$MAX_SAMPLES")
 if [[ "${1:-}" == "--test_mode" || "${1:-}" == "--test-mode" ]]; then
   ARGS+=(--test_mode)
   shift

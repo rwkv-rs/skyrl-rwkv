@@ -97,7 +97,7 @@ else
   LORA_OVERRIDES+=(trainer.policy.model.lora.rank=0)
 fi
 
-run_rwkv_python -m skyrl.train.entrypoints.main_base \
+run_rwkv_training -m skyrl.train.entrypoints.main_base \
   "data.train_data=['$TRAIN_DATA']" "data.val_data=['$VAL_DATA']" \
   trainer.algorithm.advantage_estimator=flashreinforce trainer.algorithm.policy_loss_type=flashreinforce \
   trainer.algorithm.loss_reduction=sequence_mean trainer.algorithm.use_kl_loss=false \

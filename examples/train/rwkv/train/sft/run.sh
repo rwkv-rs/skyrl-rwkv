@@ -51,7 +51,7 @@ EVAL_NUM_GPUS="${EVAL_NUM_GPUS:-8}"
 EVAL_ROOT="$OUTPUT_ROOT/evaluation"
 EVAL_COMMAND="['env','MODEL=$OUTPUT_ROOT/hf_exports/global_step_{global_step}/policy','OUTPUT=$EVAL_ROOT/global_step_{global_step}','STEP={global_step}','NUM_GPUS=$EVAL_NUM_GPUS','bash','$ROOT/eval/run.sh']"
 
-run_rwkv_python -m skyrl.train.main_sft \
+run_rwkv_training -m skyrl.train.main_sft \
   strategy=fsdp model.path="$MODEL_DIR" "${LORA_OVERRIDES[@]}" \
   "pretokenized_dataset_paths=['$DATA_ROOT/train']" "eval_pretokenized_dataset_paths=['$DATA_ROOT/eval']" \
   'eval_dataset_names=[rwkv]' max_length=null remove_microbatch_padding=false use_sequence_packing=false \

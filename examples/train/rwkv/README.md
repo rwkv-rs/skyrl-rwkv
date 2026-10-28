@@ -20,6 +20,46 @@ training settings target eight Pro6000 GPUs and use `wkv_mode=fp32io16`.
 reuses the stable `lighteval-rwkv` producer for GSM8K, MATH500, AIME24, AIME25,
 and AIMO avg@k/pass@k evaluation.
 
+For a complete benchmark manifest, set `BENCHMARKS` to its TOML path and
+`LIGHTEVAL_PROJECT` to the pinned producer checkout. This mode runs the producer
+once with its own metrics, covering every field in the manifest. `SERVED_MODEL_NAME`
+sets the model alias used by both vLLM and the producer; `SEED`, `MAX_SAMPLES`,
+and `PROMPT_TEMPLATE` configure the evaluation. The existing fixed Math avg/pass
+profile remains the default when `BENCHMARKS` is unset.
+
+SFT, FlashREINFORCE and OPD support a bounded training-and-evaluation lifecycle
+through `RWKV_TRAIN_EVAL=<json-path>` and `TRAIN_MAX_SECONDS=<seconds>`. After
+training succeeds and releases its Ray resources, the launcher publishes the
+specified HF export, runs a probe, and calls the supplied acceptance command.
+Only a passing probe runs full confirmation. The JSON contains:
+
+```json
+{
+  "export": "/run/hf_exports/global_step_5/policy",
+  "model": "/weights/rwkv7-g1l-13.3b-heli-r01-sft",
+  "env": {
+    "BENCHMARKS": "/project/config/benchmarks.toml",
+    "LIGHTEVAL_PROJECT": "/project/third_party/lighteval-rwkv",
+    "SERVED_MODEL_NAME": "rwkv7-g1l-13.3b-heli-r01-sft",
+    "SEED": "42"
+  },
+  "probe": {"output": "/run/evaluation/probe", "max_samples": 100, "seconds": 3600},
+  "full": {"output": "/run/evaluation/full", "seconds": 21600},
+  "callback": ["/project/.venv/bin/python", "-m", "helicopter", "checkpoint-result", "/run/spec.json", "train"]
+}
+```
+
+The callback receives `probe` or `full` as its final argument. Exit 0 proceeds,
+exit 1 ends evaluation normally after a failed gate, and other exit codes fail
+the job. The destination must be new; publishing never overwrites an existing
+checkpoint. Training and each evaluation have separate wall budgets. Native
+training behavior remains available by leaving `RWKV_TRAIN_EVAL` unset.
+
+SFT preprocessing accepts `--subset cot` (default), `--subset instruct` and
+`--subset mixed`. Instruction rows use the native `fake_think` prefix and
+supervise only the concise assistant answer, separator and EOS. CoT rows use
+`open_think` and retain their supplied complete reasoning and answer.
+
 ## Eight-GPU performance profiles
 
 The defaults below are the recommended hardware profile for one node with eight

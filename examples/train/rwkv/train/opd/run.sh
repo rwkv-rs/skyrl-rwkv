@@ -120,7 +120,7 @@ else
   LORA_OVERRIDES+=(trainer.policy.model.lora.rank=0)
 fi
 
-run_rwkv_python -m examples.train.on_policy_distillation.main_on_policy_distill \
+run_rwkv_training -m examples.train.on_policy_distillation.main_on_policy_distill \
   "data.train_data=['$TRAIN_DATA']" "data.val_data=['$VAL_DATA']" \
   trainer.algorithm.advantage_estimator=no_op trainer.algorithm.async_opd="$ASYNC_OPD" \
   trainer.algorithm.policy_loss_type="${POLICY_LOSS_TYPE:-importance_sampling}" \

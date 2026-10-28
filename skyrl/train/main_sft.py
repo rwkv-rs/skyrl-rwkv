@@ -69,7 +69,10 @@ def main():
     validate_sft_cfg(cfg)
     skyrl_cfg = build_skyrl_config_for_sft(cfg)
     initialize_ray(skyrl_cfg)
-    ray.get(sft_entrypoint.remote(cfg, skyrl_cfg))
+    try:
+        ray.get(sft_entrypoint.remote(cfg, skyrl_cfg))
+    finally:
+        ray.shutdown()
 
 
 if __name__ == "__main__":

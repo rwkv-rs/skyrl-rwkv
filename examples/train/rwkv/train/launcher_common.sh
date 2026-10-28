@@ -26,6 +26,16 @@ run_rwkv_python() {
   uv run --isolated --no-config --no-project "$PYTHON" "$@"
 }
 
+run_rwkv_training() {
+  if [[ -z "${RWKV_TRAIN_EVAL:-}" ]]; then
+    run_rwkv_python "$@"
+    return
+  fi
+  timeout --signal=TERM --kill-after=120s "${TRAIN_MAX_SECONDS:?Set TRAIN_MAX_SECONDS}s" \
+    uv run --isolated --no-config --no-project "$PYTHON" "$@" || return "$?"
+  run_rwkv_python "$RWKV_ROOT/eval/prepare.py" --after-train "$RWKV_TRAIN_EVAL"
+}
+
 configure_wandb() {
   if [[ "${1:-false}" == true ]]; then
     export WANDB_MODE=disabled

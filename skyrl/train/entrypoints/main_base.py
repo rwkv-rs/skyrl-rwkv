@@ -471,7 +471,10 @@ def main() -> None:
     validate_cfg(cfg)
 
     initialize_ray(cfg)
-    ray.get(skyrl_entrypoint.remote(cfg))
+    try:
+        ray.get(skyrl_entrypoint.remote(cfg))
+    finally:
+        ray.shutdown()
 
 
 if __name__ == "__main__":

@@ -34,7 +34,7 @@ def expert_rows(source, *, subset="cot"):
     """Stream complete original Nemotron expert traces from one Parquet shard."""
     for batch in pq.ParquetFile(source).iter_batches(batch_size=64):
         for row in batch.to_pylist():
-            if row.get("subset") != subset:
+            if row.get("subset") not in (("cot", "instruct") if subset == "mixed" else (subset,)):
                 continue
             user, assistant = row["messages"]
             if user["role"] != "user" or assistant["role"] != "assistant":
@@ -45,6 +45,7 @@ def expert_rows(source, *, subset="cot"):
                 "prompt": user["content"],
                 "reasoning_content": assistant.get("reasoning_content") or "",
                 "content": assistant.get("content") or "",
+                "generation_prompt": "fake_think" if row["subset"] == "instruct" else "open_think",
             }
 
 
@@ -54,24 +55,44 @@ def validation_question(uuid, seed, fraction):
     return int.from_bytes(digest, "big") / 2**256 < fraction
 
 
+def source_files(paths):
+    """Record exact input identities alongside the prepared dataset."""
+    records = []
+    for path in paths:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1 << 24), b""):
+                digest.update(block)
+        records.append({"path": str(path.resolve()), "bytes": path.stat().st_size, "sha256": digest.hexdigest()})
+    return records
+
+
 def convert_example(row, tokenizer):
-    """Supervise complete expert reasoning, final answer, separator and EOS."""
-    if not row["reasoning_content"].strip() or not row["content"].strip():
+    """Supervise the answer suffix for the row's native RWKV generation mode."""
+    mode = row.get("generation_prompt", "open_think")
+    if not row["content"].strip() or (mode == "open_think" and not row["reasoning_content"].strip()):
         raise ValueError(f"Incomplete CoT expert trace: {row['uuid']}")
+    response = (
+        f"<think>{row['reasoning_content']}\n</think>\n{row['content']}"
+        if mode == "open_think"
+        else f"<think></think>\n{row['content']}"
+    )
     messages = [
         {"role": "user", "content": row["prompt"]},
         {
             "role": "assistant",
-            "content": f"<think>{row['reasoning_content']}\n</think>\n{row['content']}",
+            "content": response,
         },
     ]
     template_kwargs = dict(
         tokenize=False,
         rwkv_prompt_template="bot",
-        rwkv_generation_prompt="open_think",
+        rwkv_generation_prompt=mode,
     )
     prompt = tokenizer.apply_chat_template(messages[:1], add_generation_prompt=True, **template_kwargs)
     full_text = tokenizer.apply_chat_template(messages, add_generation_prompt=False, **template_kwargs)
+    if not full_text.startswith(prompt):
+        raise ValueError(f"Chat template prefix mismatch: {row['uuid']}")
     # Replay rollout's prompt IDs and encode the supervised suffix separately.
     prompt_ids = tokenizer.encode(prompt, add_special_tokens=False)
     response_ids = tokenizer.encode(full_text[len(prompt) :], add_special_tokens=False) + [tokenizer.eos_token_id]
@@ -121,7 +142,7 @@ class LengthGroupedSampler(Sampler):
 
 def prepare_shard(args):
     """Stream one source shard to bounded Parquet row groups."""
-    source, staging, model, seed, fraction, limit = args
+    source, staging, model, seed, fraction, limit, subset = args
     pa.set_cpu_count(1)
     pa.set_io_thread_count(1)
     tokenizer = get_tokenizer(model)
@@ -153,7 +174,7 @@ def prepare_shard(args):
         records.clear()
 
     try:
-        for index, row in enumerate(expert_rows(source, subset="cot")):
+        for index, row in enumerate(expert_rows(source, subset=subset)):
             if limit is not None and index >= limit:
                 break
             split = "validation" if validation_question(row["question_id"], seed, fraction) else "train"
@@ -168,7 +189,7 @@ def prepare_shard(args):
             if len(buffers[split]) >= 256:
                 flush(split)
             if (index + 1) % 1000 == 0:
-                print(f"{Path(source).name}: {index + 1} complete CoT rows", flush=True)
+                print(f"{Path(source).name}: {index + 1} complete {subset} rows", flush=True)
         for split in buffers:
             flush(split)
     finally:
@@ -196,7 +217,8 @@ def prepare_data(args):
         for split in questions:
             (staging / split).mkdir()
         tasks = [
-            (str(source), directory, str(args.model.expanduser()), args.seed, args.validation_fraction, args.limit)
+            (str(source), directory, str(args.model.expanduser()), args.seed, args.validation_fraction, args.limit,
+             args.subset)
             for source in sources
         ]
         with ProcessPoolExecutor(
@@ -228,10 +250,10 @@ def prepare_data(args):
         tokenizer = get_tokenizer(str(args.model.expanduser()))
         manifest = {
             "source": str(args.input.expanduser().resolve()),
-            "source_files": [{"path": str(source.resolve()), "bytes": source.stat().st_size} for source in sources],
+            "source_files": source_files(sources),
             "model": str(args.model.expanduser().resolve()),
             "chat_template_sha256": hashlib.sha256(tokenizer.chat_template.encode()).hexdigest(),
-            "subset": "cot",
+            "subset": args.subset,
             "seed": args.seed,
             "validation_fraction": args.validation_fraction,
             "max_length": None,
@@ -254,6 +276,7 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--model", type=Path, default=Path.home() / "Weights/RWKV/hf/rwkv7-g1k-1.5b-20260930-ctx25600")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--subset", choices=("cot", "instruct", "mixed"), default="cot")
     parser.add_argument("--validation-fraction", type=float, default=0.05)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--eval-rows", type=int, default=512)

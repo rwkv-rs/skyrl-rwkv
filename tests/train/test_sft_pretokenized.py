@@ -37,7 +37,16 @@ def test_direct_nemotron_sft_preserves_original_cot_and_question_split(tmp_path)
         for uuid in ("trace-a", "trace-b")
     ]
     path = tmp_path / "nemotron.parquet"
-    pq.write_table(pa.Table.from_pylist(source + [{**source[0], "subset": "tir"}]), path)
+    instruction = {
+        **source[0],
+        "uuid": "instruction",
+        "subset": "instruct",
+        "messages": [
+            {"role": "user", "content": "Reply with exactly one word: yes"},
+            {"role": "assistant", "content": "yes"},
+        ],
+    }
+    pq.write_table(pa.Table.from_pylist(source + [{**source[0], "subset": "tir"}, instruction]), path)
     traces = list(expert_rows(path))
     assert [trace["uuid"] for trace in traces] == ["trace-a", "trace-b"]
     assert traces[0]["reasoning_content"] == reasoning
@@ -47,6 +56,39 @@ def test_direct_nemotron_sft_preserves_original_cot_and_question_split(tmp_path)
     assert validation_question(traces[0]["question_id"], 0, 0.05) == validation_question(
         traces[1]["question_id"], 0, 0.05
     )
+    mixed = list(expert_rows(path, subset="mixed"))
+    assert [row["uuid"] for row in mixed] == ["trace-a", "trace-b", "instruction"]
+    assert mixed[-1]["generation_prompt"] == "fake_think"
+    assert mixed[-1]["reasoning_content"] == ""
+    assert [row["uuid"] for row in expert_rows(path, subset="instruct")] == ["instruction"]
+
+
+@pytest.mark.parametrize("mode", ["open_think", "fake_think"])
+def test_rwkv_sft_masks_generation_prefix_and_supervises_response_and_eos(mode):
+    from examples.train.rwkv.train.sft.prepare import convert_example
+
+    class Tokenizer:
+        eos_token_id = 0
+
+        def apply_chat_template(self, messages, *, add_generation_prompt, rwkv_generation_prompt, **kwargs):
+            prefix = "User✿" + messages[0]["content"] + "✿\nBot✿"
+            if add_generation_prompt:
+                return prefix + ("<think" if rwkv_generation_prompt == "open_think" else "<think></think")
+            return prefix + messages[-1]["content"] + "✿"
+
+        def encode(self, text, *, add_special_tokens):
+            return [ord(character) for character in text]
+
+    row = {
+        "uuid": "answer", "question_id": "question", "prompt": "2+2?",
+        "content": "4", "reasoning_content": "2+2=4" if mode == "open_think" else "",
+        "generation_prompt": mode,
+    }
+    result = convert_example(row, Tokenizer())
+    supervised = [token for token, mask in zip(result["input_ids"], result["loss_mask"]) if mask]
+    expected = ">2+2=4\n</think>\n4✿" if mode == "open_think" else ">\n4✿"
+    assert supervised == [ord(character) for character in expected] + [Tokenizer.eos_token_id]
+    assert len(result["input_ids"]) == len(result["loss_mask"])
 
 
 def _rows():

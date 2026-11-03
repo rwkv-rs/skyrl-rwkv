@@ -386,6 +386,49 @@ def _gpu_state_snapshot(dispatch):
     return {name: (state.model_on_gpu, state.optimizer_on_gpu) for name, state in dispatch._gpu_state.items()}
 
 
+@pytest.mark.parametrize("offload_optimizer", [False, True])
+@pytest.mark.asyncio
+async def test_resident_policy_survives_sampling_and_weight_sync(offload_optimizer):
+
+    dispatch, calls = _prepare_sync_dispatch({"policy": (True, True)}, offload_after_step=offload_optimizer)
+    dispatch.keep_policy_model_on_gpu = True
+    dispatch.mark_all_offloaded()
+    assert _gpu_state_snapshot(dispatch) == {"policy": (True, not offload_optimizer)}
+    dispatch.offload_for_sampling()
+    await dispatch._prepare_for_weight_sync()
+    dispatch._finish_weight_sync()
+    assert _gpu_state_snapshot(dispatch) == {"policy": (True, not offload_optimizer)}
+    assert all(call[0] == "offload" and call[3] is False for call in calls)
+    if not offload_optimizer:
+        assert calls == []
+    dispatch._ensure_on_gpu("policy", need_optimizer=True)
+    assert _gpu_state_snapshot(dispatch) == {"policy": (True, True)}
+    if offload_optimizer:
+        assert calls[-1] == ("backload", "policy", True, False)
+
+
+def test_resident_policy_evaluation_preserves_parameters():
+    from skyrl.backends.skyrl_train.workers.worker_dispatch import GPUState
+
+    dispatch, calls = _prepare_sync_dispatch({"policy": (True, True)}, offload_after_step=False)
+    dispatch._gpu_state["policy"] = GPUState(True, True)
+    dispatch.keep_policy_model_on_gpu = True
+    with dispatch.offload_for_evaluation():
+        assert _gpu_state_snapshot(dispatch) == {"policy": (True, True)}
+    assert calls == []
+
+
+@pytest.mark.parametrize("strategy", ["fsdp", "megatron"])
+def test_resident_policy_rejects_unsupported_strategy(strategy):
+    from skyrl.train.config import SkyRLTrainConfig
+
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.policy.keep_model_on_gpu = True
+    cfg.trainer.strategy = strategy
+    with pytest.raises(ValueError, match="keep_model_on_gpu"):
+        cfg.__post_init__()
+
+
 class TestAdapterOnlyColocatedSync:
     """Tests for adapter-only colocated LoRA sync.
 

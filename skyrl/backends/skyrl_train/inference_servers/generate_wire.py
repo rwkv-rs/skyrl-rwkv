@@ -51,6 +51,7 @@ class PackedField(StrEnum):
     ROUTED_EXPERTS = "routed_experts"
     ROLLOUT_SAMPLE_SUPPORT = "rollout_sample_support"
     ROLLOUT_SAMPLE_SUPPORT_LOGPROBS = "rollout_sample_support_logprobs"
+    ROLLOUT_LOGPROBS = "rollout_logprobs"
 
 
 class SampleSupportWireKey(StrEnum):
@@ -188,6 +189,28 @@ def unpack_ndarray(
     array = np.frombuffer(data, dtype=dtype).reshape(shape)
     sidecar = {key: value for key, value in payload.items() if key not in _ENVELOPE_KEYS}
     return array, sidecar
+
+
+def pack_sampled_logprobs(token_ids, logprobs) -> tuple[dict[str, Any], int]:
+    values = np.empty(len(token_ids), dtype=np.float32)
+    clamped = 0
+    if len(logprobs) != len(token_ids):
+        raise ValueError("Sampled logprobs must align with response tokens")
+    for index, (token_id, candidates) in enumerate(zip(token_ids, logprobs, strict=True)):
+        entry = candidates.get(token_id) if candidates else None
+        value = entry.logprob if entry is not None else None
+        if value is None or not math.isfinite(value) or abs(value) > np.finfo(np.float32).max:
+            value = CLAMPED_LOGPROB
+            clamped += 1
+        values[index] = value
+    return pack_ndarray(values, allowed_dtypes=frozenset({np.dtype(np.float32)})), clamped
+
+
+def decode_packed_logprobs(payload: dict[str, Any]) -> np.ndarray:
+    values, _ = unpack_ndarray(payload, allowed_dtypes=frozenset({np.dtype(np.float32)}), ndim=1)
+    if not np.isfinite(values).all():
+        raise ValueError("Packed sampled logprobs must be finite")
+    return values
 
 
 def pack_routed_experts(routed_experts: RoutedExpertIndices) -> dict[str, Any]:

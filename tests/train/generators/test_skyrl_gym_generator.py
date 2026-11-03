@@ -31,6 +31,123 @@ from skyrl.train.generators.utils import build_vllm_cache_salt, prepare_generato
 from skyrl_gym.envs.base_text_env import BaseTextEnv, BaseTextEnvStepOutput
 from tests.backends.skyrl_train.sample_support_helpers import csr, dense, dense_logprobs
 
+
+def test_spilled_trajectory_reference_does_not_retain_payload(tmp_path):
+    import gc
+    import pickle
+    import weakref
+
+    from skyrl.train.generators.skyrl_gym_generator import (
+        TrajectoryOutput,
+        _restore_trajectory_output,
+        _spill_trajectory_output,
+    )
+
+    output = TrajectoryOutput(
+        response_ids=list(range(16383)),
+        reward=[0.0] * 16382 + [1.0],
+        stop_reason="stop",
+        loss_mask=[1] * 16383,
+        prompt_ids=[1, 2],
+        rollout_logprobs=None,
+        env_metrics={"correct": True},
+    )
+    payload = weakref.ref(output)
+    reference = _spill_trajectory_output(output, str(tmp_path))
+    del output
+    gc.collect()
+    assert payload() is None
+    assert len(pickle.dumps(reference)) < 1024
+    assert not hasattr(reference, "response_ids")
+    assert reference.sequence_reward == 1.0 and reference.response_length == 16383
+    restored = _restore_trajectory_output(reference)
+    assert restored.response_ids.dtype == np.int32
+    assert restored.loss_mask.dtype == np.uint8
+    assert restored.reward.dtype == np.float32
+    assert restored.rollout_logprobs is None
+    assert np.array_equal(restored.response_ids, np.arange(16383))
+    assert float(restored.reward.sum()) == 1.0
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+@pytest.mark.asyncio
+@patch("skyrl_gym.make")
+async def test_spilled_completed_payload_is_released_while_sibling_is_pending(
+    mock_make,
+    mock_tokenizer,
+    mock_llm,
+    mock_env,
+    generator_cfg,
+    mock_env_cfg,
+    tmp_path,
+):
+    import asyncio
+    import gc
+    import weakref
+
+    from skyrl.train.generators.skyrl_gym_generator import SpilledTrajectoryOutput
+
+    generator_cfg.batched = False
+    generator_cfg.sampling_params.logprobs = None
+    generator_cfg.sampling_params.max_generate_length = 16383
+    mock_tokenizer.eos_token_id = 4
+    mock_make.return_value = mock_env
+    mock_env.init.side_effect = lambda prompt: (prompt, {})
+    mock_env.get_metrics.return_value = {}
+    mock_env.step.side_effect = lambda action: BaseTextEnvStepOutput(
+        observations=[],
+        reward=1.0,
+        done=True,
+        metadata={},
+    )
+    release_sibling = asyncio.Event()
+    calls = 0
+
+    async def generate(inputs, model=None):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            await release_sibling.wait()
+        return {"responses": ["answer"], "response_ids": [[10] * 16382 + [4]], "stop_reasons": ["stop"]}
+
+    mock_llm.generate = generate
+    generator = SkyRLGymGenerator(generator_cfg, mock_env_cfg, mock_llm, mock_tokenizer)
+    generator.base_conversation_token_ids = []
+    payloads = []
+    original = generator._post_process_agent_loop_output
+
+    def capture(output, *args):
+        result = original(output, *args)
+        payloads.append(weakref.ref(result))
+        return result
+
+    generator._post_process_agent_loop_output = capture
+    prompt = [{"role": "user", "content": "What is 2 + 2?"}]
+    tasks = [
+        asyncio.create_task(
+            generator.agent_loop(
+                prompt,
+                mock_env_cfg.env_class,
+                {},
+                max_tokens=16383,
+                max_input_length=512,
+                spill_output_dir=str(tmp_path),
+            )
+        )
+        for sample in range(2)
+    ]
+    try:
+        reference = await asyncio.wait_for(asyncio.shield(tasks[0]), timeout=10)
+        assert isinstance(reference, SpilledTrajectoryOutput)
+        assert not tasks[1].done()
+        gc.collect()
+        assert payloads[0]() is None
+        assert not hasattr(tasks[0].result(), "response_ids")
+    finally:
+        release_sibling.set()
+        await asyncio.gather(*tasks)
+
+
 # Mock constants, where 4 is the eos token id
 MOCK_LLM_OUTPUT_IDS = [1, 10, 12, 4]
 MOCK_TOKENIZER_ENCODED_IDS = [1, 2, 3, 4]

@@ -42,6 +42,10 @@ with `RAY_ADDRESS=local` on a machine that has one up.
 
 ## Training Quick Start
 
+The synchronous RWKV7 GRPO recipe and its memory/throughput controls are documented
+in `examples/train/rwkv/train/sync_grpo/README.md`. Its launcher writes persistent
+rollout/scoring/log artifacts separately from retained checkpoints.
+
 ```bash
 uv run --isolated --extra megatron -m skyrl.train.entrypoints.main_base \
   trainer.strategy=megatron trainer.policy.model.path=<model> environment.env_class=gsm8k ...

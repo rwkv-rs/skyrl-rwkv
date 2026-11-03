@@ -23,6 +23,19 @@ class GSM8kEnv(BaseTextEnv):
         self.ground_truth = reward_spec["ground_truth"]
         self._generation_metadata = {"ended_eod": False, "truncated": False, "stop_reason": None}
         self._strict_reward_details: Dict[str, Any] = {}
+        self._strict_score_cache = None
+
+    def _score_strict_once(self, action: str) -> float:
+        metadata = self._generation_metadata
+        key = (action, self.ground_truth, metadata["ended_eod"], metadata["truncated"])
+        if self._strict_score_cache is None or self._strict_score_cache[0] != key:
+            reward, details = utils.compute_strict_score(
+                action, self.ground_truth, ended_eod=metadata["ended_eod"], truncated=metadata["truncated"]
+            )
+            self._strict_score_cache = (key, reward, dict(details))
+        _, reward, details = self._strict_score_cache
+        self._strict_reward_details = {**details, "stop_reason": metadata["stop_reason"], "scoring_skipped": False}
+        return reward
 
     def set_generation_metadata(
         self,
@@ -39,26 +52,15 @@ class GSM8kEnv(BaseTextEnv):
             "stop_reason": stop_reason,
         }
         if self.strict_reward:
-            _, self._strict_reward_details = utils.compute_strict_score(
-                action,
-                self.ground_truth,
-                ended_eod=ended_eod,
-                truncated=truncated,
-            )
-            self._strict_reward_details["stop_reason"] = stop_reason
+            self._strict_reward_details = {**self._generation_metadata, "strict_reward": 0.0, "scoring_skipped": True}
 
     def _get_reward(self, action: str) -> float:
         if not self.strict_reward:
             return utils.compute_score(action, self.ground_truth)
 
-        reward, self._strict_reward_details = utils.compute_strict_score(
-            action,
-            self.ground_truth,
-            ended_eod=self._generation_metadata["ended_eod"],
-            truncated=self._generation_metadata["truncated"],
-        )
-        self._strict_reward_details["stop_reason"] = self._generation_metadata["stop_reason"]
-        return reward
+        if self._generation_metadata["truncated"] or not self._generation_metadata["ended_eod"]:
+            return 0.0
+        return self._score_strict_once(action)
 
     def get_metrics(self) -> Dict[str, Any]:
         return dict(self._strict_reward_details) if self.strict_reward else {}

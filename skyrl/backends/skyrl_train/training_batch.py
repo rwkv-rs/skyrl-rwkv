@@ -123,6 +123,9 @@ class TensorList:
     def to(self, device=None, dtype=None, non_blocking=False):
         return TensorList([t.to(device=device, dtype=dtype, non_blocking=non_blocking) for t in self.tensors])
 
+    def pin_memory(self):
+        return TensorList([tensor.pin_memory() for tensor in self.tensors])
+
     def contiguous(self):
         return TensorList([t.contiguous() for t in self.tensors])
 
@@ -270,6 +273,15 @@ class TensorBatch(dict, Generic[DictType]):
                 self[key] = value.to(device=device, non_blocking=non_blocking)
             else:
                 self[key] = value.to(device=device, dtype=dtype, non_blocking=non_blocking)
+        return self
+
+    def pin_memory(self) -> "TensorBatch[DictType]":
+        """Pin CPU tensor fields so following CUDA copies can be non-blocking."""
+        for key, value in self.items():
+            if value is None:
+                continue
+            if value.device.type == "cpu":
+                self[key] = value.pin_memory()
         return self
 
     def contiguous(self) -> "TensorBatch":

@@ -113,7 +113,7 @@ class VLLMRouter:
         # Release port reservations right before the router rebinds.
         self._release_port_reservations()
 
-        self._process = multiprocessing.Process(
+        self._process = multiprocessing.get_context("spawn").Process(
             target=_run_router_with_logging,
             args=(self._router_args, self._log_file),
             daemon=True,

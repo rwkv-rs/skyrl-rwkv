@@ -23,6 +23,40 @@ class _NoopDeviceMesh:
         return None
 
 
+def test_rwkv_compute_views_preserve_fp32_update_and_checkpoint_names():
+    from torch.utils.checkpoint import checkpoint
+
+    from skyrl.backends.skyrl_train.workers.ddp.ddp_strategy import (
+        _prepare_rwkv_mixed_precision,
+    )
+
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2))
+    expected_keys = list(model.state_dict())
+    original_parameters = list(model.parameters())
+    masters = _prepare_rwkv_mixed_precision(model)
+    assert [id(parameter) for parameter in masters] == [id(parameter) for parameter in original_parameters]
+    assert _prepare_rwkv_mixed_precision(model) is masters
+    assert model[0].weight.dtype == torch.bfloat16
+    assert all(parameter.dtype == torch.float32 for parameter in masters)
+    optimizer = torch.optim.AdamW(masters, lr=2e-7, weight_decay=0)
+    before = [parameter.detach().clone() for parameter in masters]
+    for microbatch in range(2):
+        output = checkpoint(model, torch.ones(2, 4, dtype=torch.bfloat16), use_reentrant=False)
+        (output.float().square().mean() / 2).backward()
+    assert all(parameter.grad.dtype == torch.float32 for parameter in masters)
+    assert all(torch.isfinite(parameter.grad).all() for parameter in masters)
+    optimizer.step()
+    assert any(not torch.equal(parameter, previous) for parameter, previous in zip(masters, before))
+    assert all(optimizer.state[parameter]["exp_avg"].dtype == torch.float32 for parameter in masters)
+    state = model.state_dict()
+    assert list(state) == expected_keys
+    assert all(value.dtype == torch.float32 for value in state.values())
+    plain_model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 2))
+    plain_model.load_state_dict(state, strict=True)
+    model.load_state_dict(plain_model.state_dict(), strict=True)
+    assert all(torch.equal(value, plain_model.state_dict()[name]) for name, value in model.state_dict().items())
+
+
 def _make_policy_worker(cfg, rank=0, dp_size=1, strategy=None, model=None, scheduler=None, worker_cls=PolicyWorkerBase):
     worker = worker_cls(
         cfg=cfg.trainer,
@@ -80,6 +114,31 @@ def _make_loss_scaling_batch(loss_values, loss_fn, dp_size=1):
     return batch, logprobs_by_sample.tolist()
 
 
+def test_forward_compact_rows_match_legacy_without_retaining_batch_storage():
+    from skyrl.backends.skyrl_train.training_batch import TrainingOutputBatch
+
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.micro_forward_batch_size_per_gpu = 2
+    worker = _make_policy_worker(cfg, model=SimpleNamespace(is_rwkv=True))
+
+    def forward_micro(batch):
+        values = batch["sequences"][:, :1].float().repeat(1, 3)
+        output = TrainingOutputBatch({"output": values})
+        output.metadata = batch.metadata
+        return output
+
+    worker._forward_micro_batch = forward_micro
+    batch = TrainingInputBatch({"sequences": torch.arange(12).reshape(4, 3), "attention_mask": torch.ones(4, 3)})
+    batch.metadata = {"response_length": 3}
+    legacy = worker.forward(batch)
+    compact = worker.forward(batch, return_tensor_outputs=True)
+    for previous, current in zip(legacy.loss_fn_outputs, compact.loss_fn_outputs):
+        row = current["logprobs"]
+        assert row.tolist() == previous["logprobs"]
+        assert row.dtype == torch.float32 and not row.requires_grad
+        assert row.untyped_storage().nbytes() == row.numel() * row.element_size()
+
+
 def _make_loss_scaling_cfg(loss_fn, micro_batch_size):
     cfg = SkyRLTrainConfig()
     cfg.trainer.micro_train_batch_size_per_gpu = micro_batch_size
@@ -97,6 +156,29 @@ def _patch_worker_cuda_for_cpu():
     stack.enter_context(patch("torch.cuda.current_device", return_value=torch.device("cpu")))
     stack.enter_context(patch("torch.autocast", side_effect=lambda *args, **kwargs: nullcontext()))
     return stack
+
+
+@pytest.mark.parametrize("entropy_loss", [False, True])
+def test_entropy_diagnostics_can_be_disabled_without_disabling_entropy_loss(monkeypatch, entropy_loss):
+    monkeypatch.setenv("SKYRL_POLICY_ENTROPY_METRICS", "0")
+    cfg = _make_loss_scaling_cfg("dual_clip", 2)
+    cfg.trainer.algorithm.use_entropy_loss = entropy_loss
+    batch, values = _make_loss_scaling_batch([1.0, 2.0], "dual_clip")
+    logprobs = torch.tensor(values, requires_grad=True)
+    model = MagicMock()
+
+    def forward(sequences, num_actions, **kwargs):
+        assert kwargs["compute_entropy"] is entropy_loss
+        output = {"entropy": logprobs.exp().repeat(1, 2)} if entropy_loss else {}
+        return logprobs, output
+
+    model.side_effect = forward
+    worker = _make_policy_worker(cfg, model=model)
+    worker.strategy.all_reduce.side_effect = lambda metrics, op, group=None: metrics
+    with _patch_worker_cuda_for_cpu():
+        result = worker.forward_backward(batch)
+    assert ("policy_entropy" in result.metrics) is entropy_loss
+    assert np.isfinite(result.metrics["policy_loss"])
 
 
 @pytest.mark.parametrize("forward_only", [False, True])

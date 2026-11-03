@@ -27,11 +27,18 @@ BasicType = Union[int, float, str, bool]
 _MOVABLE = (torch.Tensor, *PACKED_BATCH_FIELD_TYPES)
 
 
-def to(tensor: Union[torch.Tensor, PackedTensor, List[torch.Tensor], BasicType], device):
+def to(
+    tensor: Union[torch.Tensor, PackedTensor, List[torch.Tensor], BasicType],
+    device,
+    *,
+    non_blocking: bool = False,
+):
     if isinstance(tensor, list):
-        return [to(t, device) for t in tensor]
+        return [to(t, device, non_blocking=non_blocking) for t in tensor]
+    elif isinstance(tensor, torch.Tensor):
+        return tensor.to(device, non_blocking=non_blocking)
     elif isinstance(tensor, _MOVABLE):
-        return tensor.to(device)
+        return tensor.to(device, non_blocking=non_blocking)
     else:
         return tensor
 
@@ -91,30 +98,30 @@ class Experience:
     sub_seq_lengths: Optional[TensorList] = None
 
     @torch.no_grad()
-    def to_device(self, device: torch.device) -> None:
-        self.sequences = to(self.sequences, device)
+    def to_device(self, device: torch.device, *, non_blocking: bool = False) -> None:
+        self.sequences = to(self.sequences, device, non_blocking=non_blocking)
         if self.action_log_probs is not None:
-            self.action_log_probs = to(self.action_log_probs, device)
+            self.action_log_probs = to(self.action_log_probs, device, non_blocking=non_blocking)
         if self.base_action_log_probs is not None:
-            self.base_action_log_probs = to(self.base_action_log_probs, device)
+            self.base_action_log_probs = to(self.base_action_log_probs, device, non_blocking=non_blocking)
         if self.values is not None:
-            self.values = to(self.values, device)
+            self.values = to(self.values, device, non_blocking=non_blocking)
         if self.returns is not None:
-            self.returns = to(self.returns, device)
+            self.returns = to(self.returns, device, non_blocking=non_blocking)
         if self.advantages is not None:
-            self.advantages = to(self.advantages, device)
+            self.advantages = to(self.advantages, device, non_blocking=non_blocking)
         if self.attention_mask is not None:
-            self.attention_mask = to(self.attention_mask, device)
+            self.attention_mask = to(self.attention_mask, device, non_blocking=non_blocking)
         if self.loss_mask is not None:
-            self.loss_mask = to(self.loss_mask, device)
+            self.loss_mask = to(self.loss_mask, device, non_blocking=non_blocking)
         if self.response_mask is not None:
-            self.response_mask = to(self.response_mask, device)
+            self.response_mask = to(self.response_mask, device, non_blocking=non_blocking)
         if self.rollout_logprobs is not None:
-            self.rollout_logprobs = to(self.rollout_logprobs, device)
+            self.rollout_logprobs = to(self.rollout_logprobs, device, non_blocking=non_blocking)
         if self.rollout_expert_indices is not None:
-            self.rollout_expert_indices = to(self.rollout_expert_indices, device)
+            self.rollout_expert_indices = to(self.rollout_expert_indices, device, non_blocking=non_blocking)
         if self.router_padding_mask is not None:
-            self.router_padding_mask = to(self.router_padding_mask, device)
+            self.router_padding_mask = to(self.router_padding_mask, device, non_blocking=non_blocking)
         if self.rollout_sample_support is not None:
             self.rollout_sample_support = to(self.rollout_sample_support, device)
         if self.pixel_values is not None:

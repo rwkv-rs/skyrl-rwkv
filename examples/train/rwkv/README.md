@@ -4,10 +4,11 @@ The RWKV example is organized by responsibility. Each training method has one
 `README.md`, `prepare.py`, and `run.sh`; shared rollout, data, evaluation, and
 FlashRWKV2 preflight code lives in `train/common` or `eval`.
 
-The five launchers are:
+The launchers are:
 
 - `train/antidoom`
 - `train/flashreinforce`
+- [`train/sync_grpo`](train/sync_grpo/README.md): synchronous full-parameter GRPO with pooled sampling, disk spill and DDP training
 - `train/opd`
 - `train/sao`
 - `train/sft`

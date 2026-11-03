@@ -109,3 +109,85 @@ def test_replicated_rwkv_checkpoint_uses_full_state_restore(tmp_path):
     strategy._load_resharded_checkpoint.assert_called_once_with(
         model, str(tmp_path), 8, optimizer, scheduler, True, True, True, replicated_rwkv=True
     )
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2])
+@pytest.mark.parametrize("saved_world_size", [3, 8])
+def test_ddp_resume_serializes_reads_and_restores_adam(tmp_path, monkeypatch, rank, saved_world_size):
+    from skyrl.backends.skyrl_train.workers.ddp import ddp_strategy as module
+
+    source = nn.Linear(3, 2)
+    optimizer = torch.optim.AdamW(source.parameters(), lr=1e-3)
+    source(torch.ones(2, 3)).sum().backward()
+    optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1)
+    scheduler.step()
+    torch.save(source.state_dict(), tmp_path / f"model_world_size_{saved_world_size}_rank_0.pt")
+    torch.save(optimizer.state_dict(), tmp_path / f"optim_world_size_{saved_world_size}_rank_0.pt")
+    torch.save(
+        {"lr_scheduler": scheduler.state_dict(), "client_state": {"global_step": 1}},
+        tmp_path / f"extra_state_world_size_{saved_world_size}_rank_0.pt",
+    )
+    restored = nn.Linear(3, 2)
+    restored_optimizer = torch.optim.AdamW(restored.parameters(), lr=0.5)
+    restored_scheduler = torch.optim.lr_scheduler.StepLR(restored_optimizer, step_size=1)
+    strategy = object.__new__(module.DDPStrategy)
+    strategy.world_size = 3
+    strategy.fsdp_strategy = "ddp"
+    strategy.get_rank = lambda: rank
+    strategy.print = lambda *args: None
+    strategy._model_module = lambda model: model
+    events = []
+    original_load = torch.load
+
+    def load(*args, **kwargs):
+        assert events.count("barrier") == rank
+        events.append("load")
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(module.torch, "load", load)
+    monkeypatch.setattr(module.dist, "barrier", lambda: events.append("barrier"))
+    monkeypatch.setattr(module.gc, "collect", lambda: events.append("release"))
+    _, state = strategy.load_checkpoint(
+        restored, str(tmp_path), optimizer=restored_optimizer, scheduler=restored_scheduler
+    )
+    assert events == ["barrier"] * rank + ["load"] * 3 + ["release"] + ["barrier"] * (3 - rank)
+    assert state["client_state"]["global_step"] == 1
+    assert restored_scheduler.state_dict() == scheduler.state_dict()
+    for expected, actual in zip(optimizer.state.values(), restored_optimizer.state.values(), strict=True):
+        for name in ("step", "exp_avg", "exp_avg_sq"):
+            torch.testing.assert_close(actual[name], expected[name], rtol=0, atol=0)
+    for model, current_optimizer in ((source, optimizer), (restored, restored_optimizer)):
+        model(torch.ones(2, 3)).sum().backward()
+        current_optimizer.step()
+    for expected, actual in zip(source.parameters(), restored.parameters(), strict=True):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_ddp_rwkv_keeps_fp32_masters_and_canonical_checkpoint_names():
+    from skyrl.backends.skyrl_train.workers.ddp.ddp_strategy import (
+        _prepare_rwkv_mixed_precision,
+    )
+
+    model = nn.Sequential(nn.Linear(3, 4), nn.Linear(4, 2))
+    original_names = set(model.state_dict())
+    masters = _prepare_rwkv_mixed_precision(model)
+    assert masters is _prepare_rwkv_mixed_precision(model)
+    assert all(parameter.dtype == torch.float32 for parameter in masters)
+    assert model[0].weight.dtype == torch.bfloat16
+    optimizer = torch.optim.AdamW(masters, lr=1e-3)
+    before = [parameter.detach().clone() for parameter in masters]
+    model(torch.ones(2, 3, dtype=torch.bfloat16)).float().sum().backward()
+    assert all(parameter.grad.dtype == torch.float32 for parameter in masters)
+    optimizer.step()
+    assert any(not torch.equal(old, parameter) for old, parameter in zip(before, masters, strict=True))
+    assert all(state["exp_avg"].dtype == torch.float32 for state in optimizer.state.values())
+    checkpoint = model.state_dict()
+    assert set(checkpoint) == original_names
+    restored = nn.Sequential(nn.Linear(3, 4), nn.Linear(4, 2))
+    _prepare_rwkv_mixed_precision(restored)
+    restored.load_state_dict(checkpoint)
+    torch.testing.assert_close(
+        restored(torch.ones(2, 3, dtype=torch.bfloat16)), model(torch.ones(2, 3, dtype=torch.bfloat16)), rtol=0, atol=0
+    )

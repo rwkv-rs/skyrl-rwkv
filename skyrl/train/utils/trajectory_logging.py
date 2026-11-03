@@ -4,6 +4,8 @@ import dataclasses
 import random
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple, Union
 
+import numpy as np
+
 if TYPE_CHECKING:
     from skyrl.train.utils.tracking import Tracking
 
@@ -62,8 +64,8 @@ def pretty_print_example(
         response_str = str(response)
         # --- Reward handling ---
         if reward is not None:
-            if isinstance(reward, list):
-                reward_val = float(sum(reward))
+            if isinstance(reward, (list, np.ndarray)):
+                reward_val = float(np.sum(reward, dtype=np.float64))
             else:
                 reward_val = float(reward)
             reward_str = f"{reward_val:.4f}"
@@ -226,7 +228,7 @@ class TrajectoryLogger:
         )
         # Per-token rewards arrive as lists; collapse to scalars so the
         # min/max picks and the wandb column are both well-typed.
-        scalar_rewards = [float(sum(r)) if isinstance(r, list) else float(r) for r in rewards[:total]]
+        scalar_rewards = [float(np.sum(reward, dtype=np.float64)) for reward in rewards[:total]]
         indices = self.select_sample_indices(num_samples=num_samples, rewards=scalar_rewards, total=total)
         return [
             (
@@ -305,8 +307,8 @@ class TrajectoryLogger:
         elif prompt is not None:
             parts.append(f"[USER]\n{prompt}")
 
-        if response_token_ids:
-            if loss_mask and len(loss_mask) == len(response_token_ids):
+        if response_token_ids is not None and len(response_token_ids) > 0:
+            if loss_mask is not None and len(loss_mask) == len(response_token_ids):
                 cur_role: Optional[str] = None
                 cur_tokens: List[int] = []
                 for tok, m in zip(response_token_ids, loss_mask):
@@ -336,7 +338,7 @@ class TrajectoryLogger:
         Default for the ``num_turns`` column when the caller doesn't supply
         one. Returns 0 for empty/None masks.
         """
-        if not loss_mask:
+        if loss_mask is None or len(loss_mask) == 0:
             return 0
         turns = 0
         prev = 0

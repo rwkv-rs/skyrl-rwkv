@@ -7,11 +7,210 @@ uv run --isolated --extra dev pytest tests/backends/skyrl_train/workers/test_wor
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
+from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
 from skyrl.backends.skyrl_train.workers.worker_utils import (
     all_reduce_metrics,
+    get_microbatch_iterator,
     reduce_metrics,
 )
+
+
+@pytest.mark.parametrize(
+    "length,expected_sizes",
+    [
+        (1024, [4, 4]),
+        (16368, [4, 4]),
+        (16383, [3, 3, 2]),
+        (16496, [3, 3, 2]),
+        (17407, [3, 3, 2]),
+    ],
+)
+def test_rwkv_microbatches_include_prompt_and_chunk_padding(length, expected_sizes):
+    sequences = torch.arange(8).reshape(8, 1).expand(8, length).clone()
+    batch = TrainingInputBatch({"sequences": sequences, "attention_mask": torch.ones_like(sequences)})
+    iterator = get_microbatch_iterator(batch, 4, -1, use_padded_token_count=True)
+    chunks = list(iterator)
+    assert [len(chunk) for chunk in chunks] == expected_sizes
+    assert all(len(chunk) * ((length + 15) // 16 * 16) <= 65535 for chunk in chunks)
+    combined = iterator.reorder_and_combine_batches(chunks)
+    torch.testing.assert_close(combined["sequences"], sequences)
+
+
+def test_non_rwkv_sample_batching_keeps_existing_shape():
+    sequences = torch.ones(8, 17407, dtype=torch.long)
+    batch = TrainingInputBatch({"sequences": sequences, "attention_mask": sequences})
+    iterator = get_microbatch_iterator(batch, 4, -1)
+    assert [len(chunk) for chunk in iterator] == [4, 4]
+
+
+def test_rwkv_token_budget_accounts_for_alignment_and_restores_order():
+    lengths = [16383, 16368, 16496, 17407, 1000, 3, 17001, 200]
+    sequences = torch.arange(8).reshape(8, 1).expand(8, max(lengths)).clone()
+    mask = torch.arange(max(lengths)).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
+    batch = TrainingInputBatch({"sequences": sequences, "attention_mask": mask})
+    iterator = get_microbatch_iterator(batch, 4, 100000, use_padded_token_count=True)
+    chunks = list(iterator)
+    for chunk in chunks:
+        longest = int(chunk["attention_mask"].sum(-1).max())
+        assert len(chunk) * ((longest + 15) // 16 * 16) <= 65535
+    combined = iterator.reorder_and_combine_batches(chunks)
+    torch.testing.assert_close(combined["sequences"], sequences)
+
+
+def test_rwkv_rejects_single_sequence_beyond_kernel_rows():
+    sequences = torch.ones(1, 65536, dtype=torch.long)
+    batch = TrainingInputBatch({"sequences": sequences, "attention_mask": sequences})
+    with pytest.raises(ValueError, match="CUDA kernel row limit"):
+        get_microbatch_iterator(batch, 4, -1, use_padded_token_count=True)
+
+
+def test_rwkv_tail_microbatch_keeps_global_token_mean_gradient():
+    from skyrl.backends.skyrl_train.utils.ppo_utils import (
+        apply_loss_reduction_to_advantages_minibatch,
+        ppo_policy_loss,
+    )
+    from skyrl.train.config import SkyRLTrainConfig
+
+    cfg = SkyRLTrainConfig().trainer.algorithm
+    cfg.github_strict_loss = True
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    batch = TrainingInputBatch(
+        {
+            "sequences": torch.arange(4).reshape(4, 1).expand(4, 16496).clone(),
+            "attention_mask": torch.ones(4, 16496, dtype=torch.long),
+            "loss_mask": torch.ones(4, 2),
+            "advantages": torch.tensor([[1.0, 1.0], [-1.0, -1.0], [2.0, 2.0], [-2.0, -2.0]]),
+        }
+    )
+    batch["advantages"] = apply_loss_reduction_to_advantages_minibatch(
+        batch["advantages"],
+        batch["loss_mask"],
+        "token_mean",
+        4,
+        16496,
+    )
+    iterator = get_microbatch_iterator(batch, 4, -1, use_padded_token_count=True)
+    for chunk in iterator:
+        scores = (chunk["sequences"][:, :1].float() + 1).expand(-1, 2)
+        loss, _ = ppo_policy_loss(
+            parameter * scores, torch.zeros_like(scores), chunk["advantages"], cfg, chunk["loss_mask"]
+        )
+        loss.backward()
+    reference = torch.nn.Parameter(torch.tensor(0.0))
+    scores = (batch["sequences"][:, :1].float() + 1).expand(-1, 2)
+    loss, _ = ppo_policy_loss(
+        reference * scores, torch.zeros_like(scores), batch["advantages"], cfg, batch["loss_mask"]
+    )
+    loss.backward()
+    torch.testing.assert_close(parameter.grad, reference.grad)
+    assert parameter.grad.abs() > 0
+
+
+def test_rwkv_dynamic_microbatch_mixes_four_short_and_three_long_without_reordering_outputs():
+    lengths = [17407, 1000, 17000, 16368, 800, 16496, 1200, 16600, 16900, 16800]
+    sequences = torch.arange(len(lengths)).reshape(-1, 1).expand(-1, max(lengths)).clone()
+    mask = torch.arange(max(lengths)).unsqueeze(0) >= (max(lengths) - torch.tensor(lengths)).unsqueeze(1)
+    batch = TrainingInputBatch({"sequences": sequences, "attention_mask": mask})
+    iterator = get_microbatch_iterator(batch, 4, -1, use_padded_token_count=True)
+    chunks = list(iterator)
+    assert [len(chunk) for chunk in chunks] == [4, 3, 3]
+    for chunk in chunks:
+        longest = int(chunk["attention_mask"].sum(-1).max())
+        assert len(chunk) * ((longest + 15) // 16 * 16) <= 65535
+    torch.testing.assert_close(iterator.reorder_and_combine_batches(chunks)["sequences"], sequences)
+    items = [[{"sample": int(value)} for value in chunk["sequences"][:, 0]] for chunk in chunks]
+    assert [item["sample"] for item in iterator.reorder_and_combine_items(items)] == list(range(len(lengths)))
+
+
+@pytest.mark.parametrize("token_budget", [-1, 65535, 100000])
+def test_rwkv_dynamic_microbatch_never_exceeds_configured_sample_cap(token_budget):
+    sequences = torch.ones(13, 100, dtype=torch.long)
+    batch = TrainingInputBatch({"sequences": sequences, "attention_mask": sequences})
+    iterator = get_microbatch_iterator(batch, 4, token_budget, use_padded_token_count=True)
+    assert [len(chunk) for chunk in iterator] == [4, 4, 4, 1]
+
+
+def test_rwkv_dynamic_padding_adds_no_loss_and_is_removed_from_outputs(monkeypatch):
+    from skyrl.backends.skyrl_train.workers.worker_utils import TokenBasedBatchIterator
+
+    monkeypatch.setattr(TokenBasedBatchIterator, "_sync_num_microbatches", lambda self: len(self._microbatches) + 1)
+    sequences = torch.arange(4).reshape(4, 1).expand(4, 100).clone()
+    batch = TrainingInputBatch({"sequences": sequences, "attention_mask": torch.ones_like(sequences)})
+    batch.metadata = {"response_length": 99}
+    iterator = get_microbatch_iterator(batch, 4, -1, use_padded_token_count=True)
+    chunks = list(iterator)
+    assert [len(chunk) for chunk in chunks] == [4, 1]
+    assert chunks[-1]["loss_mask"].count_nonzero() == 0
+    assert chunks[-1].metadata["is_padding_batch"]
+    actual = iterator.reorder_and_combine_batches(chunks)
+    torch.testing.assert_close(actual["sequences"], sequences)
+
+
+def test_rwkv_dynamic_mixed_sizes_keep_token_mean_gradient():
+    from skyrl.backends.skyrl_train.utils.ppo_utils import (
+        apply_loss_reduction_to_advantages_minibatch,
+        ppo_policy_loss,
+    )
+    from skyrl.train.config import SkyRLTrainConfig
+
+    cfg = SkyRLTrainConfig().trainer.algorithm
+    cfg.github_strict_loss = True
+    lengths = [1000, 17407, 1500, 17407, 2000, 17407, 3000]
+    sequences = torch.arange(7).reshape(-1, 1).expand(-1, max(lengths)).clone()
+    attention = torch.arange(max(lengths)).unsqueeze(0) >= (max(lengths) - torch.tensor(lengths)).unsqueeze(1)
+    masks = torch.tensor([[1, 0], [1, 1], [1, 0], [1, 1], [1, 0], [1, 1], [1, 1]]).float()
+    advantages = torch.tensor([1, -1, 2, -2, 3, -3, 4]).float().unsqueeze(1).expand(-1, 2)
+    normalized = apply_loss_reduction_to_advantages_minibatch(advantages, masks, "token_mean", 4, max(lengths))
+    batch = TrainingInputBatch(
+        {"sequences": sequences, "attention_mask": attention, "advantages": normalized, "loss_mask": masks}
+    )
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    iterator = get_microbatch_iterator(batch, 4, -1, use_padded_token_count=True)
+    assert [len(chunk) for chunk in iterator] == [4, 3]
+    for chunk in iterator:
+        scores = (chunk["sequences"][:, :1].float() + 1).expand(-1, 2)
+        loss, _ = ppo_policy_loss(
+            parameter * scores, torch.zeros_like(scores), chunk["advantages"], cfg, chunk["loss_mask"]
+        )
+        loss.backward()
+    reference = torch.nn.Parameter(torch.tensor(0.0))
+    scores = (sequences[:, :1].float() + 1).expand(-1, 2)
+    loss, _ = ppo_policy_loss(reference * scores, torch.zeros_like(scores), normalized, cfg, masks)
+    loss.backward()
+    torch.testing.assert_close(parameter.grad, reference.grad)
+
+
+def test_rwkv_critic_dynamic_microbatch_uses_sample_weights(monkeypatch):
+    from types import SimpleNamespace
+
+    from skyrl.backends.skyrl_train.workers.worker import CriticWorkerBase
+
+    monkeypatch.setattr(
+        "skyrl.backends.skyrl_train.workers.worker.all_reduce_metrics", lambda metrics, *args, **kwargs: metrics
+    )
+    worker = CriticWorkerBase.__new__(CriticWorkerBase)
+    worker.cfg = SimpleNamespace(micro_train_batch_size_per_gpu=4, max_tokens_per_microbatch=-1)
+    worker.model = SimpleNamespace(is_rwkv=True)
+    worker.strategy = None
+    worker.device_mesh = SimpleNamespace(get_group=lambda name: None)
+    worker._micro_batches_accumulated = 0
+    weights = []
+
+    def forward_backward(experience, microbatch_weight=None):
+        weights.append(microbatch_weight)
+        return {"critic_loss": microbatch_weight}
+
+    worker._forward_backward_micro = forward_backward
+    lengths = [1000] * 4 + [17407] * 3
+    sequences = torch.ones(7, max(lengths), dtype=torch.long)
+    mask = torch.arange(max(lengths)).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
+    batch = TrainingInputBatch({"sequences": sequences, "attention_mask": mask})
+    batch.metadata = {"response_length": 2}
+    worker.forward_backward(batch)
+    assert weights == pytest.approx([4 / 7, 3 / 7])
+    assert worker._micro_batches_accumulated == 0
 
 
 class TestReduceMetrics:

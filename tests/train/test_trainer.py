@@ -38,6 +38,257 @@ class DummyDataset:
         return batch
 
 
+def _make_spilled_pool_trainer(config, monkeypatch, tmp_path, scores):
+    import asyncio
+
+    from skyrl.train.generators.skyrl_gym_generator import (
+        SkyRLGymGenerator,
+        TrajectoryOutput,
+        _spill_trajectory_output,
+    )
+
+    monkeypatch.setenv("SKYRL_ROLLOUT_ARCHIVE", str(tmp_path))
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.cfg = config
+    config.generator.n_samples_per_prompt = 2
+    config.generator.sampling_params.logprobs = None
+    config.trainer.train_batch_size = 2
+    config.trainer.algorithm.dynamic_sampling.pool_spill = True
+    trainer.dynamic_sampling_state = None
+    trainer.all_metrics = {}
+    trainer.inference_engine_client = MagicMock()
+    generator = SkyRLGymGenerator.__new__(SkyRLGymGenerator)
+    generator.generator_cfg = config.generator
+    restored_counts = []
+    original_restore = generator.restore_spilled_outputs
+
+    def restore(references, inputs):
+        restored_counts.append(len(references))
+        return original_restore(references, inputs)
+
+    async def generate(inputs, **kwargs):
+        await asyncio.sleep(0)
+        group = inputs["env_extras"][0]["group"]
+        references = []
+        for reward in scores[group]:
+            output = TrajectoryOutput(
+                response_ids=[10 + group, 0],
+                reward=[0.0, reward],
+                stop_reason="stop",
+                loss_mask=[1, 1],
+                prompt_ids=[1],
+                rollout_logprobs=None,
+                env_metrics={},
+            )
+            references.append(_spill_trajectory_output(output, inputs["spill_output_dir"]))
+        return {"spilled_trajectories": references, "rollout_metrics": None}
+
+    generator.generate = generate
+    generator.restore_spilled_outputs = restore
+    trainer.generator = generator
+    return trainer, restored_counts
+
+
+def _spilled_pool_input(groups):
+    return {
+        "prompts": [[] for group in groups for sample in range(2)],
+        "env_classes": ["gsm8k" for group in groups for sample in range(2)],
+        "env_extras": [{"group": group} for group in groups for sample in range(2)],
+        "sampling_params": {"logprobs": None},
+        "batch_metadata": None,
+    }, [f"group-{group}" for group in groups for sample in range(2)]
+
+
+@pytest.mark.asyncio
+async def test_spilled_pool_loads_only_uniformly_selected_groups(dummy_config, monkeypatch, tmp_path):
+    scores = {group: [0.0, 1.0] if group < 4 else [0.0, 0.0] for group in range(6)}
+    trainer, restored = _make_spilled_pool_trainer(dummy_config, monkeypatch, tmp_path, scores)
+    monkeypatch.setattr(np.random, "permutation", lambda count: np.array([3, 1, 2, 0]))
+    inputs, uids = _spilled_pool_input(range(6))
+    selected, output, selected_uids = await trainer._rollout_pool_step(inputs, uids, 2)
+    assert restored == [4]
+    assert len(list((tmp_path / "completed").glob("*.pt.gz"))) == 12
+    assert {uid.split(":draw:")[0] for uid in selected_uids} == {"group-1", "group-3"}
+    assert len(selected["prompts"]) == len(output["response_ids"]) == 4
+    assert all(isinstance(row, np.ndarray) for row in output["response_ids"])
+    assert trainer.dynamic_sampling_state is None
+    assert trainer.all_metrics["generate/pool_prompts_submitted"] == 6.0
+
+
+@pytest.mark.asyncio
+async def test_spilled_pool_accumulates_references_across_waves(dummy_config, monkeypatch, tmp_path):
+    scores = {0: [0.0, 1.0], 1: [0.0, 0.0], 2: [0.0, 1.0], 3: [0.0, 1.0]}
+    trainer, restored = _make_spilled_pool_trainer(dummy_config, monkeypatch, tmp_path, scores)
+    inputs, uids = _spilled_pool_input([0, 1])
+    _, output, _ = await trainer._rollout_pool_step(inputs, uids, 2)
+    assert output is None and restored == []
+    assert trainer.dynamic_sampling_state["num_prompts_in_batch"] == 1
+    reference = trainer.dynamic_sampling_state["pool_group_refs"][0]["references"][0]
+    assert not hasattr(reference, "response_ids")
+    monkeypatch.setattr(np.random, "permutation", lambda count: np.array([2, 0, 1]))
+    inputs, uids = _spilled_pool_input([2, 3])
+    _, output, selected_uids = await trainer._rollout_pool_step(inputs, uids, 1)
+    assert restored == [4] and len(output["response_ids"]) == 4
+    assert {uid.split(":draw:")[0] for uid in selected_uids} == {"group-0", "group-3"}
+
+
+@pytest.mark.asyncio
+async def test_spilled_pool_repeated_source_across_waves_keeps_separate_grpo_groups(
+    dummy_config,
+    monkeypatch,
+    tmp_path,
+):
+    import json
+
+    from skyrl.backends.skyrl_train.utils.ppo_utils import (
+        compute_grpo_outcome_advantage,
+    )
+    from skyrl.train.dataset.preprocess import compute_prompt_mini_batch_boundaries
+
+    scores = {0: [0.0, 1.0], 1: [0.0, 0.0]}
+    trainer, restored = _make_spilled_pool_trainer(dummy_config, monkeypatch, tmp_path, scores)
+    inputs, source_uids = _spilled_pool_input([0, 1])
+    _, output, _ = await trainer._rollout_pool_step(inputs, source_uids, 2)
+    assert output is None and restored == []
+    scores[0] = [1.0, 0.0]
+    inputs, source_uids = _spilled_pool_input([0])
+    _, output, group_uids = await trainer._rollout_pool_step(inputs, source_uids, 1)
+    assert len(set(group_uids)) == 2
+    assert group_uids[0] == group_uids[1] and group_uids[2] == group_uids[3]
+    assert {uid.split(":draw:")[0] for uid in group_uids} == {"group-0"}
+    assert source_uids == ["group-0", "group-0"]
+    assert compute_prompt_mini_batch_boundaries(group_uids, 1, 2, False, 2) == [(0, 2), (2, 4)]
+    rewards = torch.tensor(np.stack(output["rewards"]))
+    advantages, _ = compute_grpo_outcome_advantage(
+        rewards,
+        torch.ones_like(rewards),
+        np.array(group_uids),
+        grpo_norm_by_std=True,
+        config=trainer.cfg.trainer.algorithm,
+    )
+    assert advantages[0, -1] < 0 and advantages[1, -1] > 0
+    assert advantages[2, -1] > 0 and advantages[3, -1] < 0
+    selection = json.loads(next((tmp_path / "completed").glob("selection-*.json")).read_text())
+    assert selection["source_uids"] == ["group-0"] * 4
+    assert selection["uids"] == group_uids and len(selection["files"]) == 4
+
+
+@pytest.mark.parametrize("source_uids,samples", [(["a"], 2), (["a", "b"], 2), (["a"], 0)])
+def test_pool_training_group_uids_rejects_incomplete_or_mixed_groups(source_uids, samples):
+    with pytest.raises(ValueError, match="Pool"):
+        RayPPOTrainer._pool_training_group_uids(source_uids, samples)
+
+
+def test_compact_token_rewards_preserve_metrics_and_penalty():
+    from skyrl.train.generators.utils import get_metrics_from_generator_output
+    from skyrl.train.utils.trainer_utils import (
+        apply_soft_overlong_punishment,
+        validate_generator_output,
+    )
+
+    rewards = [np.array([0, 1], dtype=np.float32), np.array([0, 0], dtype=np.float32)]
+    output = {
+        "prompt_token_ids": [np.array([1]), np.array([1])],
+        "response_ids": [np.array([2, 0]), np.array([3, 0])],
+        "loss_masks": [np.array([1, 1]), np.array([1, 1])],
+        "rewards": rewards,
+        "rollout_logprobs": None,
+    }
+    validate_generator_output(2, output)
+    metrics = get_metrics_from_generator_output(output, ["group", "group"])
+    assert metrics["avg_score"] == 0.5 and metrics["pass_at_n"] == 1.0
+    penalized = apply_soft_overlong_punishment(rewards, [2, 2], 3, 2, 1.0)
+    assert all(isinstance(row, np.ndarray) for row in penalized)
+    assert [float(row.sum()) for row in penalized] == [0.5, -0.5]
+    assert float(rewards[0].sum()) == 1.0
+
+    from skyrl.train.generators.utils import get_rollout_metrics
+    from skyrl.train.utils.trainer_utils import zero_variance_filter
+
+    masks = [np.ones(1024, dtype=np.uint8), np.ones(1024, dtype=np.uint8)]
+    rollout_metrics = get_rollout_metrics([[10] * 1024] * 2, [0.0, 1.0], loss_masks=masks)
+    assert rollout_metrics["generate/avg_assistant_tokens"] == 1024
+    assert rollout_metrics["generate/tokens_per_turn_max"] == 1024
+    assert zero_variance_filter([0.0, 1.0], ["group", "group"], loss_masks=masks) == [0, 1]
+
+
+def test_compact_trajectory_logging_keeps_rewards_and_assistant_spans():
+    from skyrl.train.utils.trajectory_logging import (
+        TrajectoryLogger,
+        pretty_print_example,
+    )
+
+    logger = MagicMock()
+    pretty_print_example(logger, [], "answer", np.array([0.0, 1.0], dtype=np.float32))
+    logger.opt.assert_called_once_with(colors=True)
+    assert logger.opt.return_value.info.call_args.kwargs["reward"] == "1.0000"
+    tokenizer = MagicMock()
+    tokenizer.decode.return_value = "decoded"
+    trajectory_logger = TrajectoryLogger()
+    samples = trajectory_logger.build_samples(
+        num_samples=1,
+        prompts=[[]],
+        response_ids=[np.array([10, 11, 0], dtype=np.int32)],
+        rewards=[np.array([0, 0, 1], dtype=np.float32)],
+        loss_masks=[np.array([1, 0, 1], dtype=np.uint8)],
+        tokenizer=tokenizer,
+        num_turns_list=[trajectory_logger.count_assistant_turns(np.array([1, 0, 1], dtype=np.uint8))],
+    )
+    assert samples[0][1] == 1.0 and samples[0][2] == 2
+    assert "[ASSISTANT]" in samples[0][3] and "[USER/TOOL]" in samples[0][3]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_type", [ValueError, MemoryError])
+async def test_pool_propagates_unexpected_generation_errors(dummy_config, monkeypatch, error_type):
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.cfg = dummy_config
+    trainer.cfg.generator.n_samples_per_prompt = 2
+    trainer.inference_engine_client = MagicMock()
+    trainer.all_metrics = {}
+
+    async def fail_generate(*args, **kwargs):
+        raise error_type("generation failed")
+
+    monkeypatch.setattr(trainer, "generate", fail_generate)
+    generator_input = {
+        "prompts": [[], []],
+        "env_classes": ["gsm8k"] * 2,
+        "env_extras": [{}, {}],
+        "sampling_params": {},
+        "batch_metadata": None,
+    }
+    with pytest.raises(error_type, match="generation failed"):
+        await trainer._rollout_pool_step(generator_input, ["prompt", "prompt"], 1)
+
+
+@pytest.mark.asyncio
+async def test_pool_reports_when_all_requests_abort(dummy_config, monkeypatch):
+    from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+        InferenceRequestAborted,
+    )
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.cfg = dummy_config
+    trainer.cfg.generator.n_samples_per_prompt = 2
+    trainer.inference_engine_client = MagicMock()
+    trainer.all_metrics = {}
+
+    async def abort_generate(*args, **kwargs):
+        raise InferenceRequestAborted("http://unused", "phase ended")
+
+    monkeypatch.setattr(trainer, "generate", abort_generate)
+    generator_input = {
+        "prompts": [[], []],
+        "env_classes": ["gsm8k"] * 2,
+        "env_extras": [{}, {}],
+        "sampling_params": {},
+        "batch_metadata": None,
+    }
+    with pytest.raises(RuntimeError, match="No rollout groups completed"):
+        await trainer._rollout_pool_step(generator_input, ["prompt", "prompt"], 1)
+
+
 @pytest.mark.parametrize("greater_is_better", [True, False])
 def test_best_checkpoint_survives_retention_and_hf_export(tmp_path, dummy_config, monkeypatch, greater_is_better):
     import json
@@ -758,6 +1009,7 @@ def test_forward_backward_batch_calculations():
 
         # Always set model for all worker types
         worker.model = MagicMock()
+        worker.model.is_rwkv = False
 
         return worker
 
@@ -981,7 +1233,8 @@ def test_critic_update_epochs_per_batch_multiplies_critic_optimizer_work():
     forward_backward_roles = []
     optim_step_roles = []
 
-    def forward_backward(model, chunk):
+    def forward_backward(model, chunk, **worker_kwargs):
+        assert worker_kwargs == ({"return_per_token_outputs": False} if model == "policy" else {})
         forward_backward_roles.append(model)
         return SimpleNamespace(metrics={"loss": 1.0})
 
@@ -1035,7 +1288,8 @@ def test_staged_forward_removes_each_minibatch_padding_before_reassembly(monkeyp
     boundaries = [(i, i + mini_size) for i in range(0, real_rows, mini_size)]
     monkeypatch.setattr("skyrl.backends.skyrl_train.distributed.dispatch.ray.put", lambda chunk: chunk)
     trainer = object.__new__(RayPPOTrainer)
-    trainer.cfg = SimpleNamespace(trainer=SimpleNamespace(recompute_old_logprobs_per_minibatch=True))
+    trainer.cfg = SkyRLTrainConfig()
+    trainer.cfg.trainer.recompute_old_logprobs_per_minibatch = True
 
     def forward(model, chunks):
         return SimpleNamespace(

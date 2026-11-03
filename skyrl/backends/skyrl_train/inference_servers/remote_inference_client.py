@@ -50,8 +50,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import (
     Any,
     AsyncIterator,
@@ -65,8 +68,10 @@ from typing import (
     TypedDict,
     Union,
 )
+from uuid import uuid4
 
 import aiohttp
+import numpy as np
 import orjson
 from multidict import CIMultiDict, CIMultiDictProxy
 from yarl import URL
@@ -80,6 +85,7 @@ from skyrl.backends.skyrl_train.inference_servers.base import (
 )
 from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     PackedField,
+    decode_packed_logprobs,
     decode_packed_routed_experts,
     decode_packed_sample_support,
     decode_packed_sample_support_logprobs,
@@ -192,6 +198,34 @@ async def _read_json_body(resp: aiohttp.ClientResponse) -> Any:
         raise
 
 
+def _archive_generate_result(
+    prompt_token_ids, token_ids, response_logprobs, session_id, model, stop_reason, cache_salt
+) -> None:
+    directory = Path(os.environ["SKYRL_ROLLOUT_ARCHIVE"]) / "generated"
+    directory.mkdir(parents=True, exist_ok=True)
+    if response_logprobs is not None and len(response_logprobs) != len(token_ids):
+        raise ValueError("Archived response IDs and logprobs must have the same length")
+    metadata = {
+        "session_id": str(session_id) if session_id is not None else None,
+        "model": model,
+        "stop_reason": stop_reason,
+        "cache_salt": cache_salt,
+        "has_logprobs": response_logprobs is not None,
+        "saved_at": time.time(),
+    }
+    path = directory / f"{uuid4().hex}.npz"
+    temporary = Path(str(path) + ".tmp")
+    with temporary.open("xb") as stream:
+        np.savez(
+            stream,
+            prompt_token_ids=np.asarray(prompt_token_ids, dtype=np.int32),
+            response_ids=np.asarray(token_ids, dtype=np.int32),
+            response_logprobs=np.asarray(response_logprobs if response_logprobs is not None else [], dtype=np.float32),
+            metadata=np.frombuffer(orjson.dumps(metadata), dtype=np.uint8),
+        )
+    os.replace(temporary, path)
+
+
 def _extract_session_id_and_body(
     request_payload: Dict[str, Any],
 ) -> Tuple[Optional[str], Dict[str, Any]]:
@@ -203,6 +237,21 @@ def _extract_session_id_and_body(
     session_id = body.get("session_id")
     clean_body = {k: v for k, v in body.items() if k != "session_id"}
     return session_id, clean_body
+
+
+class InferenceRequestAborted(RuntimeError):
+    """A data-plane request was aborted before completion (phase teardown / engine sleep).
+
+    Aborted in-flight requests are a normal, expected event at a rollout-phase boundary;
+    callers must treat it as a drop (the pool resampling path backfills) instead of a fatal
+    error. It is also the final failure of a request whose retries kept hitting empty
+    bodies - the teardown signature from the v8 step-1 crash.
+    """
+
+    def __init__(self, url: str, reason: str) -> None:
+        super().__init__(url, reason)
+        self.url = url
+        self.abort_reason = reason
 
 
 class PauseMode(Enum):
@@ -257,7 +306,7 @@ class SampleResponse(TypedDict):
 class RemoteGenerateResult:
     """Raw token generation result returned by ``RemoteGenerateClient``."""
 
-    raw_response: Dict[str, Any]
+    raw_response: Optional[Dict[str, Any]]
     response_ids: List[int]
     response_logprobs: Optional[List[float]]
     stop_reason: str
@@ -270,6 +319,11 @@ class RemoteGenerateClient:
     """Reusable HTTP client for one raw-token generation request."""
 
     proxy_url: str
+    # Phase-teardown abort mark: in-flight data-plane requests that started before
+    # set_abort() fail fast with InferenceRequestAborted instead of burning the full
+    # retry budget against a router that is shutting down (v8 empty-body storm).
+    _abort_reason: Optional[str] = field(default=None, init=False, repr=False)
+    _abort_epoch: int = field(default=0, init=False, repr=False)
     # aiohttp.ClientSession is bound to the event loop that created it, so one session is kept per loop.
     _sessions: Dict[asyncio.AbstractEventLoop, aiohttp.ClientSession] = field(
         default_factory=dict, init=False, repr=False
@@ -284,6 +338,16 @@ class RemoteGenerateClient:
         for loop in list(self._sessions):
             if loop.is_closed():
                 self._sessions.pop(loop, None)
+
+    def set_abort(self, reason: str) -> None:
+        """Mark the rollout phase as torn down; pre-existing in-flight requests fail fast."""
+        self._abort_epoch += 1
+        self._abort_reason = reason
+        logger.warning(f"[inference client] abort set for {self.proxy_url}: {reason}")
+
+    def clear_abort(self) -> None:
+        """Start a new phase: new requests run normally again."""
+        self._abort_reason = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """Get or create the aiohttp session bound to the running event loop.
@@ -317,8 +381,11 @@ class RemoteGenerateClient:
     ) -> Any:
         """POST JSON with retries, optionally splicing packed arrays before parsing."""
         session = await self._get_session()
+        epoch = self._abort_epoch
         last_exc: Optional[Exception] = None
         for attempt in range(_DATA_PLANE_RETRIES):
+            if self._abort_reason is not None and self._abort_epoch != epoch:
+                raise InferenceRequestAborted(url, self._abort_reason)
             try:
                 async with session.post(url, json=json, headers=headers) as resp:
                     try:
@@ -353,6 +420,15 @@ class RemoteGenerateClient:
                 await asyncio.sleep(1)
         if last_exc is None:
             raise RuntimeError(f"POST failed without an exception for {url=}")
+        if isinstance(last_exc, (orjson.JSONDecodeError, aiohttp.ServerDisconnectedError, aiohttp.ClientOSError)):
+            # A non-JSON/empty body (or dropped connection) that persisted through the whole
+            # retry budget is a teardown/abort signature (router quiet behind sleeping
+            # engines), not a parse bug: surface it as an abort so callers drop the request
+            # instead of crashing the run with a bare JSONDecodeError (v8 step-1 death).
+            raise InferenceRequestAborted(
+                url,
+                f"non-JSON/empty response after {_DATA_PLANE_RETRIES} attempts (last={last_exc})",
+            ) from last_exc
         raise last_exc
 
     async def generate(
@@ -380,9 +456,15 @@ class RemoteGenerateClient:
             ):
                 raise ValueError("routed_experts_prompt_start must be an integer within the prompt")
 
-        packed_side_channels = return_routed_experts or return_sample_support
+        compact_logprobs = (
+            os.environ.get("SKYRL_COMPACT_ROLLOUT_LOGPROBS", "0") == "1"
+            and sampling_params.get("logprobs") == 0
+            and not return_sample_support
+        )
+        packed_side_channels = return_routed_experts or return_sample_support or compact_logprobs
         path = "/skyrl/v1/generate" if packed_side_channels else "/inference/v1/generate"
         request_sampling_params = dict(sampling_params)
+        request_sampling_params.setdefault("flat_logprobs", True)
         if routed_experts_prompt_start is not None:
             request_sampling_params["routed_experts_prompt_start"] = routed_experts_prompt_start
         payload: Dict[str, Any] = {
@@ -390,6 +472,8 @@ class RemoteGenerateClient:
             "model": model,
             "token_ids": prompt_token_ids,
         }
+        if compact_logprobs:
+            payload["return_compact_logprobs"] = True
         if return_sample_support:
             payload["return_sample_support"] = True
             if sample_support_top_k is not None:
@@ -415,7 +499,15 @@ class RemoteGenerateClient:
         token_ids = choice["token_ids"]
         logprobs = choice.get("logprobs")
         response_logprobs = None
-        if logprobs is not None:
+        if compact_logprobs:
+            packed_logprobs = choice.get(PackedField.ROLLOUT_LOGPROBS)
+            if not isinstance(packed_logprobs, dict):
+                raise ValueError("Compact generation must return packed rollout_logprobs")
+            values = decode_packed_logprobs(packed_logprobs)
+            if len(values) != len(token_ids):
+                raise ValueError("Packed rollout logprobs must align with response tokens")
+            response_logprobs = values.tolist()
+        elif logprobs is not None:
             logprobs_content = logprobs.get("content", [])
             if logprobs_content:
                 response_logprobs = [logprob_info["logprob"] for logprob_info in logprobs_content]
@@ -439,8 +531,20 @@ class RemoteGenerateClient:
                     decode_packed_sample_support_logprobs(packed_sample_support_logprobs)
                 )
 
+        if os.environ.get("SKYRL_ROLLOUT_ARCHIVE"):
+            await asyncio.to_thread(
+                _archive_generate_result,
+                prompt_token_ids,
+                token_ids,
+                response_logprobs,
+                session_id,
+                model,
+                choice["finish_reason"],
+                cache_salt,
+            )
+
         return RemoteGenerateResult(
-            raw_response=response,
+            raw_response=None,
             response_ids=token_ids,
             response_logprobs=response_logprobs,
             stop_reason=choice["finish_reason"],
@@ -598,6 +702,14 @@ class RemoteInferenceClient(InferenceEngineInterface):
         if self._generate_client is None:
             self._generate_client = RemoteGenerateClient(proxy_url=self.proxy_url)
         return self._generate_client
+
+    def set_abort(self, reason: str) -> None:
+        """Forward a phase-teardown abort to the underlying generate client."""
+        self._get_generate_client().set_abort(reason)
+
+    def clear_abort(self) -> None:
+        if self._generate_client is not None:
+            self._generate_client.clear_abort()
 
     async def _get_session(self) -> aiohttp.ClientSession:
         return await self._get_generate_client()._get_session()
@@ -1154,6 +1266,8 @@ class RemoteInferenceClient(InferenceEngineInterface):
         original outcome. Routers/policies that don't track sessions treat this
         as a no-op, and unknown session ids are ignored server-side.
         """
+        if self._generate_client is not None and self._generate_client._abort_reason is not None:
+            return
         if not session_id:
             return
         url = f"{self.proxy_url}/finish_session"

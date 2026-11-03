@@ -8,6 +8,7 @@ Automatically handles GPU placement:
 The trainer interacts with the worker dispatch if all models are always on GPU.
 """
 
+import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -60,6 +61,7 @@ class WorkerDispatch:
         self.cfg = cfg
         self.colocate_all = cfg.trainer.placement.colocate_all
         self.colocate_policy_ref = cfg.trainer.placement.colocate_policy_ref
+        self.keep_policy_model_on_gpu = cfg.trainer.policy.keep_model_on_gpu
 
         # Inference engine client for weight sync (optional)
         self._inference_engine_client = inference_engine_client
@@ -167,6 +169,9 @@ class WorkerDispatch:
 
     def _offload_inactive_model(self, model: str) -> None:
         """Offload an inactive colocated model to CPU."""
+        if model == "policy" and getattr(self, "keep_policy_model_on_gpu", False):
+            self._offload(model)
+            return
         self._actor_groups[model].offload_to_cpu()
         self._gpu_state[model] = GPUState(model_on_gpu=False, optimizer_on_gpu=False)
 
@@ -210,6 +215,12 @@ class WorkerDispatch:
 
         if model not in self._actor_groups:
             return
+
+        if model == "policy" and getattr(self, "keep_policy_model_on_gpu", False):
+            offload_model = False
+            offload_optimizer = offload_optimizer and self.cfg.trainer.policy.optimizer_config.offload_after_step
+            if not offload_optimizer:
+                return
 
         self._actor_groups[model].offload_to_cpu(
             offload_optimizer=offload_optimizer,
@@ -264,7 +275,9 @@ class WorkerDispatch:
         """Mark a specific model as offloaded without changing others."""
         if model not in self._actor_groups:
             return
-        self._gpu_state[model] = GPUState(model_on_gpu=False, optimizer_on_gpu=False)
+        keep_model = model == "policy" and getattr(self, "keep_policy_model_on_gpu", False)
+        keep_optimizer = keep_model and not self.cfg.trainer.policy.optimizer_config.offload_after_step
+        self._gpu_state[model] = GPUState(model_on_gpu=keep_model, optimizer_on_gpu=keep_optimizer)
 
     def forward(
         self,
@@ -381,7 +394,12 @@ class WorkerDispatch:
             ``result[i][dp_rank]`` - ObjectRef for mini-batch *i*, DP rank *dp_rank*.
         """
         dp_size = self._actor_groups[model].actor_infos[0].rank.dp_size
-        return MeshDispatch.stage_chunks(dp_size, data, mini_batch_boundaries)
+        balance_rwkv = (
+            model == "policy"
+            and os.environ.get("SKYRL_BALANCED_DP_PACKING", "0") == "1"
+            and self.cfg.trainer.algorithm.old_logprobs_source == "rollout"
+        )
+        return MeshDispatch.stage_chunks(dp_size, data, mini_batch_boundaries, balance_rwkv=balance_rwkv)
 
     def forward_backward(
         self,

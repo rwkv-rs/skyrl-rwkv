@@ -1,4 +1,5 @@
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -27,6 +28,47 @@ from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
 )
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
 from skyrl.train.config import SamplingParams
+
+
+def test_rwkv_cublas_patch_is_opt_in_and_reversible_by_environment(monkeypatch):
+    native_calls = []
+
+    def native(*args, **kwargs):
+        native_calls.append((args, kwargs))
+        return "native"
+
+    linear = ModuleType("flashrwkv2._internal.linear")
+    linear._forward = native
+    alias = ModuleType("flashrwkv2.test_alias")
+    alias._forward = native
+    monkeypatch.setitem(sys.modules, linear.__name__, linear)
+    monkeypatch.setitem(sys.modules, alias.__name__, alias)
+    monkeypatch.setattr(model_wrapper_module.importlib, "import_module", lambda name: linear)
+    monkeypatch.setenv("SKYRL_RWKV_TRANSPOSED_GEMM_BACKEND", "tilelang")
+    model_wrapper_module._patch_rwkv_transposed_gemm()
+    assert linear._forward is native
+    previous = torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction
+    try:
+        monkeypatch.setenv("SKYRL_RWKV_TRANSPOSED_GEMM_BACKEND", "cublas")
+        model_wrapper_module._patch_rwkv_transposed_gemm()
+        assert linear._forward is alias._forward and linear._forward is not native
+        patched = linear._forward
+        model_wrapper_module._patch_rwkv_transposed_gemm()
+        assert linear._forward is patched
+        inputs = torch.ones(3, 2, dtype=torch.bfloat16)
+        weight = torch.ones(4, 2, dtype=torch.bfloat16)
+        assert patched(inputs, weight, None, torch.bfloat16) == "native"
+        monkeypatch.setenv("SKYRL_RWKV_TRANSPOSED_GEMM_BACKEND", "tilelang")
+        assert patched(inputs, weight, None, torch.bfloat16) == "native"
+        assert len(native_calls) == 2
+    finally:
+        torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = previous
+
+
+def test_rwkv_cublas_patch_rejects_unknown_backend(monkeypatch):
+    monkeypatch.setenv("SKYRL_RWKV_TRANSPOSED_GEMM_BACKEND", "invalid")
+    with pytest.raises(ValueError, match="GEMM_BACKEND"):
+        model_wrapper_module._patch_rwkv_transposed_gemm()
 
 
 @pytest.fixture(autouse=True)

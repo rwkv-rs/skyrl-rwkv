@@ -2,13 +2,16 @@ import asyncio
 import json
 import math
 import os
+import random
 import shutil
-from collections import defaultdict
+import time
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -28,6 +31,9 @@ from skyrl.backends.skyrl_train.inference_servers.base import (
 )
 from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
     get_sampling_params_for_backend,
+)
+from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
+    InferenceRequestAborted,
 )
 from skyrl.backends.skyrl_train.training_batch import (
     TensorList,
@@ -55,7 +61,10 @@ from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker import PPORayActorGroup
 from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
 from skyrl.backends.skyrl_train.workers.worker_utils import reduce_metrics
-from skyrl.env_vars import SKYRL_RAY_PG_TIMEOUT_IN_S
+from skyrl.env_vars import (
+    SKYRL_GENERATE_CONCURRENCY_PER_ENGINE,
+    SKYRL_RAY_PG_TIMEOUT_IN_S,
+)
 from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.dataset import PromptDataset
 from skyrl.train.dataset.preprocess import (
@@ -71,6 +80,7 @@ from skyrl.train.generators.base import (
     GeneratorOutput,
 )
 from skyrl.train.generators.utils import (
+    concatenate_generator_outputs,
     get_metrics_from_generator_output,
     merge_stepwise_output,
     prepare_generator_input,
@@ -94,6 +104,7 @@ from skyrl.train.utils.trainer_utils import (
     GLOBAL_STEP_PREFIX,
     DynamicSamplingState,
     ResumeMode,
+    apply_soft_overlong_punishment,
     build_dataloader,
     cleanup_old_checkpoints,
     extract_step_from_path,
@@ -375,7 +386,18 @@ class RayPPOTrainer:
                 # dynamic-sampling into account (which span multiple inner iterations
                 # before completing a logical step).
                 step_started = False
-                for _, rand_prompts in enumerate(self.train_dataloader):
+                epoch_start_step = self.global_step  # guard: detect silent empty epoch
+                ds_cfg = self.cfg.trainer.algorithm.dynamic_sampling
+                pool_mode = ds_cfg.type == "filter" and ds_cfg.pool_mode
+                if pool_mode:
+                    # Preload the pool universe once; every step draws a fresh reservoir
+                    # (with replacement across steps, without within a step).
+                    self._pool_all_prompts()
+                    wave_iter: Any = range(len(self.train_dataloader))
+                else:
+                    wave_iter = self.train_dataloader
+                for _, wave in enumerate(wave_iter):
+                    rand_prompts = self._pool_draw(ds_cfg.pool_prompts) if pool_mode else wave
                     if not step_started:
                         self._fire("on_step_start")
                         step_started = True
@@ -406,9 +428,24 @@ class RayPPOTrainer:
                         if self._vllm_metrics_scraper is not None:
                             self._vllm_metrics_scraper.resume()
                         with Timer("generate", self.all_timings), deadline.operation("generate"):
-                            generator_output: GeneratorOutput = await self.generate(generator_input)
+                            if pool_mode:
+                                already = (
+                                    self.dynamic_sampling_state.get("num_prompts_in_batch", 0)
+                                    if self.dynamic_sampling_state is not None
+                                    else 0
+                                )
+                                stop_at = max(1, self.cfg.trainer.train_batch_size - already)
+                                generator_input, generator_output, uids = await self._rollout_pool_step(
+                                    generator_input, uids, stop_at
+                                )
+                            else:
+                                generator_output: GeneratorOutput = await self.generate(generator_input)
                         if self._vllm_metrics_scraper is not None:
                             self._vllm_metrics_scraper.pause()
+
+                        if pool_mode and ds_cfg.pool_spill and generator_output is None:
+                            pbar.update(1)
+                            continue
 
                         if self.cfg.generator.step_wise_trajectories:
                             # NOTE: We use instance_ids from `trajectory_ids` here instead of re-using `uids`
@@ -426,7 +463,9 @@ class RayPPOTrainer:
                                 )
 
                         # dynamic sampling
-                        if self.cfg.trainer.algorithm.dynamic_sampling.type is not None:
+                        if self.cfg.trainer.algorithm.dynamic_sampling.type is not None and not (
+                            pool_mode and ds_cfg.pool_spill
+                        ):
                             generator_output, uids, keep_sampling = self.handle_dynamic_sampling(generator_output, uids)
                             if keep_sampling:  # continue sampling
                                 # update progress bar for current batch (but not global step)
@@ -475,7 +514,18 @@ class RayPPOTrainer:
 
                         # 3. Convert GeneratorOutput to TrainingInputBatch
                         with Timer("convert_to_training_input", self.all_timings):
-                            training_input: TrainingInputBatch = self.convert_to_training_input(generator_output, uids)
+                            sampling = self.cfg.trainer.algorithm.dynamic_sampling
+                            effective_batch_size = (
+                                len(set(uids))
+                                if sampling.type == "filter" and sampling.keep_all_informative_groups
+                                else None
+                            )
+                            training_input: TrainingInputBatch = self.convert_to_training_input(
+                                generator_output, uids, train_batch_size=effective_batch_size
+                            )
+                            step_trajectory_ids = generator_output.get("trajectory_ids")
+                            if pool_mode and ds_cfg.pool_spill:
+                                generator_output.clear()
 
                         # 4. Inference and calculate values, log probs, rewards, kl divergence
                         with Timer("fwd_logprobs_values_reward", self.all_timings):
@@ -514,7 +564,7 @@ class RayPPOTrainer:
                             "on_step_end",
                             batch=training_input,
                             metrics=status,
-                            trajectory_ids=generator_output.get("trajectory_ids"),
+                            trajectory_ids=step_trajectory_ids,
                         )
                         step_started = False
 
@@ -634,6 +684,16 @@ class RayPPOTrainer:
                     self.all_metrics = {}
                     self.all_timings = {}
                     step_started = False
+
+                if pool_mode and self.global_step == epoch_start_step and epoch < self.cfg.trainer.epochs - 1:
+                    logger.error(
+                        f"Epoch {epoch} produced zero training batches (dataloader exhausted early). "
+                        "Aborting to avoid silent early exit."
+                    )
+                    raise RuntimeError(
+                        f"DataLoader produced no batches in epoch {epoch}; "
+                        "check data.dataloader.num_workers / dataset integrity"
+                    )
 
                 self._fire("on_epoch_end")
 
@@ -917,7 +977,10 @@ class RayPPOTrainer:
                 policy_model.async_run_ray_method("pass_through", "_set_pad_token_id", self.tokenizer.pad_token_id),
                 "set_pad_token_id",
             )
-            policy_model.offload_to_cpu()
+            if cfg.trainer.policy.keep_model_on_gpu:
+                policy_model.offload_to_cpu(offload_model=False)
+            else:
+                policy_model.offload_to_cpu()
             if cfg.trainer.critic.model.path:
                 deadline.ray_get(
                     critic_model.async_init_model(
@@ -1107,6 +1170,7 @@ class RayPPOTrainer:
     async def generate(
         self,
         input_batch: GeneratorInput,
+        disable_tqdm: bool = False,
     ) -> GeneratorOutput:
         """
         Generate rollouts.
@@ -1117,7 +1181,15 @@ class RayPPOTrainer:
         - after calling this method, the same model placement still holds.
         """
         # NOTE: we assume that .generate returns samples in the same order as passed in
-        generator_output: GeneratorOutput = await self.generator.generate(input_batch)
+        if disable_tqdm:
+            generator_output: GeneratorOutput = await self.generator.generate(input_batch, disable_tqdm=disable_tqdm)
+        else:
+            generator_output: GeneratorOutput = await self.generator.generate(input_batch)
+
+        if "spilled_trajectories" in generator_output:
+            if len(generator_output["spilled_trajectories"]) != len(input_batch["prompts"]):
+                raise ValueError("Spilled trajectories must retain the generator input row count")
+            return generator_output
 
         # add rollout metrics to self.all_metrics
         if generator_output["rollout_metrics"] is not None:
@@ -1133,6 +1205,337 @@ class RayPPOTrainer:
         )
 
         return generator_output
+
+    # ------------------------------------------------------------------
+    # Pool-based rollout driver (dynamic_sampling.pool_mode)
+    # ------------------------------------------------------------------
+    def _pool_all_prompts(self) -> List[Any]:
+        """Flatten the training dataloader into the fixed prompt list the pool draws from.
+
+        Built once and reused: every step draws a fresh reservoir from it (with
+        replacement across steps, without replacement within a step).
+        """
+        if getattr(self, "_pool_all_cache", None) is None:
+            self._pool_all_cache = [p for batch in iter(self.train_dataloader) for p in batch]
+            logger.info(
+                f"[pool_mode] training set loaded: {len(self._pool_all_cache)} prompts "
+                f"(reservoir of {self.cfg.trainer.algorithm.dynamic_sampling.pool_prompts} "
+                f"drawn from it every step)"
+            )
+        return self._pool_all_cache
+
+    def _pool_draw(self, n_prompts: int) -> List[Any]:
+        """One step's pool: without replacement within the step, with replacement across steps."""
+        universe = self._pool_all_prompts()
+        if n_prompts >= len(universe):
+            return list(universe)
+        return random.sample(universe, n_prompts)
+
+    @staticmethod
+    def _slice_generator_input(gi: GeneratorInput, start: int, end: int) -> GeneratorInput:
+        """Slice a per-row generator input to rows [start, end) (one prompt = nsp rows)."""
+        out: GeneratorInput = {
+            "prompts": gi["prompts"][start:end],
+            "env_classes": gi["env_classes"][start:end],
+            "env_extras": gi["env_extras"][start:end],
+            "sampling_params": gi["sampling_params"],
+            "batch_metadata": gi["batch_metadata"],
+        }
+        if "trajectory_ids" in gi:
+            out["trajectory_ids"] = gi["trajectory_ids"][start:end]
+        return out
+
+    @staticmethod
+    def _seq_reward(seq_reward: Any) -> float:
+        """Sequence-level reward: token-level rewards (list) are summed, matching the
+        reward collapse used by the filter strategy."""
+        if isinstance(seq_reward, list):
+            return float(sum(seq_reward))
+        if isinstance(seq_reward, np.ndarray):
+            return float(seq_reward.sum())
+        return float(seq_reward)
+
+    async def _rollout_pool_step(
+        self,
+        pool_gi: GeneratorInput,
+        pool_uids: List[str],
+        stop_at: int,
+    ) -> Tuple[GeneratorInput, GeneratorOutput, List[str]]:
+        """Pool-reservoir rollout driver for ``dynamic_sampling.pool_mode``.
+
+        Admits prompts to the engines in pool order (admission is throttled by the
+        per-engine client semaphore, ``SKYRL_GENERATE_CONCURRENCY_PER_ENGINE``) and
+        stops admitting once ``stop_at`` informative groups - sequence rewards not all
+        equal, the exact predicate of the ``filter`` strategy - have completed. Already
+        in-flight groups run to completion; non-informative groups are returned as-is so
+        the downstream filter drops them and randomly truncates overflow to exactly
+        ``train_batch_size`` (unbiased selection among valid groups). If the pool is
+        exhausted before ``stop_at`` groups are valid, the remainder is decided by the
+        normal filter resampling path (a fresh pool on the next wave).
+        """
+        if self.cfg.trainer.algorithm.dynamic_sampling.pool_spill:
+            return await self._rollout_pool_step_spilled(pool_gi, pool_uids, stop_at)
+        assert stop_at >= 1
+        nsp = self.cfg.generator.n_samples_per_prompt
+        n_rows = len(pool_gi["prompts"])
+        assert n_rows % nsp == 0
+        n_prompts = n_rows // nsp
+        parts = [self._slice_generator_input(pool_gi, i * nsp, (i + 1) * nsp) for i in range(n_prompts)]
+        parts_uids = [pool_uids[i * nsp : (i + 1) * nsp] for i in range(n_prompts)]
+
+        # Admission window: cap in-flight prompts so the client-side per-engine
+        # semaphore (valve x num_engines sequences) stays saturated without the
+        # driver submitting the whole pool up front - that is what makes
+        # "stop admitting at stop_at" actually save generation instead of just
+        # bookkeeping. Coroutines beyond the window are never created.
+        window = max(
+            1,
+            (SKYRL_GENERATE_CONCURRENCY_PER_ENGINE * self.cfg.generator.inference_engine.num_engines) // nsp,
+        )
+        pending = deque(range(n_prompts))
+        inflight: Dict[asyncio.Future, int] = {}
+        outs: Dict[int, GeneratorOutput] = {}
+        valid = 0
+        dropped = 0
+        # Fresh phase: clear any abort mark left by the previous wave so new requests run.
+        if not self.cfg.trainer.fully_async.enabled and hasattr(self.inference_engine_client, "clear_abort"):
+            self.inference_engine_client.clear_abort()
+        t0 = time.monotonic()
+
+        while (pending and valid < stop_at) or inflight:
+            while pending and valid < stop_at and len(inflight) < window:
+                i = pending.popleft()
+                inflight[asyncio.ensure_future(self.generate(parts[i], disable_tqdm=True))] = i
+            if not inflight:
+                break
+            done, _ = await asyncio.wait(list(inflight), return_when=asyncio.FIRST_COMPLETED)
+            for f in done:
+                i = inflight.pop(f)
+                try:
+                    out = f.result()
+                except InferenceRequestAborted as e:
+                    dropped += 1
+                    logger.warning(
+                        f"[pool_mode] group {i} aborted during rollout "
+                        f"({type(e).__name__}: {str(e)[:200]}); dropping group "
+                        f"(resampling will backfill)"
+                    )
+                    continue
+                outs[i] = out
+                flat = [self._seq_reward(r) for r in out["rewards"]]
+                if max(flat) > min(flat):
+                    valid += 1
+
+        # Fail-fast any straggler in-flight client calls so they cannot blow up during
+        # event-loop teardown (v8: empty-body JSONDecodeError after the phase ended).
+        if not self.cfg.trainer.fully_async.enabled and hasattr(self.inference_engine_client, "set_abort"):
+            self.inference_engine_client.set_abort("pool rollout wave finished")
+        if dropped:
+            self.all_metrics["generate/pool_groups_dropped"] = float(dropped)
+        admitted = sorted(outs)
+        n_unadmitted = n_prompts - len(admitted)
+        admitted_gi: GeneratorInput
+        conc: GeneratorOutput
+        adm_uids: List[str]
+        if not admitted:
+            raise RuntimeError("No rollout groups completed; inspect the preceding request-abort errors")
+        else:
+            admitted_gi = {
+                "prompts": [x for i in admitted for x in parts[i]["prompts"]],
+                "env_classes": [x for i in admitted for x in parts[i]["env_classes"]],
+                "env_extras": [x for i in admitted for x in parts[i]["env_extras"]],
+                "sampling_params": pool_gi["sampling_params"],
+                "batch_metadata": pool_gi["batch_metadata"],
+            }
+            if "trajectory_ids" in pool_gi:
+                admitted_gi["trajectory_ids"] = [x for i in admitted for x in parts[i]["trajectory_ids"]]
+            conc = concatenate_generator_outputs(
+                [outs[i] for i in admitted],
+                step_wise=self.cfg.generator.step_wise_trajectories,
+                routes_expected=self.cfg.generator.inference_engine.enable_return_routed_experts,
+                support_expected=self.cfg.trainer.algorithm.enable_sample_support_replay,
+            )
+            adm_uids = [u for i in admitted for u in parts_uids[i]]
+
+        elapsed = time.monotonic() - t0
+        self.all_metrics.update(
+            {
+                "generate/pool_prompts_submitted": float(len(admitted)),
+                "generate/pool_prompts_unadmitted": float(n_unadmitted),
+                "generate/pool_valid_groups": float(valid),
+                "generate/pool_rollout_s": elapsed,
+            }
+        )
+        logger.info(
+            f"[pool_mode] pool={n_prompts} admitted={len(admitted)} "
+            f"unadmitted={n_unadmitted} valid_groups={valid} (stop_at={stop_at}, "
+            f"window={window}) rollout_s={elapsed:.1f}"
+        )
+        return admitted_gi, conc, adm_uids
+
+    @staticmethod
+    def _pool_training_group_uids(source_uids: List[str], samples_per_prompt: int) -> List[str]:
+        if samples_per_prompt < 1 or len(source_uids) % samples_per_prompt:
+            raise ValueError("Pool training rows must contain complete prompt groups")
+        namespace = uuid4().hex
+        group_uids = []
+        for start in range(0, len(source_uids), samples_per_prompt):
+            source_uid = source_uids[start]
+            if any(uid != source_uid for uid in source_uids[start : start + samples_per_prompt]):
+                raise ValueError("Pool source IDs must agree within each sampled prompt group")
+            group_uid = f"{source_uid}:draw:{namespace}:{start // samples_per_prompt}"
+            group_uids.extend([group_uid] * samples_per_prompt)
+        return group_uids
+
+    async def _rollout_pool_step_spilled(self, pool_gi, pool_uids, stop_at):
+        restore = getattr(self.generator, "restore_spilled_outputs", None)
+        if not callable(restore):
+            raise TypeError("pool_spill requires a generator supporting spilled outputs")
+        root = os.environ.get("SKYRL_ROLLOUT_ARCHIVE") or self.cfg.trainer.export_path
+        if not root or "://" in str(root):
+            raise ValueError("pool_spill requires a local rollout archive or export_path")
+        directory = Path(root) / "completed"
+        directory.mkdir(parents=True, exist_ok=True)
+        nsp = self.cfg.generator.n_samples_per_prompt
+        if len(pool_gi["prompts"]) % nsp:
+            raise ValueError("Pool rows must contain complete prompt groups")
+        count = len(pool_gi["prompts"]) // nsp
+        parts = [self._slice_generator_input(pool_gi, index * nsp, (index + 1) * nsp) for index in range(count)]
+        for part in parts:
+            part["spill_output_dir"] = str(directory)
+        window = max(1, SKYRL_GENERATE_CONCURRENCY_PER_ENGINE * self.cfg.generator.inference_engine.num_engines // nsp)
+        pending = deque(range(count))
+        inflight = {}
+        completed = {}
+        valid = 0
+        dropped = 0
+        submitted = 0
+        completed_tokens = 0
+        state = self.dynamic_sampling_state or {
+            "sample_batch_count": 0,
+            "num_prompts_in_batch": 0,
+            "pool_group_refs": [],
+        }
+        wave = state["sample_batch_count"] + 1
+        started = time.monotonic()
+        if hasattr(self.inference_engine_client, "clear_abort"):
+            self.inference_engine_client.clear_abort()
+        try:
+            while (pending and valid < stop_at) or inflight:
+                while pending and valid < stop_at and len(inflight) < window:
+                    index = pending.popleft()
+                    inflight[asyncio.ensure_future(self.generate(parts[index], disable_tqdm=True))] = index
+                    submitted += 1
+                if not inflight:
+                    break
+                done, _ = await asyncio.wait(list(inflight), return_when=asyncio.FIRST_COMPLETED)
+                for future in done:
+                    index = inflight.pop(future)
+                    try:
+                        output = future.result()
+                    except InferenceRequestAborted as error:
+                        dropped += 1
+                        logger.warning(f"[pool_spill] group {index} aborted: {error}")
+                        continue
+                    references = output.get("spilled_trajectories")
+                    if references is None or len(references) != nsp:
+                        raise ValueError("Spilled generation must return one reference per trajectory")
+                    scores = [float(reference.sequence_reward) for reference in references]
+                    if not np.isfinite(scores).all():
+                        raise ValueError("Pool group rewards must be finite")
+                    completed_tokens += sum(reference.response_length for reference in references)
+                    informative = nsp == 1 or max(scores) > min(scores)
+                    with (directory / "groups.jsonl").open("a", encoding="utf-8") as stream:
+                        stream.write(
+                            json.dumps(
+                                {
+                                    "wave": wave,
+                                    "uids": pool_uids[index * nsp : (index + 1) * nsp],
+                                    "informative": informative,
+                                    "files": [reference.path for reference in references],
+                                    "rewards": scores,
+                                }
+                            )
+                            + "\n"
+                        )
+                    if informative:
+                        valid += 1
+                        completed[index] = {
+                            "references": references,
+                            "input": parts[index],
+                            "uids": pool_uids[index * nsp : (index + 1) * nsp],
+                        }
+        finally:
+            for future in inflight:
+                future.cancel()
+            if inflight:
+                await asyncio.gather(*inflight, return_exceptions=True)
+        if submitted == dropped:
+            raise RuntimeError("No rollout groups completed; inspect the preceding request-abort errors")
+        entries = list(state["pool_group_refs"])
+        entries.extend(completed[index] for index in sorted(completed))
+        self.all_metrics.update(
+            {
+                "generate/pool_prompts_submitted": float(submitted),
+                "generate/pool_prompts_unadmitted": float(count - submitted),
+                "generate/pool_valid_groups": float(valid),
+                "generate/pool_groups_dropped": float(dropped),
+                "generate/pool_rollout_s": time.monotonic() - started,
+                "generate/pool_spilled_response_tokens": float(completed_tokens),
+                "generate/pool_sampling_waves": float(wave),
+            }
+        )
+        target = self.cfg.trainer.train_batch_size
+        if len(entries) < target:
+            self.dynamic_sampling_state = {
+                "sample_batch_count": wave,
+                "num_prompts_in_batch": len(entries),
+                "pool_group_refs": entries,
+            }
+            limit = self.cfg.trainer.algorithm.dynamic_sampling.max_sample_batches
+            if limit > 0 and wave >= limit:
+                raise RuntimeError(f"Dynamic sampling reached {limit} waves without enough informative groups")
+            logger.info(f"[pool_spill] wave={wave} valid={len(entries)}/{target}; retaining references only")
+            return pool_gi, None, []
+        if not self.cfg.trainer.algorithm.dynamic_sampling.keep_all_informative_groups and len(entries) > target:
+            chosen = set(np.random.permutation(len(entries))[:target].tolist())
+            entries = [entry for index, entry in enumerate(entries) if index in chosen]
+        selected_input = {
+            key: [value for entry in entries for value in entry["input"][key]]
+            for key in ("prompts", "env_classes", "env_extras")
+        }
+        selected_input["sampling_params"] = pool_gi["sampling_params"]
+        selected_input["batch_metadata"] = pool_gi["batch_metadata"]
+        if "trajectory_ids" in pool_gi:
+            selected_input["trajectory_ids"] = [
+                value for entry in entries for value in entry["input"]["trajectory_ids"]
+            ]
+        references = [reference for entry in entries for reference in entry["references"]]
+        source_uids = [uid for entry in entries for uid in entry["uids"]]
+        selected_uids = self._pool_training_group_uids(source_uids, nsp)
+        with (directory / f"selection-{time.time_ns()}.json").open("x", encoding="utf-8") as stream:
+            json.dump(
+                {
+                    "uids": selected_uids,
+                    "source_uids": source_uids,
+                    "files": [reference.path for reference in references],
+                },
+                stream,
+            )
+        self.dynamic_sampling_state = None
+        output = await asyncio.to_thread(restore, references, selected_input)
+        metrics = output.pop("rollout_metrics", None)
+        if metrics is not None:
+            self.all_metrics.update(metrics)
+        validate_generator_output(
+            len(selected_uids),
+            output,
+            step_wise=False,
+            routes_expected=self.cfg.generator.inference_engine.enable_return_routed_experts,
+            support_expected=self.cfg.trainer.algorithm.enable_sample_support_replay,
+        )
+        logger.info(f"[pool_spill] restored {len(entries)} selected groups; other payloads remain on disk")
+        return selected_input, output, selected_uids
 
     @torch.no_grad()
     def postprocess_generator_output(
@@ -1203,8 +1606,20 @@ class RayPPOTrainer:
         responses: List[List[int]] = generator_output["response_ids"]
         per_token_rewards: List[List[float]] = []
 
+        # DAPO soft overlong punishment: expected length = max_generate_length - overlong_buffer_len
+        if self.cfg.trainer.algorithm.overlong_buffer_len > 0:
+            response_lengths = [len(response) for response in responses]
+            generator_output["rewards"] = apply_soft_overlong_punishment(
+                rewards,
+                response_lengths,
+                self.cfg.generator.sampling_params.max_generate_length,
+                self.cfg.trainer.algorithm.overlong_buffer_len,
+                self.cfg.trainer.algorithm.overlong_buffer_penalty_factor,
+            )
+            rewards = generator_output["rewards"]
+
         # Check if rewards are already token-level (List[List[float]]) or response-level (List[float])
-        if rewards and isinstance(rewards[0], list):
+        if rewards and isinstance(rewards[0], (list, np.ndarray)):
             # Token-level rewards: rewards is List[List[float]]
             per_token_rewards = rewards
         else:
@@ -1434,6 +1849,13 @@ class RayPPOTrainer:
         order (mini-batches are contiguous and in order), so the result aligns with the full-batch
         forward's ordering. Tensorizing the combined ``loss_fn_outputs`` once pads uniformly.
         """
+        forward_kwargs = (
+            {"return_tensor_outputs": True}
+            if model == "policy"
+            and self.cfg.trainer.strategy in ("ddp", "fsdp")
+            and self.cfg.trainer.algorithm.old_logprobs_source == "trainer"
+            else {}
+        )
         if self.cfg.trainer.recompute_old_logprobs_per_minibatch and mini_batch_boundaries:
             # Pre-stage all per-DP mini-batch chunks once (same as the training step), so chunk
             # serialization is amortized off the dispatch critical path across mini-batches. The
@@ -1442,7 +1864,7 @@ class RayPPOTrainer:
             all_chunk_refs = self.dispatch.stage_data(model, data_fwd_pass, mini_batch_boundaries)
             combined_outputs: List[Dict[str, Any]] = []
             for (start, end), chunk_refs in zip(mini_batch_boundaries, all_chunk_refs, strict=True):
-                mb_output = self.dispatch.forward_from_staged(model, chunk_refs)
+                mb_output = self.dispatch.forward_from_staged(model, chunk_refs, **forward_kwargs)
                 # stage_data pads each mini-batch independently for DP. Remove
                 # those synthetic rows before concatenation, or every following
                 # mini-batch's scores shift relative to its sampled tokens.
@@ -1453,7 +1875,7 @@ class RayPPOTrainer:
             padding = result.new_zeros((len(data_fwd_pass) - len(result), *result.shape[1:]))
             return torch.cat((result, padding), dim=0)
 
-        output = self.dispatch.forward(model, data_fwd_pass)
+        output = self.dispatch.forward(model, data_fwd_pass, **forward_kwargs)
         return loss_fn_outputs_to_tensor(output.loss_fn_outputs, key=key)
 
     def _skip_policy_forward(self, training_input: TrainingInputBatch) -> bool:
@@ -1470,7 +1892,12 @@ class RayPPOTrainer:
         keyed by policy_loss_type and cannot distinguish the two CISPO anchors.
         """
         algorithm = self.cfg.trainer.algorithm
-        if algorithm.policy_loss_type == PolicyLossType.CISPO:
+        if algorithm.uses_rollout_old_logprobs and algorithm.policy_loss_type in (
+            PolicyLossType.REGULAR,
+            PolicyLossType.DUAL_CLIP,
+        ):
+            loss_without_old_logprobs = True
+        elif algorithm.policy_loss_type == PolicyLossType.CISPO:
             # CISPO reads old logprobs only with the default "old" anchor; "rollout" optimizes against
             # the rollout logprobs (like rollout_is) and never touches them.
             loss_without_old_logprobs = algorithm.cispo.cispo_anchor == "rollout"
@@ -1565,16 +1992,21 @@ class RayPPOTrainer:
         action_log_probs = action_log_probs[: len(sequences_all)] if action_log_probs is not None else None
         values = values[: len(sequences_all)] if values is not None else None
 
+        computed_action_log_probs = action_log_probs
+        if self.cfg.trainer.algorithm.uses_rollout_old_logprobs:
+            if training_input.get("rollout_logprobs") is None:
+                raise ValueError("Rollout old-policy anchor requires recorded rollout logprobs")
+            action_log_probs = training_input["rollout_logprobs"]
         training_input["base_action_log_probs"] = base_log_probs
         training_input["action_log_probs"] = action_log_probs
         training_input["values"] = values
 
-        if training_input.get("rollout_logprobs", None) is not None and action_log_probs is not None:
+        if training_input.get("rollout_logprobs", None) is not None and computed_action_log_probs is not None:
             # Abs diff between rollout and forward-pass logprobs, over response tokens. When the
             # forward pass is skipped, the worker's `minibatch_rollout_logprobs_abs_diff_*` is used.
             logprobs_diff = (
                 training_input["rollout_logprobs"][training_input["loss_mask"] > 0]
-                - action_log_probs[training_input["loss_mask"] > 0]
+                - computed_action_log_probs[training_input["loss_mask"] > 0]
             ).abs()
 
             # Guard: a batch with no trainable response tokens (loss_mask all zero, e.g. every
@@ -1733,7 +2165,8 @@ class RayPPOTrainer:
             update_epochs = self.cfg.trainer.critic_update_epochs_per_batch
         for _epoch in range(update_epochs):
             for chunk_refs in all_chunk_refs:
-                status = self.dispatch.forward_backward_from_staged(model, chunk_refs)
+                worker_kwargs = {"return_per_token_outputs": False} if model == "policy" else {}
+                status = self.dispatch.forward_backward_from_staged(model, chunk_refs, **worker_kwargs)
                 for k, v in status.metrics.items():
                     all_metrics[k].append(v)
 
@@ -1810,6 +2243,7 @@ class RayPPOTrainer:
             "type": self.cfg.trainer.algorithm.dynamic_sampling.type,
             "max_sample_batches": max_sample_batches,
             "min_replace_ratio": self.cfg.trainer.algorithm.dynamic_sampling.min_replace_ratio,
+            "keep_all_informative_groups": self.cfg.trainer.algorithm.dynamic_sampling.keep_all_informative_groups,
             "train_batch_size": self.cfg.trainer.train_batch_size,
             "n_samples_per_prompt": self.cfg.generator.n_samples_per_prompt,
         }
@@ -2026,8 +2460,8 @@ class RayPPOTrainer:
         self.dispatch.load_checkpoint(
             "policy",
             policy_ckpt_dir,
-            load_optimizer_states=True,
-            load_lr_scheduler_states=True,
+            load_optimizer_states=self.cfg.trainer.resume_optimizer_states,
+            load_lr_scheduler_states=self.cfg.trainer.resume_optimizer_states,
         )
         logger.info("Successfully loaded policy checkpoint")
 
@@ -2037,8 +2471,8 @@ class RayPPOTrainer:
             self.dispatch.load_checkpoint(
                 "critic",
                 critic_ckpt_dir,
-                load_optimizer_states=True,
-                load_lr_scheduler_states=True,
+                load_optimizer_states=self.cfg.trainer.resume_optimizer_states,
+                load_lr_scheduler_states=self.cfg.trainer.resume_optimizer_states,
             )
             logger.info("Successfully loaded critic checkpoint")
 

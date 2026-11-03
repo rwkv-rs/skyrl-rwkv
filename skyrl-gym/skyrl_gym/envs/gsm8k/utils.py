@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import re
+import os
 from typing import Any, Dict, Optional, Tuple
 
 
@@ -114,6 +115,23 @@ def compute_strict_score(
     ended_eod: bool,
     truncated: bool,
 ) -> Tuple[float, Dict[str, Any]]:
+    if (
+        os.environ.get("SKYRL_ISOLATED_MATH_SCORING") == "1"
+        and os.environ.get("SKYRL_STRICT_ANSWER_SCORER") != "official_aime_boxed"
+    ):
+        from skyrl_gym.envs.gsm8k.isolated_scoring import score
+
+        return score(solution_str, ground_truth, ended_eod=ended_eod, truncated=truncated)
+    return _compute_strict_score_local(solution_str, ground_truth, ended_eod=ended_eod, truncated=truncated)
+
+
+def _compute_strict_score_local(
+    solution_str: str,
+    ground_truth: str,
+    *,
+    ended_eod: bool,
+    truncated: bool,
+) -> Tuple[float, Dict[str, Any]]:
     """Score a complete strict-CoT GSM8K response.
 
     The prompt may prefill ``<think>``. Therefore the generated response only
@@ -126,10 +144,19 @@ def compute_strict_score(
         extract_solution(answer_region, method="strict", remove_commas=False) if parsed is not None else None
     )
     normalized_ground_truth = _normalize_answer(ground_truth, remove_commas=False)
+    official_result = None
+    if os.environ.get("SKYRL_STRICT_ANSWER_SCORER") == "official_aime_boxed":
+        from skyrl_gym.envs.aime.utils import compute_score as official_compute_score
+
+        official_result = official_compute_score(answer_region, normalized_ground_truth, strict_box_verify=True)
+        extracted_answer = official_result["pred"]
     structural_format_valid = bool(parsed is not None and extracted_answer is not None)
     answer_parseable = False
     is_correct = False
-    if structural_format_valid and normalized_ground_truth is not None:
+    if official_result is not None:
+        answer_parseable = extracted_answer is not None
+        is_correct = bool(official_result["acc"])
+    elif structural_format_valid and normalized_ground_truth is not None:
         from math_verify import parse, verify
 
         try:

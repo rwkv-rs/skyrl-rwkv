@@ -116,11 +116,30 @@ def test_stage_chunks_and_dispatch_from_staged():
     assert torch.equal(results["a"], expected), f"Expected {expected}, got {results['a']}"
 
 
+def test_balanced_rwkv_row_order_equalizes_padded_work():
+    lengths = [16800] * 32 + [8000] * 32 + [16000] * 32 + [1200] * 32
+    mask = torch.arange(16800).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
+    order = MeshDispatch._balanced_row_order(mask, dp_size=4)
+    bins = [order[index * 32 : (index + 1) * 32] for index in range(4)]
+    work = [sum(((lengths[row] + 511) // 512) * 512 for row in bucket) for bucket in bins]
+    assert max(work) / min(work) < 1.05
+    assert sorted(order) == list(range(len(lengths)))
+
+
 def test_pass_through_dispatch():
     num_actors = 8
     actor_group = RayActorGroup(num_actors)
     ret = actor_group.pass_through_dispatch(1, 2)
     assert ret == [None] * num_actors
+
+
+def test_loss_fn_outputs_to_tensor_accepts_compact_tensor_rows():
+    rows = [{"logprobs": torch.tensor([-1.0, -2.0])}, {"logprobs": torch.tensor([-3.0])}]
+    result = loss_fn_outputs_to_tensor(rows)
+    assert result.dtype == torch.float32
+    assert torch.equal(result, torch.tensor([[-1.0, -2.0], [-3.0, 0.0]]))
+    result[0, 0] = 9.0
+    assert rows[0]["logprobs"][0] == -1.0
 
 
 def test_loss_fn_outputs_to_tensor_basic():
@@ -188,3 +207,54 @@ def test_dispatch_registry():
         }
     finally:
         DispatchRegistry._registry.pop("custom")
+
+
+@pytest.mark.parametrize("dp_size", [2, 7, 8])
+def test_balanced_rwkv_dispatch_preserves_rows_and_reduces_padded_work_imbalance(monkeypatch, dp_size):
+    from skyrl.backends.skyrl_train.workers.worker_utils import rwkv_padded_length
+
+    lengths = [length for length in (32, 96, 160, 256, 512, 768, 1024, 1536) for _ in range(dp_size)]
+    row_ids = torch.arange(len(lengths))
+    data = TrainingInputBatch(
+        {
+            "sequences": row_ids.unsqueeze(-1),
+            "attention_mask": torch.arange(max(lengths)).unsqueeze(0) < torch.tensor(lengths).unsqueeze(-1),
+            "advantages": row_ids.float().unsqueeze(-1),
+            "rollout_logprobs": -row_ids.float().unsqueeze(-1),
+        }
+    )
+    data.metadata = {"response_length": 1}
+    monkeypatch.setattr(ray, "put", lambda chunk: chunk)
+    chunks = MeshDispatch.stage_chunks(dp_size, data, [(0, len(lengths))], balance_rwkv=True)[0]
+    assert all(len(chunk) == len(lengths) // dp_size for chunk in chunks)
+    assert sorted(int(row) for chunk in chunks for row in chunk["sequences"].flatten()) == row_ids.tolist()
+    work = []
+    for chunk in chunks:
+        torch.testing.assert_close(chunk["advantages"], chunk["sequences"].float())
+        torch.testing.assert_close(chunk["rollout_logprobs"], -chunk["sequences"].float())
+        padded_lengths = sorted(rwkv_padded_length(length) for length in chunk["attention_mask"].sum(-1).tolist())
+        work.append(
+            sum(
+                len(padded_lengths[start : start + 4]) * max(padded_lengths[start : start + 4])
+                for start in range(0, len(padded_lengths), 4)
+            )
+        )
+    rows_per_rank = len(lengths) // dp_size
+    contiguous_work = []
+    for rank in range(dp_size):
+        rank_lengths = [
+            rwkv_padded_length(length) for length in lengths[rank * rows_per_rank : (rank + 1) * rows_per_rank]
+        ]
+        contiguous_work.append(
+            sum(
+                len(rank_lengths[start : start + 4]) * max(rank_lengths[start : start + 4])
+                for start in range(0, len(rank_lengths), 4)
+            )
+        )
+    assert max(work) / min(work) < max(contiguous_work) / min(contiguous_work)
+    assert max(work) / min(work) <= 1.2
+
+
+def test_balanced_rwkv_dispatch_rejects_unequal_row_counts():
+    with pytest.raises(ValueError, match="divisible"):
+        MeshDispatch._balanced_row_order(torch.ones(5, 16), 2)

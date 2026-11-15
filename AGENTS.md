@@ -53,6 +53,7 @@ When working on these areas, read the corresponding doc first:
 
 | Area | Read first |
 |------|-----------|
+| Reviewing or re-reviewing pull requests (read and follow) | `.agents/docs/pr-review.md` |
 | Package management, uv, formatting | `.agents/docs/development.md` |
 | Overall guide for modifying or working with SkyRL | `.agents/docs/contributing.md` |
 | Tests, fixtures, CI quirks | `.agents/docs/testing.md` |

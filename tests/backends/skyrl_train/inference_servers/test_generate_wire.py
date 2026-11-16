@@ -15,6 +15,7 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     PackedArrayKey,
     PackedField,
     build_logprobs_content,
+    decode_packed_logprobs,
     decode_packed_routed_experts,
     decode_packed_sample_support,
     decode_packed_sample_support_logprobs,
@@ -23,6 +24,7 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     pack_routed_experts,
     pack_sample_support,
     pack_sample_support_logprobs,
+    pack_sampled_logprobs,
     unpack_ndarray,
 )
 from tests.backends.skyrl_train.sample_support_helpers import csr, dense
@@ -43,6 +45,27 @@ def _body(**choice_fields) -> dict:
 @dataclass
 class _Logprob:
     logprob: float
+
+
+def test_compact_sampled_logprobs_roundtrip_without_per_token_json_objects():
+    token_ids = list(range(16383))
+    source = [{token: _Logprob(-0.25)} for token in token_ids]
+    packed, count = pack_sampled_logprobs(token_ids, source)
+    body = orjson.dumps(_body(**{PackedField.ROLLOUT_LOGPROBS.value: packed}))
+    decoded = load_packed_body(body)
+    values = decode_packed_logprobs(decoded["choices"][0][PackedField.ROLLOUT_LOGPROBS])
+    assert count == 0 and values.dtype == np.float32
+    assert len(values) == len(token_ids) and np.all(values == -0.25)
+    assert values.nbytes == 4 * len(token_ids)
+    assert b'"content"' not in body and len(body) < 100000
+
+
+def test_compact_sampled_logprobs_clamps_invalid_entries_and_checks_alignment():
+    packed, count = pack_sampled_logprobs([1, 2, 3], [{1: _Logprob(-0.5)}, None, {3: _Logprob(float("nan"))}])
+    assert count == 2
+    np.testing.assert_equal(decode_packed_logprobs(packed), [-0.5, CLAMPED_LOGPROB, CLAMPED_LOGPROB])
+    with pytest.raises(ValueError, match="align"):
+        pack_sampled_logprobs([1, 2], [{1: _Logprob(-0.5)}])
 
 
 @pytest.mark.parametrize(

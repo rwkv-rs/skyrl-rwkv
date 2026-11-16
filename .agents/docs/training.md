@@ -2,6 +2,11 @@
 
 ## Entrypoints
 
+- `examples/train/rwkv/train/sync_grpo/run.sh` runs synchronous full-parameter
+  RWKV7 GRPO with the optional `ddp` backend, pooled sampling and completed-rollout
+  spill. Its README documents loss conventions, serial checkpoint restore,
+  compact sampler logprobs and the historical validation limits.
+
 - **`skyrl/train/entrypoints/main_base.py`** — Primary training entrypoint. Handles inference server setup, training loop, weight sync.
 - **`skyrl/train/entrypoints/main_generate.py`** — Generation-only entrypoint (no training).
 - **`skyrl/train/main_value.py`** — Standalone offline critic pretraining via `torchrun` and native `FSDPStrategy`; argparse flags, no Ray/inference engines. Optional `--use-nora` freezes the RWKV backbone and trains existing fused NoRA adapters plus the full FP32 value head; `--rank` defaults to 8 and alpha defaults to rank. Rank sweeps double 8, 16, 32, etc. FSDP checkpoints retain adapters/head; HF exports and `best/` merge complete BF16 critic weights. Dataset/collator: `skyrl/train/dataset/value_dataset.py`. Exact-token input contract and RWKV commands: `examples/train/rwkv/README.md` (Offline value pretraining).

@@ -31,12 +31,136 @@ from skyrl.train.config import AlgorithmConfig, OffPolicyCorrectionConfig
 from skyrl.train.utils.trainer_utils import finalize_minibatch_rollout_logprob_diff_std
 
 
+@pytest.mark.parametrize("loss_name", ["regular", "dual_clip"])
+@pytest.mark.parametrize("strict", [False, True])
+def test_strict_ppo_skips_old_forward_only_with_recorded_rollout(loss_name, strict):
+    from types import SimpleNamespace
+
+    from skyrl.train.trainer import RayPPOTrainer
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    algorithm = AlgorithmConfig(policy_loss_type=loss_name, github_strict_loss=strict, use_kl_loss=False)
+    trainer.cfg = SimpleNamespace(trainer=SimpleNamespace(algorithm=algorithm))
+    assert trainer._skip_policy_forward({"rollout_logprobs": torch.zeros(1, 2)}) is strict
+    assert trainer._skip_policy_forward({"rollout_logprobs": None}) is False
+    algorithm.use_kl_in_reward = True
+    assert trainer._skip_policy_forward({"rollout_logprobs": torch.zeros(1, 2)}) is False
+    algorithm.use_kl_in_reward = False
+    algorithm.off_policy_correction.tis_ratio_type = "token"
+    assert trainer._skip_policy_forward({"rollout_logprobs": torch.zeros(1, 2)}) is False
+
+
+def test_strict_anchor_does_not_report_fabricated_zero_forward_diff():
+    from unittest.mock import MagicMock
+
+    from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+    from skyrl.train.config import SkyRLTrainConfig
+    from skyrl.train.trainer import RayPPOTrainer
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.cfg = SkyRLTrainConfig()
+    trainer.cfg.trainer.algorithm.github_strict_loss = True
+    trainer.cfg.trainer.algorithm.use_kl_loss = False
+    trainer.dispatch = MagicMock()
+    trainer.ref_model = None
+    trainer.all_metrics = {}
+    trainer.all_timings = {}
+    data = TrainingInputBatch(
+        {
+            "sequences": torch.ones(2, 4, dtype=torch.long),
+            "attention_mask": torch.ones(2, 4),
+            "response_mask": torch.ones(2, 3),
+            "loss_mask": torch.ones(2, 3),
+            "rollout_logprobs": torch.full((2, 3), -1.0),
+        }
+    )
+    data.metadata = {"response_length": 3}
+    result = trainer.fwd_logprobs_values_reward(data)
+    trainer.dispatch.forward.assert_not_called()
+    assert torch.equal(result["action_log_probs"], result["rollout_logprobs"])
+    assert not any("rollout_train_logprobs_abs_diff" in name for name in trainer.all_metrics)
+
+
 def test_losses_without_old_logprobs():
     """rollout_is and dppo optimize against rollout logprobs and do not need old logprobs."""
     assert "rollout_is" in LOSSES_WITHOUT_OLD_LOGPROBS
     assert "dppo" in LOSSES_WITHOUT_OLD_LOGPROBS
     assert "regular" not in LOSSES_WITHOUT_OLD_LOGPROBS
     assert "gspo" not in LOSSES_WITHOUT_OLD_LOGPROBS
+
+
+@pytest.mark.parametrize("source,expected", [(None, True), ("rollout", True), ("trainer", False)])
+def test_old_logprob_source_preserves_strict_numerical_conventions(source, expected):
+    config = AlgorithmConfig(github_strict_loss=True, old_logprobs_source=source)
+    assert config.uses_rollout_old_logprobs is expected
+    assert config.github_strict_loss is True
+    assert config.grpo_norm_by_std is True
+
+
+def test_invalid_old_logprob_source_is_rejected():
+    config = AlgorithmConfig(old_logprobs_source="current_minibatch")
+    with pytest.raises(ValueError, match="old_logprobs_source"):
+        _ = config.uses_rollout_old_logprobs
+
+
+def test_recomputed_denominator_is_fixed_before_all_optimizer_steps():
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+    from skyrl.train.config import SkyRLTrainConfig
+    from skyrl.train.trainer import RayPPOTrainer
+
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.cfg = SkyRLTrainConfig()
+    trainer.cfg.trainer.algorithm.github_strict_loss = True
+    trainer.cfg.trainer.algorithm.old_logprobs_source = "trainer"
+    trainer.cfg.trainer.algorithm.use_kl_loss = False
+    trainer.dispatch = MagicMock()
+    trainer.ref_model = None
+    trainer.all_metrics = {}
+    trainer.all_timings = {}
+    events = []
+    old_logprobs = torch.tensor([[-1.0, -1.5], [-2.0, -2.5], [-3.0, -3.5], [-4.0, -4.5]])
+
+    def compute_old(*args, **kwargs):
+        events.append("old_forward")
+        return old_logprobs.clone()
+
+    trainer._execute_forward_pass = compute_old
+    data = TrainingInputBatch(
+        {
+            "sequences": torch.ones(4, 3, dtype=torch.long),
+            "attention_mask": torch.ones(4, 3),
+            "response_mask": torch.ones(4, 2),
+            "loss_mask": torch.ones(4, 2),
+            "rollout_logprobs": None,
+            "advantages": torch.ones(4, 2),
+        }
+    )
+    data.metadata = {"response_length": 2, "policy_mini_batch_boundaries": [(0, 2), (2, 4)]}
+    prepared = trainer.fwd_logprobs_values_reward(data)
+    assert torch.equal(prepared["action_log_probs"], old_logprobs)
+    assert not prepared["action_log_probs"].requires_grad
+    trainer.dispatch.stage_data.side_effect = lambda model, batch, boundaries: [
+        batch[start:end] for start, end in boundaries
+    ]
+
+    def train_minibatch(model, batch, **worker_kwargs):
+        assert worker_kwargs == {"return_per_token_outputs": False}
+        start = 0 if events.count("optimizer") == 0 else 2
+        assert torch.equal(batch["action_log_probs"], old_logprobs[start : start + 2])
+        events.append("backward")
+        return SimpleNamespace(metrics={"policy_loss": 0.0})
+
+    def update(model):
+        events.append("optimizer")
+        return 1.0
+
+    trainer.dispatch.forward_backward_from_staged.side_effect = train_minibatch
+    trainer.dispatch.optim_step.side_effect = update
+    trainer._execute_training_step("policy", prepared)
+    assert events == ["old_forward", "backward", "optimizer", "backward", "optimizer"]
 
 
 @pytest.mark.parametrize(

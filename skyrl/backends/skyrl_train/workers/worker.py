@@ -703,6 +703,32 @@ class Worker(DistributedTorchRayActor):
             load_optimizer_states=load_optimizer_states,
             load_lr_scheduler_states=load_lr_scheduler_states,
         )
+        optimizer_config = getattr(self.strategy, "optimizer_config", None)
+        if (
+            load_optimizer_states
+            and self.optimizer is not None
+            and optimizer_config is not None
+            and optimizer_config.resume_hyperparameters_from_config is True
+        ):
+            if (
+                optimizer_config.scheduler not in ("constant", "constant_with_warmup")
+                or optimizer_config.num_warmup_steps
+            ):
+                raise ValueError("Resuming configured optimizer hyperparameters requires a constant LR without warmup")
+            for group in self.optimizer.param_groups:
+                group.update(
+                    lr=optimizer_config.lr,
+                    initial_lr=optimizer_config.lr,
+                    betas=tuple(optimizer_config.adam_betas),
+                    weight_decay=optimizer_config.weight_decay,
+                )
+            if self.scheduler is not None:
+                self.scheduler.base_lrs = [optimizer_config.lr] * len(self.optimizer.param_groups)
+                self.scheduler._last_lr = [optimizer_config.lr] * len(self.optimizer.param_groups)
+            logger.info(
+                f"Restored optimizer moments; configured LR={optimizer_config.lr}, "
+                f"betas={optimizer_config.adam_betas}, weight_decay={optimizer_config.weight_decay}"
+            )
         return states
 
     def save_hf_model(self, export_dir: str, tokenizer):
@@ -1023,9 +1049,8 @@ class PolicyWorkerBase(Worker):
         all_metrics = defaultdict(list)
         loss_fn_output_batches = []  # per-microbatch; restored to input order below
 
-        for microbatch_index, microbatch in enumerate(microbatch_iterator):
-            experience = BaseBatchIterator.batch_to_experience(microbatch)
-            microbatch_weight = len(microbatch) / len(data) * data.metadata.get("loss_scale", 1.0)
+        for microbatch_index, experience in enumerate(self._iter_microbatch_experiences(microbatch_iterator)):
+            microbatch_weight = len(experience.sequences) / len(data) * data.metadata.get("loss_scale", 1.0)
             with self._microbatch_context(is_last=microbatch_index == len(microbatch_iterator) - 1):
                 metrics = self._forward_backward_micro(
                     experience,
@@ -1060,7 +1085,7 @@ class PolicyWorkerBase(Worker):
         # were purely-padding (added to equalize the microbatch count across DP ranks).
         # Added before all-reduce so they are averaged across DP (num_microbatches is
         # identical on every rank; num_padding_microbatches reports the per-rank average).
-        if self.cfg.max_tokens_per_microbatch > 0:
+        if isinstance(microbatch_iterator, TokenBasedBatchIterator):
             result["num_microbatches"] = float(len(microbatch_iterator))
             result["num_padding_microbatches"] = float(getattr(microbatch_iterator, "num_padding_microbatches", 0))
 
@@ -1073,6 +1098,10 @@ class PolicyWorkerBase(Worker):
     def _microbatch_context(self, *, is_last: bool):
         """Control backend communication around one forward/backward microbatch."""
         yield
+
+    def _iter_microbatch_experiences(self, microbatch_iterator):
+        for microbatch in microbatch_iterator:
+            yield BaseBatchIterator.batch_to_experience(microbatch)
 
     def _forward_backward_micro(
         self,
@@ -1100,7 +1129,8 @@ class PolicyWorkerBase(Worker):
         """
         self.model.train()
 
-        experience.to_device(torch.cuda.current_device())
+        experience.to_device(torch.cuda.current_device(), non_blocking=True)
+        defer_metrics = getattr(self.model, "is_rwkv", False) and os.environ.get("SKYRL_DEFER_LOSS_METRICS", "0") == "1"
 
         sequences = experience.sequences
         old_action_log_probs = experience.action_log_probs
@@ -1139,13 +1169,16 @@ class PolicyWorkerBase(Worker):
         # TODO (sumanthrh): don't think this does anything for fsdp rn because autocast happens internally
         with torch.autocast(dtype=torch.bfloat16, device_type="cuda"):
             # actor loss
+            compute_entropy = self.cfg.algorithm.use_entropy_loss or (
+                os.environ.get("SKYRL_POLICY_ENTROPY_METRICS", "1") == "1"
+            )
             action_log_probs, output = self.model(
                 sequences,
                 num_actions,
                 attention_mask=attention_mask,
                 temperature=self.cfg.algorithm.temperature,
                 return_output=True,
-                compute_entropy=True,
+                compute_entropy=compute_entropy,
                 entropy_requires_grad=self.cfg.algorithm.use_entropy_loss,
                 pixel_values=experience.pixel_values,
                 image_grid_thw=experience.image_grid_thw,
@@ -1156,6 +1189,7 @@ class PolicyWorkerBase(Worker):
                 enable_sample_support_replay=sample_support_replay,
                 enable_score_centering=score_centering,
                 response_mask=experience.response_mask,
+                sequence_lengths=(experience.metadata.get("rwkv_sequence_lengths") if experience.metadata else None),
             )
             # loss function
             # TODO: recompute advantages
@@ -1163,6 +1197,8 @@ class PolicyWorkerBase(Worker):
                 "loss_mask": loss_mask,
                 "rollout_logprobs": rollout_action_logprobs,
             }
+            if defer_metrics and getattr(current_loss_fn, "__name__", "") == "ppo_policy_loss":
+                policy_loss_kwargs["defer_metrics"] = True
             if resolved_loss_name == "async_opd":
                 policy_loss_kwargs["teacher_log_probs"] = base_action_log_probs
             if resolved_loss_name == "flashreinforce":
@@ -1240,9 +1276,12 @@ class PolicyWorkerBase(Worker):
             # entropy loss
             with torch.set_grad_enabled(self.cfg.algorithm.use_entropy_loss):
                 # batch_size, seqlen
-                entropy_BS = output["entropy"]
-                entropy_BS = entropy_BS[:, -num_actions - 1 : -1]
-                entropy = masked_mean(entropy_BS, loss_mask)
+                if compute_entropy:
+                    entropy_BS = output["entropy"]
+                    entropy_BS = entropy_BS[:, -num_actions - 1 : -1]
+                    entropy = masked_mean(entropy_BS, loss_mask)
+                else:
+                    entropy = action_log_probs.new_zeros(())
 
             if self.cfg.algorithm.use_entropy_loss:
                 entropy_loss_term = entropy * self.cfg.algorithm.entropy_loss_coef
@@ -1277,36 +1316,42 @@ class PolicyWorkerBase(Worker):
             batch_size = action_log_probs.shape[0]
             seq_len = action_log_probs.shape[1]
 
-            if response_mask is not None:
+            if not return_per_token_outputs:
+                valid_lens = []
+            elif response_mask is not None:
                 valid_lens = response_mask.sum(dim=1).int().tolist()
             elif loss_mask is not None:
                 valid_lens = (loss_mask > 0).sum(dim=1).int().tolist()
             else:
                 valid_lens = [seq_len] * batch_size
 
-            detached_log_probs = action_log_probs.detach().cpu()
-            loss_fn_outputs = []
-            for i, valid_len in enumerate(valid_lens):
-                loss_fn_outputs.append(
-                    {
-                        "logprobs": detached_log_probs[i, -valid_len:].tolist() if valid_len > 0 else [],
-                    }
-                )
+            if return_per_token_outputs:
+                detached_log_probs = action_log_probs.detach().cpu()
+                loss_fn_outputs = [
+                    {"logprobs": detached_log_probs[i, -valid_len:].tolist() if valid_len > 0 else []}
+                    for i, valid_len in enumerate(valid_lens)
+                ]
+            else:
+                loss_fn_outputs = []
 
             status = {
-                "final_loss": unscaled_loss.item(),
-                "policy_loss": policy_loss.item(),
-                "policy_entropy": entropy.item(),
+                "final_loss": unscaled_loss.detach() if defer_metrics else unscaled_loss.item(),
+                "policy_loss": policy_loss.detach() if defer_metrics else policy_loss.item(),
+                "policy_entropy": entropy.detach() if defer_metrics else entropy.item(),
                 "response_length": num_actions,
                 "policy_lr": self.scheduler.get_last_lr()[0],
                 "loss_fn_outputs": loss_fn_outputs,
             }
+            if not compute_entropy:
+                status.pop("policy_entropy")
             for k, v in loss_metrics.items():
                 status["loss_metrics/" + k] = v
             if self.cfg.algorithm.use_kl_loss:
                 status["policy_kl"] = kl_loss.item()
             status.update(
-                compute_minibatch_rollout_logprob_diff_metrics(action_log_probs, rollout_action_logprobs, loss_mask)
+                compute_minibatch_rollout_logprob_diff_metrics(
+                    action_log_probs, rollout_action_logprobs, loss_mask, defer_metrics=defer_metrics
+                )
             )
 
         return status
@@ -1338,6 +1383,7 @@ class PolicyWorkerBase(Worker):
         loss_fn: Optional[str] = None,
         loss_fn_config: Optional[Dict[str, Any]] = None,
         return_per_token_outputs: bool = True,
+        return_tensor_outputs: bool = False,
     ) -> WorkerOutput:
         """Run forward pass.
 
@@ -1354,6 +1400,8 @@ class PolicyWorkerBase(Worker):
         ``return_per_token_outputs=False`` skips building the per-token
         ``loss_fn_outputs`` on the loss path for callers that read only
         ``metrics`` (e.g. SFT eval); it has no effect on the inference path.
+
+        ``return_tensor_outputs=True`` returns independent compact CPU tensor rows on the inference path.
         """
         if loss_fn is None:
             # Inference forward path: run in micro batches and emit per-sample logprobs.
@@ -1371,7 +1419,14 @@ class PolicyWorkerBase(Worker):
             if output.device is not None and output.device != torch.device("cpu"):
                 output = output.to("cpu")
             row_tensor = output["output"]
-            loss_fn_outputs = [{"logprobs": row_tensor[i].tolist()} for i in range(row_tensor.shape[0])]
+            loss_fn_outputs = [
+                {
+                    "logprobs": (
+                        row_tensor[index].detach().clone() if return_tensor_outputs else row_tensor[index].tolist()
+                    )
+                }
+                for index in range(row_tensor.shape[0])
+            ]
             return WorkerOutput(loss_fn_outputs=loss_fn_outputs, metrics={})
 
         micro_batch_size = self.cfg.micro_forward_batch_size_per_gpu
@@ -1417,7 +1472,7 @@ class PolicyWorkerBase(Worker):
                 ``loss_fn_outputs`` when callers read only ``metrics``.
         """
         self.model.eval()
-        experience.to_device(torch.cuda.current_device())
+        experience.to_device(torch.cuda.current_device(), non_blocking=True)
 
         sequences = experience.sequences
         old_action_log_probs = experience.action_log_probs
@@ -1520,7 +1575,7 @@ class PolicyWorkerBase(Worker):
 
     def _forward_micro_batch(self, micro_batch: TrainingInputBatch) -> TrainingOutputBatch:
         device = torch.cuda.current_device()
-        micro_batch.to(device)
+        micro_batch.to(device, non_blocking=True)
         self.model.eval()
         sequences = micro_batch["sequences"]
         response_length = micro_batch.metadata["response_length"]
@@ -1634,13 +1689,13 @@ class CriticWorkerBase(Worker):
             :class:`WorkerOutput` with empty ``loss_fn_outputs`` and scalar
             ``metrics`` (all-reduced across DP).
         """
-        use_token_batching = self.cfg.max_tokens_per_microbatch > 0
         microbatch_iterator = get_microbatch_iterator(
             data,
             micro_batch_size=self.cfg.micro_train_batch_size_per_gpu,
             max_tokens_per_microbatch=self.cfg.max_tokens_per_microbatch,
             use_padded_token_count=getattr(self.model, "is_rwkv", False),
         )
+        use_token_batching = isinstance(microbatch_iterator, TokenBasedBatchIterator)
         all_metrics = defaultdict(list)
 
         for microbatch in microbatch_iterator:
@@ -1683,7 +1738,7 @@ class CriticWorkerBase(Worker):
         """
         self.model.train()
 
-        experience.to_device(torch.cuda.current_device())
+        experience.to_device(torch.cuda.current_device(), non_blocking=True)
 
         sequences = experience.sequences
         old_values = experience.values
@@ -1756,7 +1811,7 @@ class CriticWorkerBase(Worker):
     ) -> TrainingOutputBatch:
         """Generates critic values."""
         device = torch.cuda.current_device()
-        micro_batch.to(device)
+        micro_batch.to(device, non_blocking=True)
         sequences = micro_batch["sequences"]
         response_length = micro_batch.metadata["response_length"]
         attention_mask = micro_batch["attention_mask"]
@@ -1832,7 +1887,7 @@ class RefWorkerBase(Worker):
 
     def _forward_micro_batch(self, micro_batch: TrainingInputBatch) -> TrainingOutputBatch:
         device = torch.cuda.current_device()
-        micro_batch.to(device)
+        micro_batch.to(device, non_blocking=True)
         sequences = micro_batch["sequences"]
         response_length = micro_batch.metadata["response_length"]
         attention_mask = micro_batch["attention_mask"]

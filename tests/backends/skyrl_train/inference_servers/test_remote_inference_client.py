@@ -29,6 +29,7 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     decode_packed_sample_support,
     pack_routed_experts,
     pack_sample_support,
+    pack_sampled_logprobs,
 )
 from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
     InferenceServerHTTPError,
@@ -51,6 +52,35 @@ async def _fake_detokenize(token_id_lists: List[List[int]]) -> List[str]:
 
 
 _SUPPORT = csr([[7, 8, -1], [-1, -1, -1], [9, 10, 11]])
+
+
+@pytest.mark.asyncio
+async def test_compact_logprobs_endpoint_archives_aligned_fp32_arrays(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("SKYRL_COMPACT_ROLLOUT_LOGPROBS", "1")
+    monkeypatch.setenv("SKYRL_ROLLOUT_ARCHIVE", str(tmp_path))
+    client = RemoteGenerateClient(proxy_url="http://unused")
+    packed, _ = pack_sampled_logprobs([7, 8], [{7: SimpleNamespace(logprob=-0.25)}, {8: SimpleNamespace(logprob=-0.5)}])
+
+    async def post(url, json, headers, *, packed_side_channels=False):
+        assert url.endswith("/skyrl/v1/generate") and packed_side_channels
+        assert json["return_compact_logprobs"] is True
+        assert json["sampling_params"]["logprobs"] == 0
+        return {
+            "choices": [
+                {"token_ids": [7, 8], "finish_reason": "stop", "logprobs": None, PackedField.ROLLOUT_LOGPROBS: packed}
+            ]
+        }
+
+    monkeypatch.setattr(client, "_post", post)
+    result = await client.generate(
+        prompt_token_ids=[1], sampling_params={"logprobs": 0}, session_id="compact", model="default"
+    )
+    assert result.response_logprobs == [-0.25, -0.5]
+    with np.load(next((tmp_path / "generated").glob("*.npz")), allow_pickle=False) as archived:
+        assert archived["response_logprobs"].dtype == np.float32
+        np.testing.assert_equal(archived["response_logprobs"], [-0.25, -0.5])
 
 
 def _packed_generate_body(*, two_blobs: bool) -> dict:
@@ -601,6 +631,105 @@ class TestRemoteInferenceClientInit:
 
 class TestDataPlane:
     """Test data plane methods."""
+
+    @pytest.mark.asyncio
+    async def test_generation_can_archive_ids_without_rollout_logprobs(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SKYRL_ROLLOUT_ARCHIVE", str(tmp_path))
+        generate_client = RemoteGenerateClient(proxy_url="http://unused")
+        captured = {}
+
+        async def fake_post(url, json, **kwargs):
+            captured.update(json)
+            return {"choices": [{"token_ids": [7, 8], "finish_reason": "stop", "logprobs": None}]}
+
+        monkeypatch.setattr(generate_client, "_post", fake_post)
+        result = await generate_client.generate(
+            prompt_token_ids=[1, 2],
+            sampling_params={"logprobs": None},
+            session_id="no-logprobs",
+            model="default",
+        )
+        assert captured["sampling_params"]["logprobs"] is None
+        assert result.response_logprobs is None
+        paths = list((tmp_path / "generated").glob("*.npz"))
+        assert len(paths) == 1
+        with np.load(paths[0], allow_pickle=False) as archived:
+            assert archived["response_ids"].tolist() == [7, 8]
+            assert archived["response_logprobs"].size == 0
+            assert orjson.loads(archived["metadata"].tobytes())["has_logprobs"] is False
+        assert list((tmp_path / "generated").glob("*.tmp")) == []
+
+    @pytest.mark.asyncio
+    async def test_generate_archives_sampled_arrays_before_returning(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("SKYRL_ROLLOUT_ARCHIVE", str(tmp_path))
+        generate_client = RemoteGenerateClient(proxy_url="http://unused")
+
+        async def fake_post(*args, **kwargs):
+            return {
+                "choices": [
+                    {
+                        "token_ids": [7, 8],
+                        "finish_reason": "stop",
+                        "logprobs": {"content": [{"logprob": -0.1}, {"logprob": -0.2}]},
+                    }
+                ]
+            }
+
+        monkeypatch.setattr(generate_client, "_post", fake_post)
+        result = await generate_client.generate(
+            prompt_token_ids=[1, 2],
+            sampling_params={"logprobs": 0},
+            session_id="archive-session",
+            model="default",
+            cache_salt="policy-7",
+        )
+        paths = list((tmp_path / "generated").glob("*.npz"))
+        assert len(paths) == 1
+        with np.load(paths[0], allow_pickle=False) as archived:
+            assert archived["response_ids"].tolist() == result.response_ids
+            assert archived["response_logprobs"].dtype == np.float32
+            assert np.allclose(archived["response_logprobs"], result.response_logprobs)
+            metadata = orjson.loads(archived["metadata"].tobytes())
+            assert metadata["session_id"] == "archive-session"
+            assert metadata["cache_salt"] == "policy-7"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("flat_logprobs", [None, False, True])
+    async def test_generate_sampled_logprobs_use_flat_storage(self, monkeypatch, flat_logprobs):
+        generate_client = RemoteGenerateClient(proxy_url="http://unused")
+        captured = {}
+        sampling_params = {"logprobs": 0}
+        if flat_logprobs is not None:
+            sampling_params["flat_logprobs"] = flat_logprobs
+        original_params = dict(sampling_params)
+
+        async def fake_post(url, json, headers, *, packed_side_channels=False):
+            captured.update(url=url, json=json, headers=headers)
+            return {
+                "choices": [
+                    {
+                        "token_ids": [7, 8],
+                        "finish_reason": "stop",
+                        "logprobs": {"content": [{"logprob": -0.1}, {"logprob": -0.2}]},
+                    }
+                ]
+            }
+
+        monkeypatch.setattr(generate_client, "_post", fake_post)
+        result = await generate_client.generate(
+            prompt_token_ids=[1, 2],
+            sampling_params=sampling_params,
+            session_id="rollout-session",
+            model="default",
+        )
+
+        assert captured["url"].endswith("/inference/v1/generate")
+        assert captured["json"]["sampling_params"]["logprobs"] == 0
+        assert captured["json"]["sampling_params"]["flat_logprobs"] is (flat_logprobs is not False)
+        assert captured["headers"]["X-Session-ID"] == "rollout-session"
+        assert sampling_params == original_params
+        assert result.response_ids == [7, 8]
+        assert result.response_logprobs == [-0.1, -0.2]
 
     @pytest.mark.asyncio
     async def test_generate(self, client):

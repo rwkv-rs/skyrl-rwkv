@@ -230,14 +230,16 @@ def get_metrics_from_generator_output(generator_output: GeneratorOutput, uids: L
     # TODO: We should make metrics customizable by the environment.
     # Map from the example's uid to each trajectory's reward on that same example
     uid_to_trajectory_rewards = defaultdict(list)
-    if isinstance(rewards[0], list):
+    if isinstance(rewards[0], (list, np.ndarray)):
         # Token-level rewards: rewards is List[List[float]]
         # For each trajectory, we sum over the token rewards for `mean_raw_reward` computation
-        mean_raw_reward = float(np.mean([sum(trajectory_rewards) for trajectory_rewards in rewards]))
+        mean_raw_reward = float(
+            np.mean([np.sum(trajectory_rewards, dtype=np.float64) for trajectory_rewards in rewards])
+        )
 
         # For each trajectory, we sum over the positive token rewards for mean_positive_reward computation
         mean_positive_reward = float(
-            np.mean([sum(max(r, 0) for r in trajectory_rewards) for trajectory_rewards in rewards])
+            np.mean([np.maximum(trajectory_rewards, 0).sum(dtype=np.float64) for trajectory_rewards in rewards])
         )
 
         # Assume the last token's reward signifies the trajectory's reward for `pass_at_n` computation
@@ -438,7 +440,7 @@ def compute_turn_token_counts(loss_masks: List[List[int]]) -> List[int]:
     """
     turn_token_counts: List[int] = []
     for mask in loss_masks:
-        if not mask:
+        if len(mask) == 0:
             continue
         nz = (np.asarray(mask) != 0).astype(np.int8)
         if nz.sum() == 0:
@@ -495,7 +497,7 @@ def get_rollout_metrics(
     # Support both response-level and token-level rewards
     flat_rewards = []
     for r in rewards:
-        if isinstance(r, list):
+        if isinstance(r, (list, np.ndarray)):
             flat_rewards.append(float(np.sum(r)))
         else:
             flat_rewards.append(float(r))
@@ -519,7 +521,7 @@ def get_rollout_metrics(
     }
 
     if loss_masks is not None:
-        assistant_tokens_arr = np.array([sum(mask) for mask in loss_masks])
+        assistant_tokens_arr = np.array([np.sum(mask, dtype=np.int64) for mask in loss_masks])
         rollout_metrics.update(
             {
                 "generate/avg_assistant_tokens": np.mean(assistant_tokens_arr).item(),
@@ -878,7 +880,7 @@ def _merge_single_trajectory(gen_out: GeneratorOutput) -> GeneratorOutput:
 
     n = len(gen_out["response_ids"])
     assert n > 0, "Expect non-empty GeneratorOutput."
-    is_token_level_rewards = isinstance(gen_out["rewards"][0], list)
+    is_token_level_rewards = isinstance(gen_out["rewards"][0], (list, np.ndarray))
     has_logprobs = gen_out.get("rollout_logprobs") is not None
     has_stop_reasons = gen_out.get("stop_reasons") is not None
     has_sample_support = gen_out.get("rollout_sample_support") is not None

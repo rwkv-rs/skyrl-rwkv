@@ -593,14 +593,20 @@ def ppo_policy_loss(
     config: AlgorithmConfig,
     loss_mask: Optional[torch.Tensor] = None,
     rollout_logprobs: Optional[torch.Tensor] = None,
+    defer_metrics: bool = False,
 ) -> Tuple[torch.Tensor, dict[str, float]]:
     assert config.policy_loss_type in ["regular", "dual_clip"], "loss_type must be either 'regular' or 'dual_clip'"
 
-    ratio = safe_exp_delta(log_probs - old_log_probs, clip=20.0, out_dtype=log_probs.dtype)
+    if getattr(config, "github_strict_loss", False):
+        ratio = torch.exp(log_probs - old_log_probs)
+    else:
+        ratio = safe_exp_delta(log_probs - old_log_probs, clip=20.0, out_dtype=log_probs.dtype)
     surr1 = ratio * advantages
     surr2 = ratio.clamp(1 - config.eps_clip_low, 1 + config.eps_clip_high) * advantages
     loss = -torch.min(surr1, surr2)
-    clip_ratio = masked_mean((-surr2 > -surr1).float(), loss_mask).mean().detach().item()
+    clip_ratio = masked_mean((-surr2 > -surr1).float(), loss_mask).mean().detach()
+    if not defer_metrics:
+        clip_ratio = clip_ratio.item()
     clip_pg_losses1 = loss
     if config.policy_loss_type == "dual_clip":
         pg_losses3 = -advantages * config.clip_ratio_c
@@ -1730,11 +1736,19 @@ def compute_grpo_outcome_advantage(
                 id2std[idx] = torch.tensor(1.0)
             elif len(id2score[idx]) > 1:
                 id2mean[idx] = torch.mean(torch.tensor(id2score[idx]))
-                id2std[idx] = torch.std(torch.tensor([id2score[idx]]))
+                group_scores = torch.tensor(id2score[idx])
+                if getattr(kwargs.get("config"), "github_strict_loss", False):
+                    variance = (group_scores - id2mean[idx]).square().mean()
+                    id2std[idx] = variance.sqrt() if variance > 1e-6 else variance.new_zeros(())
+                else:
+                    id2std[idx] = torch.std(group_scores)
             else:
                 raise ValueError(f"no score in prompt index: {idx}")
         for i in range(bsz):
-            if grpo_norm_by_std:
+            if grpo_norm_by_std and getattr(kwargs.get("config"), "github_strict_loss", False):
+                group_std = id2std[index[i]]
+                scores[i] = (scores[i] - id2mean[index[i]]) / group_std if group_std > 1e-6 else 0.0
+            elif grpo_norm_by_std:
                 scores[i] = (scores[i] - id2mean[index[i]]) / (id2std[index[i]] + epsilon)
             else:
                 scores[i] = scores[i] - id2mean[index[i]]

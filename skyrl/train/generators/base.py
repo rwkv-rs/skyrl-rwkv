@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, List, Literal, Optional, TypedDict, Union
+from typing import Any, Dict, List, Literal, NotRequired, Optional, TypedDict, Union
 
 import torch
 
@@ -29,6 +29,7 @@ class BatchMetadata:
 
 
 class GeneratorInput(TypedDict):
+    spill_output_dir: NotRequired[str]
     prompts: List[ConversationType]
     env_classes: List[str]
     env_extras: Optional[List[Dict[str, Any]]]
@@ -38,6 +39,7 @@ class GeneratorInput(TypedDict):
 
 
 class GeneratorOutput(TypedDict):
+    spilled_trajectories: NotRequired[List[Any]]
     prompt_token_ids: List[List[int]]
     response_ids: List[List[int]]
     rewards: Union[List[float], List[List[float]]]

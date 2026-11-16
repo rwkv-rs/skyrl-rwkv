@@ -234,6 +234,8 @@ class OptimizerConfig(BaseConfig):
     """Betas for the AdamW optimizer."""
     weight_decay: float = 1e-2
     """L2 regularization strength for AdamW."""
+    resume_hyperparameters_from_config: bool = False
+    """Reapply configured AdamW hyperparameters after resume; requires a constant scheduler without warmup."""
     max_grad_norm: float = 1.0
     """Gradient clipping. The total L2 norm of the model gradients is scaled to this value."""
     offload_after_step: bool = True
@@ -765,6 +767,11 @@ class PolicyConfig(BaseConfig):
     model: ModelConfig = field(default_factory=lambda: copy.deepcopy(ModelConfig(path="Qwen/Qwen2.5-1.5B-Instruct")))
     optimizer_config: OptimizerConfig = field(default_factory=OptimizerConfig)
     """Optimizer configuration for the policy model."""
+    keep_model_on_gpu: bool = False
+    """Keep colocated synchronous DDP policy parameters on GPU during rollout.
+    Trades GPU capacity for lower host memory use; optimizer offload remains separately configured.
+    Currently requires full-parameter training without critic or reference forwards.
+    """
     fsdp_config: FSDPConfig = field(default_factory=FSDPConfig)
     """FSDP configuration, applicable when ``trainer.strategy="fsdp"``."""
     sequence_parallel_size: int = 1
@@ -983,6 +990,25 @@ class DynamicSamplingConfig(BaseConfig):
     """Sample at most this many batches before stopping. ``-1`` to sample forever."""
     min_replace_ratio: float = 0.3
     """Minimum proportion of good samples to replace bad samples. Only used with ``"replace"`` strategy."""
+    keep_all_informative_groups: bool = False
+    """Keep surplus mixed-reward groups and train them in one global minibatch for filter sampling."""
+
+    pool_mode: bool = False
+    """When true (requires ``type="filter"``), each logical step rolls out a reservoir of
+    ``pool_prompts`` prompts drawn from the shuffled training set (with replacement across
+    steps, without within a step). Prompts are admitted to the inference engines in pool
+    order - throttled by ``SKYRL_GENERATE_CONCURRENCY_PER_ENGINE`` - and admission stops
+    once ``train_batch_size`` informative groups have completed; in-flight groups run to
+    completion and overflow is randomly truncated downstream, so selection among valid
+    groups stays unbiased. A pool exhausted before the target falls back to the normal
+    filter resampling path (a fresh pool on the next wave)."""
+    pool_prompts: int = 2048
+    """Reservoir size in prompts per logical step, used only when ``pool_mode`` is true."""
+    pool_spill: bool = False
+    """Persist completed trajectories and retain only references until uniform group selection.
+    Selected trajectories are restored as compact arrays; concurrency and admission windows are unchanged.
+    Requires a supporting generator and non-step-wise generation.
+    """
 
 
 @dataclass
@@ -1165,6 +1191,19 @@ class AlgorithmConfig(BaseConfig):
     grpo_norm_by_std: bool = True
     """Normalize advantages by the standard deviation in GRPO.
     Set to False for Dr. GRPO (https://arxiv.org/abs/2503.20783)."""
+    github_strict_loss: bool = False
+    """Use population GRPO and the unclamped strict-script PPO ratio, with a legacy rollout anchor."""
+    old_logprobs_source: Optional[str] = None
+    """Select the fixed PPO denominator: ``trainer``, ``rollout``, or ``None`` for legacy behavior.
+    ``trainer`` computes logprobs before any optimizer update and keeps them fixed for the logical batch.
+    ``rollout`` uses recorded sampler logprobs. ``None`` selects rollout for github_strict_loss and trainer otherwise.
+    This does not change group-standard-deviation or ratio-clamping conventions.
+    """
+    overlong_buffer_len: int = 0
+    """DAPO soft overlong punishment buffer in tokens. 0 disables; expected length = max_generate_length - overlong_buffer_len.
+    Responses longer than the expected length get reward linearly decayed to 0 at max_generate_length."""
+    overlong_buffer_penalty_factor: float = 1.0
+    """Multiplier of the linear overlong buffer penalty subtracted from the reward."""
     zero_variance_filter: bool = False
     """Loss-mask prompts with zero-variance rewards. Only applicable when rewards are response-level."""
     zero_variance_filter_tol: float = 1e-6
@@ -1218,6 +1257,12 @@ class AlgorithmConfig(BaseConfig):
     """Sequence-length normalization constant used for actor or critic ``seq_mean_token_sum_norm`` loss reduction.
     Must be set explicitly for that reduction mode; otherwise can remain ``None``. This often
     matches the model context window / vLLM ``max_model_len`` when that is the intended budget."""
+
+    @property
+    def uses_rollout_old_logprobs(self) -> bool:
+        if self.old_logprobs_source not in (None, "trainer", "rollout"):
+            raise ValueError("old_logprobs_source must be trainer, rollout, or None")
+        return self.github_strict_loss if self.old_logprobs_source is None else self.old_logprobs_source == "rollout"
 
 
 # ---------------------------------------------------------------------------
@@ -1739,6 +1784,8 @@ class TrainerConfig(BaseConfig):
     See https://docs.skyrl.ai/docs/checkpointing-logging/checkpointing"""
     resume_path: Optional[str] = None
     """Checkpoint directory to resume from. Only used when ``resume_mode="from_path"``."""
+    resume_optimizer_states: bool = True
+    """Whether a checkpoint resume restores optimizer and scheduler state."""
     log_path: str = "/tmp/skyrl-logs"
     """Path for infrastructure log files.
     vLLM engine startup, model loading, and worker initialization logs are written to
@@ -2189,6 +2236,30 @@ class SkyRLTrainConfig(BaseConfig):
         # so workers can access it without needing the generator config
         if self.trainer.algorithm.temperature is None:
             self.trainer.algorithm.temperature = self.generator.sampling_params.temperature
+
+        if self.trainer.algorithm.old_logprobs_source == "trainer" and self.trainer.fully_async.enabled:
+            raise ValueError("old_logprobs_source=trainer requires synchronous sampling and training")
+        if self.trainer.algorithm.old_logprobs_source == "rollout" and self.generator.sampling_params.logprobs is None:
+            raise ValueError("old_logprobs_source=rollout requires recorded generator.sampling_params.logprobs")
+        if self.trainer.algorithm.old_logprobs_source not in (None, "trainer", "rollout"):
+            raise ValueError("old_logprobs_source must be trainer, rollout, or None")
+        if self.trainer.algorithm.dynamic_sampling.pool_mode and self.trainer.algorithm.dynamic_sampling.pool_spill:
+            if self.generator.step_wise_trajectories or self.generator.batched:
+                raise ValueError("pool_spill requires unbatched non-step-wise trajectories")
+
+        if self.trainer.policy.keep_model_on_gpu:
+            if (
+                self.trainer.strategy != "ddp"
+                or not self.trainer.placement.colocate_all
+                or self.trainer.fully_async.enabled
+                or self.trainer.policy.model.lora.rank > 0
+                or self.trainer.critic.model.path is not None
+                or self.trainer.algorithm.use_kl_loss
+                or self.trainer.algorithm.use_kl_in_reward
+            ):
+                raise ValueError(
+                    "policy.keep_model_on_gpu requires synchronous colocated full-parameter DDP without critic or reference"
+                )
 
         flashreinforce = self.trainer.algorithm.flashreinforce
         rollout_is = self.trainer.algorithm.rollout_is

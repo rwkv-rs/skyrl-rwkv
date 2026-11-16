@@ -48,6 +48,7 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     pack_routed_experts,
     pack_sample_support,
     pack_sample_support_logprobs,
+    pack_sampled_logprobs,
 )
 from skyrl.backends.skyrl_train.inference_servers.protocols import ServerActorProtocol
 from skyrl.backends.skyrl_train.utils.sample_support import (
@@ -625,6 +626,16 @@ class VLLMServerActor(ServerActorProtocol):
             cache_salt = body.get("cache_salt")
 
             capture_sample_support = body.get("return_sample_support", False)
+            compact_logprobs = body.get("return_compact_logprobs", False)
+            if compact_logprobs:
+                if capture_sample_support or sampling_params_dict.get("logprobs") != 0:
+                    raise HTTPException(
+                        status_code=400, detail="Compact sampled logprobs require logprobs=0 without support replay"
+                    )
+                sampling_params_dict["flat_logprobs"] = True
+                sampling_params_dict["output_kind"] = RequestOutputKind.FINAL_ONLY
+                if not sampling_params_dict.get("stop"):
+                    sampling_params_dict.setdefault("detokenize", False)
             if capture_sample_support:
                 # Capture support independently from sampling.  In particular, a
                 # rollout may keep top_k=-1 while requesting a diagnostic top-k
@@ -678,7 +689,14 @@ class VLLMServerActor(ServerActorProtocol):
             logprobs = None
             packed_sample_support = None
             packed_sample_support_logprobs = None
-            if capture_sample_support:
+            packed_logprobs = None
+            if compact_logprobs:
+                if resp.logprobs is None:
+                    raise HTTPException(status_code=500, detail="Missing sampled logprobs")
+                packed_logprobs, num_clamped = pack_sampled_logprobs(token_ids_out, resp.logprobs)
+                if num_clamped:
+                    logger.warning(f"request {request_id}: clamped {num_clamped} sampled logprobs")
+            elif capture_sample_support:
                 content, sample_support = _sample_support_from_flat_logprobs(resp.logprobs, support_top_k)
                 logprobs = {"content": content}
                 packed_sample_support = pack_sample_support(sample_support)
@@ -702,6 +720,7 @@ class VLLMServerActor(ServerActorProtocol):
                         "token_ids": token_ids_out,
                         "finish_reason": finish_reason,
                         "logprobs": logprobs,
+                        PackedField.ROLLOUT_LOGPROBS.value: packed_logprobs,
                         PackedField.ROUTED_EXPERTS.value: routed_experts,
                         PackedField.ROLLOUT_SAMPLE_SUPPORT.value: packed_sample_support,
                         PackedField.ROLLOUT_SAMPLE_SUPPORT_LOGPROBS.value: packed_sample_support_logprobs,

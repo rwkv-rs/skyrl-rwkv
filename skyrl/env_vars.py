@@ -170,3 +170,42 @@ SKYRL_MEGATRON_RANDOM_INIT = str(os.environ.get("SKYRL_MEGATRON_RANDOM_INIT", "0
 
 For throughput/memory benchmarking (e.g. dummy SFT with random tokens), where only the architecture
 matters: ``model.path`` then needs just ``config.json`` and tokenizer files, no safetensors."""
+
+SKYRL_RWKV_LENGTH_BUCKET_SIZE = max(0, int(os.environ.get("SKYRL_RWKV_LENGTH_BUCKET_SIZE", "0")))
+"""Optional recurrent length bucket in tokens; zero retains 16-token alignment only."""
+
+SKYRL_BALANCED_DP_PACKING = os.environ.get("SKYRL_BALANCED_DP_PACKING", "0") == "1"
+"""Balance padded RWKV work across policy ranks when training against rollout logprobs."""
+
+SKYRL_RWKV_PREFETCH = os.environ.get("SKYRL_RWKV_PREFETCH", "0") == "1"
+"""Prefetch one tensor-only CPU microbatch through pinned memory for RWKV DDP."""
+
+SKYRL_RWKV_TRANSPOSED_GEMM_BACKEND = os.environ.get("SKYRL_RWKV_TRANSPOSED_GEMM_BACKEND", "tilelang")
+"""Select tilelang or cublas for RWKV transposed BF16 projections."""
+
+SKYRL_DEFER_LOSS_METRICS = os.environ.get("SKYRL_DEFER_LOSS_METRICS", "0") == "1"
+"""Defer RWKV PPO scalar conversion until microbatch metrics are reduced."""
+
+SKYRL_POLICY_ENTROPY_METRICS = os.environ.get("SKYRL_POLICY_ENTROPY_METRICS", "1") == "1"
+"""Compute policy entropy for diagnostics; entropy loss always requires entropy."""
+
+SKYRL_ROLLOUT_LOGPROB_DIFF_METRICS = os.environ.get("SKYRL_ROLLOUT_LOGPROB_DIFF_METRICS", "1") == "1"
+"""Compute per-microbatch differences between training and rollout logprobs."""
+
+SKYRL_COMPACT_ROLLOUT_LOGPROBS = os.environ.get("SKYRL_COMPACT_ROLLOUT_LOGPROBS", "0") == "1"
+"""Transport sampled-token FP32 logprobs as a packed array when logprobs=0."""
+
+SKYRL_ROLLOUT_ARCHIVE = os.environ.get("SKYRL_ROLLOUT_ARCHIVE")
+"""Optional persistent directory for generated and completed rollout artifacts."""
+
+SKYRL_ISOLATED_MATH_SCORING = os.environ.get("SKYRL_ISOLATED_MATH_SCORING", "0") == "1"
+"""Enable Linux subprocess isolation for strict mathematical scoring."""
+
+SKYRL_MATH_WORKERS = int(os.environ.get("SKYRL_MATH_WORKERS", "8"))
+"""Maximum concurrent isolated mathematical scoring workers."""
+
+SKYRL_MATH_TIMEOUT_SECONDS = max(0.1, float(os.environ.get("SKYRL_MATH_TIMEOUT_SECONDS", "3")))
+"""Deadline for an isolated scoring attempt; timeouts receive reward zero."""
+
+SKYRL_MATH_ARCHIVE = os.environ.get("SKYRL_MATH_ARCHIVE")
+"""Persistent scoring audit directory, required when isolated scoring is enabled."""

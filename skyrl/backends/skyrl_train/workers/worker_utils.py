@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Dict, Iterator, List, Optional
 
 import torch
@@ -25,6 +26,24 @@ from skyrl.train.dataset.replay_buffer import Experience
 # Summing it would multiply the reported value by the microbatch (and DP) count -- e.g. a true
 # ~0.5 nats reads as ~44. Keep these averaged regardless of `sum_loss_metrics`.
 MEAN_LOSS_METRICS = frozenset({"mtp_loss", "draft_loss"})
+RWKV_KERNEL_MAX_ROWS = 65535
+RWKV_KERNEL_CHUNK_LENGTH = 16
+_configured_bucket_size = max(0, int(os.environ.get("SKYRL_RWKV_LENGTH_BUCKET_SIZE", "0")))
+RWKV_LENGTH_BUCKET_SIZE = (
+    math.ceil(_configured_bucket_size / RWKV_KERNEL_CHUNK_LENGTH) * RWKV_KERNEL_CHUNK_LENGTH
+    if _configured_bucket_size > RWKV_KERNEL_CHUNK_LENGTH
+    else _configured_bucket_size
+)
+
+
+def rwkv_padded_length(token_count: int) -> int:
+    """Return recurrent kernel length after 16-token alignment and bucketing."""
+    aligned = math.ceil(int(token_count) / RWKV_KERNEL_CHUNK_LENGTH) * RWKV_KERNEL_CHUNK_LENGTH
+    if RWKV_LENGTH_BUCKET_SIZE > RWKV_KERNEL_CHUNK_LENGTH:
+        aligned = math.ceil(aligned / RWKV_LENGTH_BUCKET_SIZE) * RWKV_LENGTH_BUCKET_SIZE
+    return aligned
+
+
 # Per-micro-batch abs diff between train-step and rollout logprobs. The moments (`_mean`,
 # `_sq_mean`) and `_max`/`_min` reduce correctly across micro-batches, DP ranks, and
 # mini-batches; the std is reconstructed from the moments downstream.
@@ -51,6 +70,8 @@ def compute_minibatch_rollout_logprob_diff_metrics(
     action_log_probs: torch.Tensor,
     rollout_logprobs: Optional[torch.Tensor],
     loss_mask: Optional[torch.Tensor],
+    *,
+    defer_metrics: bool = False,
 ) -> Dict[str, float]:
     """Per-micro-batch abs diff between the train-step and rollout logprobs.
 
@@ -64,14 +85,17 @@ def compute_minibatch_rollout_logprob_diff_metrics(
     """
     if rollout_logprobs is None:
         return {}
+    if os.environ.get("SKYRL_ROLLOUT_LOGPROB_DIFF_METRICS", "1") != "1":
+        return {}
     abs_diff = (action_log_probs - rollout_logprobs).abs()
     masked_abs_diff = abs_diff if loss_mask is None else abs_diff * loss_mask
-    return {
-        MINIBATCH_ROLLOUT_LOGPROB_DIFF_MEAN_KEY: masked_mean(abs_diff, loss_mask).item(),
-        MINIBATCH_ROLLOUT_LOGPROB_DIFF_SQ_MEAN_KEY: masked_mean(abs_diff.square(), loss_mask).item(),
-        MINIBATCH_ROLLOUT_LOGPROB_DIFF_MAX_KEY: masked_abs_diff.max().item(),
-        MINIBATCH_ROLLOUT_LOGPROB_DIFF_MIN_KEY: masked_abs_diff.min().item(),
+    metrics = {
+        MINIBATCH_ROLLOUT_LOGPROB_DIFF_MEAN_KEY: masked_mean(abs_diff, loss_mask),
+        MINIBATCH_ROLLOUT_LOGPROB_DIFF_SQ_MEAN_KEY: masked_mean(abs_diff.square(), loss_mask),
+        MINIBATCH_ROLLOUT_LOGPROB_DIFF_MAX_KEY: masked_abs_diff.max(),
+        MINIBATCH_ROLLOUT_LOGPROB_DIFF_MIN_KEY: masked_abs_diff.min(),
     }
+    return metrics if defer_metrics else {key: value.item() for key, value in metrics.items()}
 
 
 def reduce_metrics(metrics: Dict[str, List[float]], sum_loss_metrics: bool = False) -> Dict[str, float]:
@@ -91,8 +115,21 @@ def reduce_metrics(metrics: Dict[str, List[float]], sum_loss_metrics: bool = Fal
             (for pre-scaled policy losses).
     """
     reduced_metrics = dict()
+    deferred = {}
     for k, v in metrics.items():
         assert len(v) > 0, f"No metrics for key {k}"
+        tensors = [value for value in v if isinstance(value, torch.Tensor)]
+        if tensors:
+            values = torch.stack([torch.as_tensor(value, device=tensors[0].device).detach() for value in v])
+            if k.endswith("_max"):
+                deferred[k] = values.max()
+            elif k.endswith("_min"):
+                deferred[k] = values.min()
+            elif sum_loss_metrics and (k == "loss" or k.endswith("_loss")) and k not in MEAN_LOSS_METRICS:
+                deferred[k] = values.sum()
+            else:
+                deferred[k] = values.float().mean()
+            continue
         if not all(isinstance(x, (int, float)) for x in v):
             print(f"Metrics for key {k} are not all numbers: {v}")
             continue
@@ -104,6 +141,8 @@ def reduce_metrics(metrics: Dict[str, List[float]], sum_loss_metrics: bool = Fal
             reduced_metrics[k] = sum(v)
         else:
             reduced_metrics[k] = sum(v) / len(v)
+    if deferred:
+        reduced_metrics.update(zip(deferred, torch.stack(list(deferred.values())).cpu().tolist(), strict=True))
     return reduced_metrics
 
 
@@ -275,15 +314,19 @@ class TokenBasedBatchIterator(BaseBatchIterator):
         data: TrainingInputBatch,
         max_tokens_per_microbatch: int,
         use_padded_token_count: bool = False,
+        max_samples_per_microbatch: Optional[int] = None,
     ):
         """
         Args:
             data: The training input batch to chunk.
             max_tokens_per_microbatch: Maximum number of tokens per microbatch.
             use_padded_token_count: Bound padded recurrent work and group similar lengths.
+            max_samples_per_microbatch: Optional hard cap on rows within a padded microbatch.
         """
         super().__init__(data)
         self._max_tokens_per_microbatch = max_tokens_per_microbatch
+        if max_samples_per_microbatch is not None and max_samples_per_microbatch < 1:
+            raise ValueError("max_samples_per_microbatch must be positive")
 
         # Compute token counts per sample using attention_mask
         attention_mask = data["attention_mask"]
@@ -299,8 +342,13 @@ class TokenBasedBatchIterator(BaseBatchIterator):
             self._microbatches = []
             indices = []
             for index in sorted(range(len(self._token_counts)), key=self._token_counts.__getitem__):
-                length = self._token_counts[index]
-                if indices and (len(indices) + 1) * length > self._max_tokens_per_microbatch:
+                length = rwkv_padded_length(self._token_counts[index])
+                if length > RWKV_KERNEL_MAX_ROWS:
+                    raise ValueError("RWKV padded sequence exceeds the CUDA kernel row limit")
+                if indices and (
+                    (len(indices) + 1) * length > self._max_tokens_per_microbatch
+                    or (max_samples_per_microbatch is not None and len(indices) >= max_samples_per_microbatch)
+                ):
                     self._microbatches.append(indices)
                     indices = []
                 indices.append(index)
@@ -482,13 +530,27 @@ def get_microbatch_iterator(
 
     Args:
         data: The training input batch.
-        micro_batch_size: Number of samples per microbatch (used if max_tokens_per_microbatch <= 0).
+        micro_batch_size: Maximum samples per RWKV microbatch; fixed count for other models
+            when max_tokens_per_microbatch <= 0.
         max_tokens_per_microbatch: Maximum tokens per microbatch. If > 0, uses token-based batching.
-        use_padded_token_count: Bound batch size times maximum length, for RWKV.
+        use_padded_token_count: Bound RWKV padded work, including prompt and 16-token alignment,
+            to the CUDA row limit on both sample-based and token-based paths.
 
     Returns:
         A BaseBatchIterator instance.
     """
+    if use_padded_token_count:
+        budget = (
+            min(max_tokens_per_microbatch, RWKV_KERNEL_MAX_ROWS)
+            if max_tokens_per_microbatch > 0
+            else RWKV_KERNEL_MAX_ROWS
+        )
+        return TokenBasedBatchIterator(
+            data,
+            max_tokens_per_microbatch=budget,
+            use_padded_token_count=True,
+            max_samples_per_microbatch=micro_batch_size,
+        )
     if max_tokens_per_microbatch > 0:
         return TokenBasedBatchIterator(
             data,

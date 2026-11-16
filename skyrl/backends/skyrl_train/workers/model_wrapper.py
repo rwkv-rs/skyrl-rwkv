@@ -3,6 +3,9 @@
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/actor.py
 # https://github.com/OpenRLHF/OpenRLHF/blob/main/openrlhf/models/model.py
 
+import importlib
+import os
+import sys
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -47,9 +50,52 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
     logprobs_from_logits,
     logprobs_from_logits_vllm,
 )
+from skyrl.backends.skyrl_train.workers.worker_utils import (
+    RWKV_LENGTH_BUCKET_SIZE,
+    rwkv_padded_length,
+)
 
 # RwkvCache._chunk_length: full-sequence kernels operate on 16-token chunks.
 RWKV_CHUNK_LENGTH = 16
+
+
+def _patch_rwkv_transposed_gemm() -> None:
+    """Use cuBLAS for transposed BF16 projections when explicitly requested."""
+    backend = os.environ.get("SKYRL_RWKV_TRANSPOSED_GEMM_BACKEND", "tilelang")
+    if backend not in ("tilelang", "cublas"):
+        raise ValueError("SKYRL_RWKV_TRANSPOSED_GEMM_BACKEND must be tilelang or cublas")
+    if backend == "tilelang":
+        return
+    linear = importlib.import_module("flashrwkv2._internal.linear")
+    original = linear._forward
+    if getattr(original, "_skyrl_cublas_transposed", False):
+        return
+    torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
+
+    def forward(inputs, weight, bias, output_dtype, config=None):
+        enabled = os.environ.get("SKYRL_RWKV_TRANSPOSED_GEMM_BACKEND", "tilelang") == "cublas"
+        if (
+            enabled
+            and config is None
+            and inputs.is_cuda
+            and weight.is_cuda
+            and inputs.dtype == weight.dtype == torch.bfloat16
+            and inputs.ndim == weight.ndim == 2
+            and weight.stride(0) == 1
+            and output_dtype in (torch.bfloat16, torch.float32)
+        ):
+            result = torch.mm(inputs, weight.t(), out_dtype=torch.float32)
+            if bias is not None:
+                result.add_(bias.float())
+            return result.to(output_dtype)
+        return original(inputs, weight, bias, output_dtype, config=config)
+
+    forward._skyrl_cublas_transposed = True
+    for name, module in tuple(sys.modules.items()):
+        if name.startswith("flashrwkv2.") and getattr(module, "_forward", None) is original:
+            module._forward = forward
+    linear._forward = forward
+    logger.info("RWKV transposed BF16 GEMMs use cuBLAS with FP32 accumulation")
 
 
 def _patch_rwkv_training_state_contract() -> None:
@@ -370,6 +416,7 @@ class HFModelWrapper(nn.Module):
         model_config = getattr(self.model, "config", None)
         self.is_rwkv = getattr(model_config, "model_type", None) == "rwkv"
         if self.is_rwkv:
+            _patch_rwkv_transposed_gemm()
             _patch_rwkv_training_state_contract()
             if self.remove_microbatch_padding:
                 raise ValueError("RWKV does not support remove_microbatch_padding=true")
@@ -448,6 +495,7 @@ class HFModelWrapper(nn.Module):
         sample_support: Optional[PackedSampleSupport] = None,
         enable_score_centering: bool = False,
         response_mask: Optional[torch.Tensor] = None,
+        sequence_lengths: Optional[list[int]] = None,
     ) -> torch.Tensor:
         """Run independent recurrent streams without left padding."""
         batch_size, padded_length = sequences.shape
@@ -476,28 +524,39 @@ class HFModelWrapper(nn.Module):
             # earlier logits in a causal recurrent model.
             buckets = ((valid_lengths, torch.arange(batch_size, device=sequences.device)),)
         else:
+            if RWKV_LENGTH_BUCKET_SIZE > RWKV_CHUNK_LENGTH:
+                bucket_ids = torch.tensor(
+                    [rwkv_padded_length(length) for length in valid_lengths.tolist()],
+                    device=valid_lengths.device,
+                    dtype=torch.long,
+                )
+            else:
+                bucket_ids = valid_lengths
             buckets = (
                 (
-                    valid_lengths[valid_lengths == sequence_length],
-                    torch.nonzero(valid_lengths == sequence_length, as_tuple=True)[0],
+                    valid_lengths[bucket_ids == bucket_length],
+                    torch.nonzero(bucket_ids == bucket_length, as_tuple=True)[0],
                 )
-                for sequence_length in valid_lengths.unique(sorted=True)
+                for bucket_length in bucket_ids.unique(sorted=True)
             )
 
         for bucket_lengths, bucket_indices in buckets:
-            bucket_length = int(bucket_lengths.max().item())
-            if not self.rwkv_chunk_size:
-                bucket_length = (bucket_length + RWKV_CHUNK_LENGTH - 1) // RWKV_CHUNK_LENGTH * RWKV_CHUNK_LENGTH
+            bucket_indices_cpu = bucket_indices.tolist()
+            bucket_lengths_cpu = (
+                [sequence_lengths[index] for index in bucket_indices_cpu]
+                if sequence_lengths is not None
+                else bucket_lengths.tolist()
+            )
+            bucket_length = rwkv_padded_length(max(bucket_lengths_cpu))
             if self.rwkv_chunk_size and torch.distributed.is_available() and torch.distributed.is_initialized():
                 # Each FSDP rank must enter the same number of chunk forwards and recomputations.
                 global_length = bucket_lengths.max().clone()
                 torch.distributed.all_reduce(global_length, op=torch.distributed.ReduceOp.MAX)
-                bucket_length = int(global_length.item())
+                bucket_length = rwkv_padded_length(int(global_length.item()))
             bucket_sequences = sequences.new_zeros((bucket_indices.numel(), bucket_length))
-            for bucket_row, (sequence_index, sequence_length_tensor) in enumerate(
-                zip(bucket_indices, bucket_lengths, strict=True)
+            for bucket_row, (sequence_index, sequence_length) in enumerate(
+                zip(bucket_indices_cpu, bucket_lengths_cpu, strict=True)
             ):
-                sequence_length = int(sequence_length_tensor.item())
                 bucket_sequences[bucket_row, :sequence_length] = sequences[sequence_index, -sequence_length:]
             bucket_labels = torch.roll(bucket_sequences, shifts=-1, dims=1)
             if self.rwkv_chunk_size and not enable_score_centering:
@@ -506,8 +565,8 @@ class HFModelWrapper(nn.Module):
                 )
                 bucket_log_probs = torch.stack(
                     [
-                        nn.functional.pad(row[: int(length.item())], (padded_length - int(length.item()), 0))
-                        for row, length in zip(bucket_log_probs, bucket_lengths, strict=True)
+                        nn.functional.pad(row[:length], (padded_length - length, 0))
+                        for row, length in zip(bucket_log_probs, bucket_lengths_cpu, strict=True)
                     ]
                 )
                 if log_probs is None:
@@ -516,8 +575,8 @@ class HFModelWrapper(nn.Module):
                 if compute_entropy:
                     bucket_entropy = torch.stack(
                         [
-                            nn.functional.pad(row[: int(length.item())], (padded_length - int(length.item()), 0))
-                            for row, length in zip(bucket_entropy, bucket_lengths, strict=True)
+                            nn.functional.pad(row[:length], (padded_length - length, 0))
+                            for row, length in zip(bucket_entropy, bucket_lengths_cpu, strict=True)
                         ]
                     )
                     if entropy is None:
@@ -584,8 +643,8 @@ class HFModelWrapper(nn.Module):
             else:
                 bucket_log_probs = torch.stack(
                     [
-                        nn.functional.pad(row[: int(length.item())], (padded_length - int(length.item()), 0))
-                        for row, length in zip(bucket_log_probs, bucket_lengths, strict=True)
+                        nn.functional.pad(row[:length], (padded_length - length, 0))
+                        for row, length in zip(bucket_log_probs, bucket_lengths_cpu, strict=True)
                     ]
                 )
             if log_probs is None:
@@ -682,6 +741,7 @@ class HFModelWrapper(nn.Module):
         enable_sample_support_replay: bool = False,
         enable_score_centering: bool = False,
         response_mask: Optional[torch.Tensor] = None,
+        sequence_lengths: Optional[list[int]] = None,
     ) -> torch.Tensor:
         """Returns action log probs"""
         if self.is_rwkv:
@@ -698,6 +758,7 @@ class HFModelWrapper(nn.Module):
                 sample_support=sample_support,
                 enable_score_centering=enable_score_centering,
                 response_mask=response_mask,
+                sequence_lengths=sequence_lengths,
             )
 
         has_image_inputs = pixel_values is not None or image_grid_thw is not None

@@ -7,12 +7,19 @@ For details, see https://docs.skyrl.ai/docs/tutorials/skyrl_gym_generator
 
 import asyncio
 import copy
+import gzip
+import json
+import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
+from functools import partial
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 from uuid import uuid4
 
+import numpy as np
 import torch
 from loguru import logger
 from tqdm.asyncio import tqdm
@@ -50,6 +57,15 @@ from skyrl.train.generators.utils import (
 )
 from skyrl_gym.envs.base_text_env import BaseTextEnvStepOutput
 
+_ROLLOUT_ARCHIVE_LOCK = threading.Lock()
+
+
+def _archive_rollout_event(event):
+    directory = Path(os.environ["SKYRL_ROLLOUT_ARCHIVE"])
+    directory.mkdir(parents=True, exist_ok=True)
+    with _ROLLOUT_ARCHIVE_LOCK, (directory / "trajectories.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"time": time.time(), **event}, ensure_ascii=False) + "\n")
+
 
 @dataclass
 class TrajectoryOutput:
@@ -72,6 +88,40 @@ class TrajectoryOutput:
     # Wall-clock seconds spent in each phase. "llm" is time in inference-engine calls, "env" is
     # time in env.step. Field is None if any loop did not record a split.
     time_splits: Optional[Dict[str, float]] = None
+
+
+@dataclass(frozen=True)
+class SpilledTrajectoryOutput:
+    path: str
+    sequence_reward: float
+    response_length: int
+
+
+def _spill_trajectory_output(output: TrajectoryOutput, directory: str) -> SpilledTrajectoryOutput:
+    compact = copy.copy(output)
+    compact.response_ids = np.asarray(output.response_ids, dtype=np.int32)
+    compact.prompt_ids = np.asarray(output.prompt_ids, dtype=np.int32)
+    compact.loss_mask = np.asarray(output.loss_mask, dtype=np.uint8)
+    if isinstance(output.reward, (list, np.ndarray)):
+        compact.reward = np.asarray(output.reward, dtype=np.float32)
+        reward = float(compact.reward.sum(dtype=np.float64))
+    else:
+        reward = float(output.reward)
+    if output.rollout_logprobs is not None:
+        compact.rollout_logprobs = np.asarray(output.rollout_logprobs, dtype=np.float32)
+    destination = Path(directory)
+    destination.mkdir(parents=True, exist_ok=True)
+    path = destination / f"{uuid4().hex}.pt.gz"
+    temporary = Path(str(path) + ".tmp")
+    with gzip.open(temporary, "xb", compresslevel=1) as stream:
+        torch.save(compact, stream)
+    os.replace(temporary, path)
+    return SpilledTrajectoryOutput(str(path), reward, len(compact.response_ids))
+
+
+def _restore_trajectory_output(reference: SpilledTrajectoryOutput) -> TrajectoryOutput:
+    with gzip.open(reference.path, "rb") as stream:
+        return torch.load(stream, map_location="cpu", weights_only=False)
 
 
 @dataclass
@@ -279,7 +329,9 @@ class SkyRLGymGenerator(GeneratorInterface):
     async def _run_in_executor_if_available(self, func, *args, **kwargs):
         if (executor := self.env_executor) is not None:
             loop = asyncio.get_running_loop()
-            return await loop.run_in_executor(executor, func, *args, **kwargs)
+            return await loop.run_in_executor(executor, partial(func, *args, **kwargs))
+        elif os.environ.get("SKYRL_ISOLATED_MATH_SCORING") == "1":
+            return await asyncio.to_thread(func, *args, **kwargs)
         else:
             return func(*args, **kwargs)
 
@@ -368,6 +420,7 @@ class SkyRLGymGenerator(GeneratorInterface):
         trajectory_id: Optional[TrajectoryID] = None,
         cache_salt: Optional[str] = None,
         training_phase: TrainingPhase = TRAINING_PHASE_TRAIN,
+        spill_output_dir: Optional[str] = None,
     ) -> Union[TrajectoryOutput, StepWiseOutput]:
         """
         Multi-turn generation loop that executes a single trajectory.
@@ -567,7 +620,8 @@ class SkyRLGymGenerator(GeneratorInterface):
                             response_logprobs.append(0.0)
                         added_eos = True
 
-                self._set_generation_metadata(
+                await self._run_in_executor_if_available(
+                    self._set_generation_metadata,
                     env,
                     output,
                     output_ids,
@@ -795,10 +849,59 @@ class SkyRLGymGenerator(GeneratorInterface):
             )
             agent_loop_output.e2e_time = time.monotonic() - agent_loop_start_time
             agent_loop_output.time_splits = time_splits
+            if os.environ.get("SKYRL_ROLLOUT_ARCHIVE") and isinstance(agent_loop_output, TrajectoryOutput):
+                reward = agent_loop_output.reward
+                await asyncio.to_thread(
+                    _archive_rollout_event,
+                    {
+                        "event": "scored",
+                        "session_id": session_id,
+                        "cache_salt": cache_salt,
+                        "reward": float(sum(reward) if isinstance(reward, list) else reward),
+                        "stop_reason": agent_loop_output.stop_reason,
+                        "response_tokens": len(agent_loop_output.response_ids),
+                        "trainable_tokens": sum(agent_loop_output.loss_mask),
+                        "env_metrics": agent_loop_output.env_metrics,
+                        "e2e_seconds": agent_loop_output.e2e_time,
+                        "time_splits": time_splits,
+                    },
+                )
+            if spill_output_dir is not None:
+                if not isinstance(agent_loop_output, TrajectoryOutput):
+                    raise ValueError("Spilled outputs require complete non-step-wise trajectories")
+                if self.generator_cfg.zero_reward_on_non_stop and agent_loop_output.stop_reason != "stop":
+                    reward = agent_loop_output.reward
+                    agent_loop_output.reward = [0.0] * len(reward) if isinstance(reward, list) else 0.0
+                if self.generator_cfg.apply_overlong_filtering and agent_loop_output.stop_reason != "stop":
+                    agent_loop_output.loss_mask = [0] * len(agent_loop_output.loss_mask)
+                reference = await asyncio.to_thread(_spill_trajectory_output, agent_loop_output, spill_output_dir)
+                if os.environ.get("SKYRL_ROLLOUT_ARCHIVE"):
+                    await asyncio.to_thread(
+                        _archive_rollout_event,
+                        {
+                            "event": "spilled",
+                            "session_id": session_id,
+                            "cache_salt": cache_salt,
+                            "path": reference.path,
+                        },
+                    )
+                return reference
             return agent_loop_output
 
         finally:
-            await self.inference_engine_client.finish_session(session_id)
+            cleanup_start = time.monotonic()
+            try:
+                await self.inference_engine_client.finish_session(session_id)
+            finally:
+                if os.environ.get("SKYRL_ROLLOUT_ARCHIVE"):
+                    await asyncio.to_thread(
+                        _archive_rollout_event,
+                        {
+                            "event": "session_cleanup_returned",
+                            "session_id": session_id,
+                            "seconds": time.monotonic() - cleanup_start,
+                        },
+                    )
 
     def _build_per_token_rewards(
         self, per_step_rewards: List[Tuple[float, Optional[int]]], response_ids: List[int], appended_eos_token: bool
@@ -983,7 +1086,8 @@ class SkyRLGymGenerator(GeneratorInterface):
         )
 
         for i, (output, response, env, env_class) in enumerate(zip(outputs, responses, envs, env_classes)):
-            self._set_generation_metadata(
+            await self._run_in_executor_if_available(
+                self._set_generation_metadata,
                 env,
                 output,
                 response,
@@ -1056,6 +1160,9 @@ class SkyRLGymGenerator(GeneratorInterface):
             GeneratorOutput
         """
         prompts = input_batch["prompts"]
+        spill_output_dir = input_batch.get("spill_output_dir")
+        if spill_output_dir is not None and (self.batched or self.generator_cfg.step_wise_trajectories):
+            raise ValueError("Spilled outputs require unbatched non-step-wise generation")
         env_classes = input_batch["env_classes"]
         env_extras = input_batch["env_extras"]
         trajectory_ids = input_batch.get("trajectory_ids", None)
@@ -1100,6 +1207,7 @@ class SkyRLGymGenerator(GeneratorInterface):
                     trajectory_id=trajectory_ids[i] if trajectory_ids is not None else None,
                     cache_salt=cache_salt,
                     training_phase=training_phase,
+                    **({"spill_output_dir": spill_output_dir} if spill_output_dir is not None else {}),
                 )
             )
 
@@ -1110,6 +1218,20 @@ class SkyRLGymGenerator(GeneratorInterface):
             mininterval=5,
             disable=disable_tqdm,
         )
+        if spill_output_dir is not None:
+            return {"spilled_trajectories": all_outputs, "rollout_metrics": None}
+        return self._assemble_generator_output(all_outputs, env_classes, trajectory_ids, sampling_params)
+
+    def restore_spilled_outputs(self, references, generator_input):
+        outputs = [_restore_trajectory_output(reference) for reference in references]
+        return self._assemble_generator_output(
+            outputs,
+            generator_input["env_classes"],
+            generator_input.get("trajectory_ids"),
+            generator_input.get("sampling_params"),
+        )
+
+    def _assemble_generator_output(self, all_outputs, env_classes, trajectory_ids, sampling_params):
         # Per-trajectory end-to-end generation times (one entry per prompt, preserving input order).
         # ``e2e_time`` is optional for agent loops; if any trajectory did not record it, we omit the
         # field entirely rather than emit a partially-populated list.
@@ -1267,7 +1389,9 @@ class SkyRLGymGenerator(GeneratorInterface):
         """
         for i, stop_reason in enumerate(stop_reasons):
             if stop_reason != "stop":
-                if isinstance(rewards[i], list):
+                if isinstance(rewards[i], np.ndarray):
+                    rewards[i] = np.zeros_like(rewards[i])
+                elif isinstance(rewards[i], list):
                     rewards[i] = [0.0] * len(rewards[i])
                 else:
                     rewards[i] = 0.0

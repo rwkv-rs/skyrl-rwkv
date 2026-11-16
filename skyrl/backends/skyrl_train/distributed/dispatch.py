@@ -14,6 +14,10 @@ from skyrl.backends.skyrl_train.training_batch import (
     TrainingOutputBatch,
     pad_training_input_batch,
 )
+from skyrl.backends.skyrl_train.workers.worker_utils import (
+    RWKV_KERNEL_MAX_ROWS,
+    rwkv_padded_length,
+)
 
 
 @dataclass
@@ -123,11 +127,47 @@ class MeshDispatch(Dispatch):
         return object_refs
 
     @classmethod
+    def _balanced_row_order(cls, attention_mask: torch.Tensor, dp_size: int) -> list[int]:
+        """Assign rows to DP ranks with equal padded RWKV recurrent work."""
+        lengths = attention_mask.sum(dim=1).cpu().tolist()
+        row_count = len(lengths)
+        if row_count % dp_size != 0:
+            raise ValueError("balanced RWKV dispatch requires rows divisible by DP size")
+        rows_per_rank = row_count // dp_size
+        padded_lengths = [rwkv_padded_length(length) for length in lengths]
+
+        def estimate_work(indices: list[int]) -> int:
+            ordered = sorted((padded_lengths[index] for index in indices))
+            total = 0
+            group: list[int] = []
+            for length in ordered:
+                if length > RWKV_KERNEL_MAX_ROWS:
+                    raise ValueError("RWKV padded sequence exceeds the CUDA kernel row limit")
+                if group and (len(group) >= 4 or (len(group) + 1) * length > RWKV_KERNEL_MAX_ROWS):
+                    total += len(group) * group[-1]
+                    group = []
+                group.append(length)
+            if group:
+                total += len(group) * group[-1]
+            return total
+
+        bins: list[list[int]] = [[] for _ in range(dp_size)]
+        for index in sorted(range(row_count), key=padded_lengths.__getitem__, reverse=True):
+            candidates = [rank for rank, rows in enumerate(bins) if len(rows) < rows_per_rank]
+            rank = min(
+                candidates,
+                key=lambda candidate: (estimate_work(bins[candidate] + [index]), len(bins[candidate]), candidate),
+            )
+            bins[rank].append(index)
+        return [index for rows in bins for index in rows]
+
+    @classmethod
     def stage_chunks(
         cls,
         dp_size: int,
         data: TrainingInputBatch,
         mini_batch_boundaries: List[Tuple[int, int]],
+        balance_rwkv: bool = False,
     ) -> List[List[ObjectRef]]:
         """Pre-stage mini-batch chunks into the object store.
 
@@ -153,6 +193,16 @@ class MeshDispatch(Dispatch):
             pad_size = (-mb_size) % dp_size
             if pad_size > 0:
                 mini_batch = pad_training_input_batch(mini_batch, pad_size)
+
+            if balance_rwkv and mini_batch.get("attention_mask") is not None:
+                order = cls._balanced_row_order(mini_batch["attention_mask"], dp_size)
+                order_tensor = torch.tensor(order, dtype=torch.long, device=mini_batch["attention_mask"].device)
+                reordered = {}
+                for key, value in mini_batch.items():
+                    reordered[key] = None if value is None else value[order_tensor]
+                balanced_batch = TrainingInputBatch(reordered)
+                balanced_batch.metadata = mini_batch.metadata
+                mini_batch = balanced_batch
 
             mini_batch_size = len(mini_batch)
             assert (
@@ -346,5 +396,5 @@ def loss_fn_outputs_to_tensor(
     Returns:
         ``torch.Tensor[B, T_max]`` right-padded with ``pad_value``.
     """
-    seqs = [torch.tensor(o[key], dtype=dtype, device=device) for o in outputs]
+    seqs = [torch.as_tensor(output[key], dtype=dtype, device=device) for output in outputs]
     return torch.nn.utils.rnn.pad_sequence(seqs, batch_first=True, padding_value=pad_value)

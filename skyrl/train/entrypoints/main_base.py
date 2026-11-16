@@ -295,6 +295,12 @@ class BasePPOExp:
                 PolicyWorker,
                 RefWorker,
             )
+        elif self.cfg.trainer.strategy == "ddp":
+            from skyrl.backends.skyrl_train.workers.ddp.ddp_worker import (
+                CriticWorker,
+                PolicyWorker,
+                RefWorker,
+            )
         elif self.cfg.trainer.strategy == "megatron":
             from skyrl.backends.skyrl_train.workers.megatron.megatron_worker import (
                 CriticWorker,

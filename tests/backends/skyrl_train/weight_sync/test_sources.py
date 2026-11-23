@@ -134,7 +134,7 @@ class TestFsdpLoraWeightSource:
             ["r_proj", "k_proj", "v_proj", "o_proj", "mlp.key", "mlp.value", "lm_head"],
         ],
     )
-    def test_rwkv_streams_effective_weights_for_vllm(self, targets):
+    def test_rwkv_streams_frozen_base_and_fp32_adapters(self, targets):
         from peft import LoraConfig, get_peft_model
         from transformers import RwkvConfig, RwkvForCausalLM
 
@@ -159,23 +159,16 @@ class TestFsdpLoraWeightSource:
         before = {name: value.clone() for name, value in model.state_dict().items()}
         meta, pairs = _assert_channels_agree(FsdpLoraWeightSource(model, torch.bfloat16))
         streamed = dict(pairs)
-        assert not any("lora_" in name or "base_layer" in name or ".default." in name for name in streamed)
-        assert {item.dtype for item in meta} == {torch.bfloat16}
-        # ``FsdpLoraWeightSource`` streams onto the caller's CUDA device and
-        # sends the same normalized merge used by HF export.
+        assert not any("base_layer" in name or ".default." in name for name in streamed)
         for projection in ("key", "value"):
             layer = getattr(model.get_base_model().model.layers[0].mlp, projection)
             prefix = f"model.layers.0.mlp.{projection}"
-            weight_a = layer.lora_A["default"].weight.float()
-            expected = (
-                (
-                    layer.base_layer.weight.float()
-                    + layer.lora_B["default"].weight.float() @ (weight_a / (weight_a.norm(dim=0, keepdim=True) + 1e-6))
-                )
-                .to(torch.bfloat16)
-                .to(streamed[f"{prefix}.weight"].device)
-            )
-            torch.testing.assert_close(streamed[f"{prefix}.weight"], expected, rtol=0, atol=0)
+            assert torch.equal(streamed[f"{prefix}.weight"], layer.base_layer.weight)
+            for adapter in ("A", "B"):
+                expected = getattr(layer, f"lora_{adapter}")["default"].weight
+                assert streamed[f"{prefix}.lora_{adapter}.weight"].dtype == torch.float32
+                assert torch.equal(streamed[f"{prefix}.lora_{adapter}.weight"], expected.float())
+        assert {item.dtype for item in meta if ".lora_" not in item.name} == {torch.bfloat16}
         for name, value in model.state_dict().items():
             torch.testing.assert_close(value, before[name], rtol=0, atol=0)
 
@@ -193,15 +186,17 @@ class TestFsdpLoraWeightSource:
 
     def test_prefix_and_next_sync_use_updated_adapter(self):
         model, layer = self._model()
-        with torch.no_grad():
-            layer.lora_B["default"].weight.fill_(1.0)
         source = FsdpLoraWeightSource(model, torch.bfloat16, weight_prefix="language_model.")
-        assert [item.name for item in source.metadata] == ["language_model.0.weight"]
-        first = dict(source.iter_full())["language_model.0.weight"]
+        assert [item.name for item in source.metadata] == [
+            "language_model.0.weight",
+            "language_model.0.lora_A.weight",
+            "language_model.0.lora_B.weight",
+        ]
+        first = dict(source.iter_full())["language_model.0.lora_B.weight"]
         with torch.no_grad():
             layer.lora_B["default"].weight.mul_(2)
-        second = dict(source.iter_full())["language_model.0.weight"]
-        assert not torch.equal(second, first)
+        second = dict(source.iter_full())["language_model.0.lora_B.weight"]
+        assert torch.equal(second, 2 * first)
 
     def test_hf_export_merges_normalized_adapter_in_fp32(self):
         from skyrl.backends.skyrl_train.distributed.fsdp_utils import (

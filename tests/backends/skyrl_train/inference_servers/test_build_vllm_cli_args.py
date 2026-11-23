@@ -376,11 +376,23 @@ def test_fsdp_nora_serves_complete_weights_instead_of_adapter(use_nora):
         [
             "trainer.policy.model.path=rwkv-student",
             "trainer.policy.model.lora.rank=8",
+            "trainer.policy.model.lora.target_modules=[r_proj,mlp.key,mlp.value,lm_head]",
             f"trainer.policy.model.lora.use_nora={str(use_nora).lower()}",
         ]
     )
     assert _uses_lora_weight_sync(cfg) is not use_nora
     assert resolve_policy_model_name(cfg) == ("rwkv-student" if use_nora else SKYRL_LORA_ADAPTER_NAME)
+    args = build_vllm_cli_args(cfg)
+    if use_nora:
+        assert not args.enable_lora
+        assert args.hf_overrides["rwkv_lora"] == {
+            "r": 8,
+            "lora_alpha": cfg.trainer.policy.model.lora.alpha,
+            "use_nora": True,
+            "target_modules": list(cfg.trainer.policy.model.lora.target_modules),
+        }
+    else:
+        assert "rwkv_lora" not in (args.hf_overrides or {})
 
 
 def test_serialized_fp8_threads_the_wire_format_into_the_ignore_list(monkeypatch):

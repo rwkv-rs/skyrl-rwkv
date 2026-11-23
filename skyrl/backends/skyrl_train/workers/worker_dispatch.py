@@ -956,7 +956,8 @@ class WorkerDispatch:
             await self._inference_engine_client.wake_up(tags=["kv_cache"])
         else:
             strategy = self.cfg.trainer.strategy
-            is_lora = self.cfg.trainer.policy.model.lora.rank > 0
+            lora_cfg = self.cfg.trainer.policy.model.lora
+            is_lora = lora_cfg.rank > 0 and not lora_cfg.use_nora
             if is_lora and not (
                 strategy == "megatron" and self.cfg.trainer.policy.megatron_config.lora_config.merge_lora
             ):

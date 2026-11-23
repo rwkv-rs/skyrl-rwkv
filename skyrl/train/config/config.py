@@ -109,8 +109,8 @@ class SkyRLLoraConfig(BaseConfig):
     use_nora: bool = False
     """Use AntiDoom's normalized LoRA implementation with the NoRA PEFT fork.
 
-    RWKV FSDP only. Requires positive ``rank``. Weight sync and HF exports merge
-    the normalized adapter in FP32 before sending effective weights to vLLM.
+    RWKV FSDP only. Requires positive ``rank``. Weight sync sends the frozen base
+    and FP32 adapters to vLLM-RWKV; HF exports merge the normalized adapter in FP32.
     """
     lora_sync_path: str = "/tmp/skyrl_lora_sync"
     """Directory where LoRA adapter weights are saved and synchronized between the training and inference processes.

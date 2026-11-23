@@ -109,7 +109,7 @@ def _fft_dispatch_cfg(weight_sync_backend: str = "nccl") -> SimpleNamespace:
         trainer=SimpleNamespace(
             strategy="fsdp",
             policy=SimpleNamespace(
-                model=SimpleNamespace(lora=SimpleNamespace(rank=0)),
+                model=SimpleNamespace(lora=SimpleNamespace(rank=0, use_nora=False)),
                 megatron_config=SimpleNamespace(lora_config=SimpleNamespace(merge_lora=False)),
             ),
         ),
@@ -123,12 +123,15 @@ class TestSaveWeights:
     """Tests for `WorkerDispatch.save_weights_for_sampler`"""
 
     @pytest.mark.asyncio
-    async def test_non_colocated_calls_pause_and_resume(self):
+    @pytest.mark.parametrize("use_nora", [False, True])
+    async def test_non_colocated_calls_pause_and_resume(self, use_nora):
         from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
 
         dispatch = WorkerDispatch.__new__(WorkerDispatch)
         dispatch.colocate_all = False
         dispatch.cfg = _fft_dispatch_cfg()
+        dispatch.cfg.trainer.policy.model.lora.use_nora = use_nora
+        dispatch.cfg.trainer.policy.model.lora.rank = 4 if use_nora else 0
         dispatch._inference_engine_client = AsyncMock()
         dispatch._broadcast_to_inference_engines = MagicMock()
         dispatch._prepare_for_weight_sync = AsyncMock()

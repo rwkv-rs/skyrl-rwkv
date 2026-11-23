@@ -162,6 +162,7 @@ def mock_env_cfg():
 @pytest.mark.parametrize("training_phase", [TRAINING_PHASE_TRAIN, TRAINING_PHASE_EVAL])
 @pytest.mark.parametrize("batched", [False, True])
 @pytest.mark.parametrize("strict_mode", [False, True])
+@pytest.mark.parametrize("max_env_workers", [0, 2])
 @pytest.mark.parametrize(
     "response, response_ids, stop_reason, strict_reward",
     [
@@ -182,6 +183,7 @@ async def test_generate_prepared_gsm8k_reward_contract(
     training_phase,
     batched,
     strict_mode,
+    max_env_workers,
     response,
     response_ids,
     stop_reason,
@@ -192,7 +194,7 @@ async def test_generate_prepared_gsm8k_reward_contract(
     generator_cfg.use_conversation_multi_turn = False
     generator_cfg.preserve_truncated_action_mask = True
     generator_cfg.sampling_params.logprobs = 1
-    gym_cfg = SkyRLGymConfig(max_env_workers=0)
+    gym_cfg = SkyRLGymConfig(max_env_workers=max_env_workers)
     gym_cfg.gsm8k.strict_reward = strict_mode
     mock_tokenizer.decode.side_effect = lambda ids: response
     mock_llm.generate.return_value = {

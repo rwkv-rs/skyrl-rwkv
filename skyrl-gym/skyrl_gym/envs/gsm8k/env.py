@@ -51,14 +51,10 @@ class GSM8kEnv(BaseTextEnv):
         if not self.strict_reward:
             return utils.compute_score(action, self.ground_truth)
 
-        reward, self._strict_reward_details = utils.compute_strict_score(
-            action,
-            self.ground_truth,
-            ended_eod=self._generation_metadata["ended_eod"],
-            truncated=self._generation_metadata["truncated"],
-        )
-        self._strict_reward_details["stop_reason"] = self._generation_metadata["stop_reason"]
-        return reward
+        # The generator already scores this action in set_generation_metadata
+        # on its main thread. Math-Verify's signal timeout cannot run in the
+        # environment thread pool used for step().
+        return self._strict_reward_details["strict_reward"]
 
     def get_metrics(self) -> Dict[str, Any]:
         return dict(self._strict_reward_details) if self.strict_reward else {}

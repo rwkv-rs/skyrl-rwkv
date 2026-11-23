@@ -195,6 +195,7 @@ def test_rwkv_critic_rejects_incompatible_packing(kwargs):
 
 @pytest.fixture
 def rwkv_checkpoint(tmp_path):
+    pytest.importorskip("flashrwkv2", reason="RWKV7 checkpoints require the rwkv extra")
     from transformers import RwkvConfig, RwkvForCausalLM
 
     config = RwkvConfig(

@@ -1,6 +1,5 @@
 import pytest
 import torch
-from flash_attn.bert_padding import pad_input, unpad_input
 
 from skyrl.backends.skyrl_train.workers.model_wrapper import HFModelWrapper
 
@@ -24,7 +23,10 @@ def position_ids(attention_mask):
     return pos_ids
 
 
+@pytest.mark.vllm
 def test_flash_attention_sequence_packing(input_ids, attention_mask, position_ids):
+    from flash_attn.bert_padding import unpad_input
+
     input_ids_packed, nnz_indices, _, _, _ = unpad_input(input_ids.unsqueeze(-1), attention_mask=attention_mask)
     input_ids_packed = input_ids_packed.transpose(0, 1)
     position_ids_packed, _, _, _, _ = unpad_input(position_ids.unsqueeze(-1), attention_mask=attention_mask)
@@ -44,7 +46,10 @@ def test_flash_attention_sequence_packing(input_ids, attention_mask, position_id
     assert torch.equal(nnz_indices, expected_nnz_indices)
 
 
+@pytest.mark.vllm
 def test_flash_attention_sequence_unpacking(input_ids, attention_mask, position_ids):
+    from flash_attn.bert_padding import pad_input, unpad_input
+
     # pack
     input_ids_packed, nnz_indices, _, _, _ = unpad_input(input_ids.unsqueeze(-1), attention_mask=attention_mask)
     input_ids_packed = input_ids_packed.transpose(0, 1)

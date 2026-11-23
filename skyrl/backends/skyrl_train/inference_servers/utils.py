@@ -388,14 +388,13 @@ def build_vllm_cli_args(cfg: SkyRLTrainConfig) -> Namespace:
 
     engine_kwargs = get_config_as_dict(ie_cfg.engine_init_kwargs)
     _validate_logprobs_mode(
-        engine_kwargs, context="generator.inference_engine.engine_init_kwargs", expected=logprobs_mode
+        engine_kwargs, context="generator.inference_engine.engine_init_kwargs", expected=args.logprobs_mode
     )
     _apply_serialized_fp8_weight_sync_defaults(
         ie_cfg,
         engine_kwargs,
         cfg.trainer.policy.model.path,
     )
-    _apply_rwkv_lora_overrides(cfg, engine_kwargs)
     _apply_engine_init_kwargs(args, engine_kwargs)
 
     if args.enable_lora:

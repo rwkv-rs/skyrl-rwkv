@@ -39,7 +39,16 @@ def ragged_support(trajectories: PackedTensor | Sequence, logprobs: Sequence | N
 
 def dense(support: CompactSampleSupport, fill: int = -1) -> np.ndarray:
     """Expand CSR rows back into a ``[tokens, top_k]`` grid padded with ``fill``."""
-    grid = np.full((support.num_rows, support.top_k), fill, dtype=SAMPLE_SUPPORT_DTYPE)
-    columns = np.arange(support.token_ids.size) - np.repeat(support.offsets[:-1], support.row_lengths)
-    grid[np.repeat(np.arange(support.num_rows), support.row_lengths), columns] = support.token_ids
+    return _expand(support, support.token_ids, SAMPLE_SUPPORT_DTYPE, fill)
+
+
+def dense_logprobs(support: CompactSampleSupport, fill: float = float("-inf")) -> np.ndarray:
+    """Expand the sampler-logprob column back into a padded grid."""
+    return _expand(support, support.logprobs, SAMPLE_SUPPORT_LOGPROBS_DTYPE, fill)
+
+
+def _expand(support: CompactSampleSupport, members: np.ndarray, dtype, fill) -> np.ndarray:
+    grid = np.full((support.num_rows, support.top_k), fill, dtype=dtype)
+    columns = np.arange(members.size) - np.repeat(support.offsets[:-1], support.row_lengths)
+    grid[np.repeat(np.arange(support.num_rows), support.row_lengths), columns] = members
     return grid

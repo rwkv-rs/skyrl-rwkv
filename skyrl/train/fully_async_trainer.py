@@ -18,9 +18,9 @@ import math
 import os
 import sys
 import time
-from dataclasses import dataclass, replace
 from collections import defaultdict
 from contextlib import asynccontextmanager, nullcontext
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Set, Tuple
 
@@ -937,8 +937,6 @@ class FullyAsyncRayPPOTrainer(RayPPOTrainer):
                             self.all_metrics[f"pipeline/phase_pct/{phase_name}"] = (
                                 100.0 * phase_seconds / iteration_wall_clock
                             )
-                    self.tracker.log(self.all_metrics, step=self.global_step, commit=False)
-                    self.all_metrics = {}
                     self._training_wait_seconds = 0.0
                     self._training_wait_events = 0
 

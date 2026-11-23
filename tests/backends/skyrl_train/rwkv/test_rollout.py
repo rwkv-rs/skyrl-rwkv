@@ -1022,14 +1022,38 @@ def test_owned_engine_acceptance_precedes_dataset_generation(tmp_path, tokenizer
         assert not (tmp_path / "output/correct_counts_by_question.jsonl").exists()
 
 
+@pytest.fixture
+def preparation(monkeypatch):
+    import importlib
+    import importlib.util
+    import sys
+    from types import ModuleType
+    from unittest.mock import MagicMock
+
+    rwkv = ModuleType("vllm.model_executor.models.rwkv")
+    rwkv._load_flashrwkv2 = MagicMock()
+    compile_module = ModuleType("flashrwkv2.compile")
+    compile_module.load_extension = MagicMock()
+    flashrwkv2 = ModuleType("flashrwkv2")
+    flashrwkv2.compile = compile_module
+    for module in (rwkv, compile_module, flashrwkv2):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    common = importlib.import_module("examples.train.rwkv.train.common")
+    name = f"{common.__name__}.prepare_flashrwkv2"
+    spec = importlib.util.find_spec(name)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.setattr(common, "prepare_flashrwkv2", module, raising=False)
+    spec.loader.exec_module(module)
+    return module
+
+
 @pytest.mark.parametrize("entrypoint", ["prepare", "check"])
 @pytest.mark.parametrize("installed_commit", ["old-install", None])
 def test_rwkv_native_artifact_preflight_rejects_unmatched_install_before_loading(
-    tmp_path, monkeypatch, entrypoint, installed_commit
+    tmp_path, monkeypatch, entrypoint, installed_commit, preparation
 ):
     from unittest.mock import MagicMock
-
-    from examples.train.rwkv.train.common import prepare_flashrwkv2 as preparation
 
     (tmp_path / "pyproject.toml").write_text('[tool.uv.sources.vllm]\nrev = "project-pin"\n')
     monkeypatch.chdir(tmp_path)
@@ -1051,8 +1075,9 @@ def test_rwkv_native_artifact_preflight_rejects_unmatched_install_before_loading
     load.assert_not_called()
 
 
-def test_rwkv_native_artifact_environment_records_verified_installed_revision(tmp_path, monkeypatch, capsys):
-    from examples.train.rwkv.train.common import prepare_flashrwkv2 as preparation
+def test_rwkv_native_artifact_environment_records_verified_installed_revision(
+    tmp_path, monkeypatch, capsys, preparation
+):
 
     (tmp_path / "pyproject.toml").write_text('[tool.uv.sources.vllm]\nrev = "matched-install"\n')
     monkeypatch.chdir(tmp_path)

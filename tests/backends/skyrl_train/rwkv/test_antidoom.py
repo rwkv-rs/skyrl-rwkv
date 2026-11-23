@@ -701,14 +701,13 @@ def test_prepare_groups_siblings_and_keeps_original_validation_prompts(tmp_path,
 )
 @pytest.mark.parametrize("adapt_head", [False, True])
 def test_adapter_reference_reload_and_merged_logits_after_optimizer_step(tmp_path, monkeypatch, use_nora, adapt_head):
+    if use_nora:
+        pytest.importorskip("flashrwkv2", reason="NoRA requires the rwkv extra")
+
     from safetensors.torch import save_file
     from tokenizers import Tokenizer as RustTokenizer
     from tokenizers.models import WordLevel
     from transformers import AutoModelForCausalLM, PreTrainedTokenizerFast
-
-    from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
-        layered_summon_lora_params,
-    )
 
     torch.manual_seed(7)
     base = LlamaForCausalLM(
@@ -754,7 +753,7 @@ def test_adapter_reference_reload_and_merged_logits_after_optimizer_step(tmp_pat
     assert not torch.allclose(adapted, reference)
     adapter_path = tmp_path / "adapter"
     adapter_path.mkdir()
-    state = layered_summon_lora_params(model)
+    state = antidoom.collect_lora_params(model)
     assert state.keys() == {
         name.replace(".default.", ".") for name, param in model.named_parameters() if param.requires_grad
     }

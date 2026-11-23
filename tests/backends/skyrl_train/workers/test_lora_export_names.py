@@ -99,6 +99,7 @@ def test_full_weight_sync_uses_inference_namespace(monkeypatch, is_multimodal_lm
     model = SimpleNamespace(state_dict=lambda: {source_name: source_tensor})
     # Exercise the current source factory without initializing distributed workers.
     worker = object.__new__(FSDPPolicyWorkerBase)
+    worker.cfg = SimpleNamespace(policy=SimpleNamespace(model=SimpleNamespace(lora=SimpleNamespace(use_nora=False))))
     worker.model = SimpleNamespace(model=model)
     worker._is_multimodal_lm_only = is_multimodal_lm_only
     monkeypatch.setattr(sources_mod, "materialize_full_tensor", lambda tensor: tensor)

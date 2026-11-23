@@ -1005,6 +1005,7 @@ def test_critic_update_epochs_per_batch_multiplies_critic_optimizer_work():
 
     trainer = object.__new__(RayPPOTrainer)
     trainer.cfg = SkyRLTrainConfig()
+    trainer.cfg.trainer.algorithm.loss_reduction = "token_mean"
     trainer.cfg.trainer.critic.model.path = "critic"
     trainer.cfg.trainer.train_critic_and_policy_parallel = False
     trainer.cfg.trainer.update_epochs_per_batch = 1

@@ -194,6 +194,7 @@ def test_left_padded_rows_shift_the_row_id_channel_by_their_own_padding_width():
     assert actual[1, 0] == 0
 
 
+@pytest.mark.vllm
 def test_packed_microbatch_matches_the_padded_rectangle():
     """``remove_microbatch_padding`` reroutes every channel through ``nnz_indices``."""
     sequences, attention_mask = _ragged_batch()
@@ -211,7 +212,7 @@ def test_packed_microbatch_matches_the_padded_rectangle():
     torch.testing.assert_close(packed_model.table.grad, model.table.grad)
 
 
-@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("packed", [False, pytest.param(True, marks=pytest.mark.vllm)])
 def test_entropy_comes_from_the_recorded_support_not_the_vocabulary(monkeypatch, packed):
     sequences, attention_mask = _ragged_batch()
     support = _ragged_support(sequences)
@@ -359,6 +360,7 @@ def _scored_forward(wrapper, sequences, attention_mask, support: PackedTensor, r
     return output[SCORE_CENTERING_SCORES_KEY]
 
 
+@pytest.mark.vllm
 def test_centering_scores_land_in_canonical_positions_packed_or_not():
     sequences, attention_mask = _ragged_batch()
     support = _ragged_support(sequences)

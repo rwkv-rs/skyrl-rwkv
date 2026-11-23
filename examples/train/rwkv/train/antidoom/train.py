@@ -694,6 +694,17 @@ def ftpo_loss(
     }
 
 
+def collect_lora_params(model):
+    """Collect canonical adapter tensors without exporting frozen embedding weights."""
+    from peft import get_peft_model_state_dict
+
+    state = get_peft_model_state_dict(model, save_embedding_layers=False)
+    return {
+        name: param.full_tensor().detach().cpu() if hasattr(param, "full_tensor") else param.detach().cpu()
+        for name, param in state.items()
+    }
+
+
 def load_model(model_path, adapter_path=None):
     from transformers import AutoModelForCausalLM
 
@@ -1259,7 +1270,6 @@ def train(args):
     from peft import LoraConfig, TaskType, get_peft_model
     from safetensors.torch import save_file
     from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
-    from skyrl.backends.skyrl_train.distributed.fsdp_utils import layered_summon_lora_params
     from skyrl.train.config import FSDPConfig, OptimizerConfig
 
     device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
@@ -1336,7 +1346,7 @@ def train(args):
         def save_and_evaluate(step, metrics):
             metrics.update(evaluate(model, eval_rows, device, args.micro_batch_size, args.max_batch_tokens))
             adapter_dir = args.output / "adapters" / f"step_{step}"
-            adapter_state = layered_summon_lora_params(model)
+            adapter_state = collect_lora_params(model)
             if dist.get_rank() == 0:
                 adapter_dir.mkdir(parents=True, exist_ok=True)
                 save_file(adapter_state, str(adapter_dir / "adapter_model.safetensors"))

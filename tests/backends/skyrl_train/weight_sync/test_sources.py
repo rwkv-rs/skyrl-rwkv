@@ -120,6 +120,13 @@ class TestFsdpWeightSource:
 
 
 class TestFsdpLoraWeightSource:
+    @pytest.fixture(autouse=True)
+    def require_nora(self):
+        from peft import LoraConfig
+
+        if "use_nora" not in LoraConfig.__dataclass_fields__:
+            pytest.skip("NoRA weight sources require the rwkv extra")
+
     @pytest.mark.parametrize(
         "targets",
         [
@@ -189,11 +196,11 @@ class TestFsdpLoraWeightSource:
         with torch.no_grad():
             layer.lora_B["default"].weight.fill_(1.0)
         source = FsdpLoraWeightSource(model, torch.bfloat16, weight_prefix="language_model.")
-        assert [item.name for item in source.metadata()] == ["language_model.0.weight"]
-        first = dict(source)["language_model.0.weight"]
+        assert [item.name for item in source.metadata] == ["language_model.0.weight"]
+        first = dict(source.iter_full())["language_model.0.weight"]
         with torch.no_grad():
             layer.lora_B["default"].weight.mul_(2)
-        second = dict(source)["language_model.0.weight"]
+        second = dict(source.iter_full())["language_model.0.weight"]
         assert not torch.equal(second, first)
 
     def test_hf_export_merges_normalized_adapter_in_fp32(self):

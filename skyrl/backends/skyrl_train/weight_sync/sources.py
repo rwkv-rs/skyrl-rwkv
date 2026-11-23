@@ -156,12 +156,13 @@ class FsdpLoraWeightSource(FsdpWeightSource):
                 continue
             yield name.replace(".base_layer.", "."), param
 
+    @cached_property
     def metadata(self) -> List[ParamMeta]:
         return [
             ParamMeta(f"{self._prefix}{name}", self._dtype, tuple(param.shape)) for name, param in self._merged_names()
         ]
 
-    def __iter__(self) -> Iterator[Tuple[str, torch.Tensor]]:
+    def iter_full(self) -> Iterator[Tuple[str, torch.Tensor]]:
         from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
             iter_merged_lora_weights,
         )

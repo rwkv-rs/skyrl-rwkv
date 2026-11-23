@@ -7,8 +7,8 @@ import pytest
 
 from skyrl.backends.skyrl_train.inference_servers.utils import (
     _apply_serialized_fp8_weight_sync_defaults,
-    build_frozen_vllm_cli_args,
     _get_vllm_logprobs_mode,
+    build_frozen_vllm_cli_args,
     build_vllm_cli_args,
     get_pd_cli_args,
     get_pd_p2p_connector_name,
@@ -189,7 +189,7 @@ def test_build_vllm_cli_args_succeeds_on_gpu_less_host(monkeypatch):
     [
         (
             ["generator.inference_engine.engine_init_kwargs.logprobs_mode=raw_logprobs"],
-            "generator.inference_engine.engine_init_kwargs.logprobs_mode must be 'processed_logprobs'",
+            "raw_logprobs requires an RWKV model with an unmodified rollout distribution",
         ),
         (
             ["generator.inference_engine.weight_sync_backend=sharded_rdt", "trainer.placement.colocate_all=true"],

@@ -21,10 +21,8 @@ dependencies = [
     "tokenizers>=0.23.1",
     "transformers>=5.6.1,<=5.21.0.dev0",
     "typer>=0.17.4",
-    # Exact pin: peft 0.19.x turned a string `target_modules` such as "all-linear"
-    # into a character set on MoE models (fixed by 0.21.0). Megatron-Bridge
-    # requires peft>=0.20.0,<=0.21.0.
-    "peft==0.21.0",
+    # Native backends pin PEFT 0.21.0; RWKV selects the NoRA fork below.
+    "peft>=0.19.2.dev0,<=0.21.0",
     "hf_transfer",
     "cloudpathlib>=0.23.0",
     "zstandard>=0.23.0",
@@ -89,7 +87,7 @@ skyrl-train = [
     "torchdata",
     "omegaconf",
     "ray==2.57.0",
-    "peft==0.21.0",
+    "peft>=0.19.2.dev0,<=0.21.0",
     "debugpy==1.8.0",
     "hf_transfer",
     "wandb",
@@ -97,7 +95,6 @@ skyrl-train = [
     "tensordict",
     "jaxtyping",
     "skyrl-gym",
-    "flash-attn==2.8.3.post1; sys_platform == 'linux'",
     "polars",
     "s3fs",
     "s5cmd>=0.3.3; sys_platform == 'linux'",
@@ -121,6 +118,7 @@ skyrl-train = [
 
 fsdp = [
     "skyrl[skyrl-train]",
+    "peft==0.21.0",
     "transformers>=5.6.1,<=5.16.1; sys_platform == 'linux'",
     "vllm==0.33.0; sys_platform == 'linux'",
     "vllm-router; sys_platform == 'linux'",
@@ -154,7 +152,8 @@ fsdp = [
 
 rwkv = [
     "skyrl[skyrl-train]",
-    "torch==2.13.0; sys_platform == 'linux'",
+    "peft==0.19.2.dev0",
+    "torch==2.14.0; sys_platform == 'linux'",
     "transformers==5.21.0.dev0; sys_platform == 'linux'",
     "vllm; sys_platform == 'linux'",
     "FlashRWKV2==0.1.0a17; sys_platform == 'linux'",
@@ -166,6 +165,7 @@ rwkv = [
 
 megatron = [
     "skyrl[skyrl-train]",
+    "peft==0.21.0",
     "transformers>=5.6.1,<=5.16.1; sys_platform == 'linux'",
     "transformer-engine[pytorch]==2.19.0; sys_platform == 'linux'",
     # Declared directly (not just via transformer-engine[pytorch]) so the
@@ -275,6 +275,7 @@ mooncake = [
 ]
 
 dev = [
+    "matplotlib",
     "mkdocs",
     "mkdocs-material",
     "mkdocstrings[python]>=0.24.0",
@@ -364,9 +365,9 @@ override-dependencies = [
     # Widen Bridge's bound without overriding RWKV's direct Git requirement.
     { package = { name = "megatron-bridge" }, dependencies = ["transformers>=5.6.1,<=5.16.1; sys_platform == 'linux'"] },
     # Keep the RWKV Transformers source selected by this project.
-    { package = { name = "vllm", version = "0.23.1rc1.dev5461+g2852a7b1d.rwkv" }, dependencies = ["transformers==5.21.0.dev0; sys_platform == 'linux'"] },
-    # NoRA PEFT fork (based on PEFT 0.19.2.dev0) for RWKV NoRA training and merging.
-    "peft @ git+https://github.com/Joluck/NoRA@4669c35ce0ffd027456272ee5050c0f58ac8d22a#subdirectory=peft",
+    { package = { name = "vllm", version = "0.23.1rc1.dev6383+geb7d01bfb.rwkv" }, dependencies = ["transformers==5.21.0.dev0; sys_platform == 'linux'", "tilelang==0.1.15; sys_platform == 'linux'", "apache-tvm-ffi==0.1.12; sys_platform == 'linux'"] },
+    { package = { name = "vllm", version = "0.33.0" }, dependencies = ["tilelang==0.1.13; sys_platform == 'linux'", "apache-tvm-ffi==0.1.12; sys_platform == 'linux'"] },
+    { package = { name = "mamba-ssm" }, dependencies = ["tilelang==0.1.13; sys_platform == 'linux'", "apache-tvm-ffi==0.1.12; sys_platform == 'linux'"] },
     "megatron-core>=0.16.0; sys_platform == 'linux'",
     "ml_dtypes>=0.5.0; sys_platform == 'linux'",
     # `nixl` hard-depends on both nixl-cu12 and nixl-cu13; drop the cu12 variant
@@ -408,8 +409,6 @@ override-dependencies = [
     #     tilelang 0.1.9  + ffi 0.1.12  -> AttributeError
     #     tilelang 0.1.13 + ffi 0.1.12  -> import OK
     # 0.1.13 is the first tilelang whose bound (`>=0.1.11,<0.1.13`) admits 0.1.12.
-    # FlashRWKV2 0.1.0a17 pins tilelang==0.1.15, which keeps the same ffi bound.
-    "tilelang==0.1.15; sys_platform == 'linux'",
     "apache-tvm-ffi==0.1.12; sys_platform == 'linux'",
     # vLLM 0.33.0 pins nvidia-cutlass-dsl==4.8.0 and quack-kernels==0.6.5. The torch-2.14
     # combined FA4 `flash-attn` wheels pin the same versions; held here so the two can
@@ -423,56 +422,6 @@ override-dependencies = [
     # torch: 0.29.0 wants torch 2.14.0, 0.28.0 wants 2.13.0.
     "torchvision==0.29.0; sys_platform == 'linux'",
 ]
-
-# Exact metadata from the pinned upstream CUDA wheels. This lets universal
-# locking read their dependencies without downloading unused backend binaries.
-[[tool.uv.dependency-metadata]]
-name = "flashinfer-cubin"
-version = "0.7.0.post1"
-requires-python = ">=3.8"
-requires-dist = []
-
-[[tool.uv.dependency-metadata]]
-name = "flashinfer-jit-cache-sm80"
-version = "0.7.0.post1+cu130"
-requires-python = ">=3.9"
-requires-dist = []
-
-[[tool.uv.dependency-metadata]]
-name = "flashinfer-jit-cache-sm89"
-version = "0.7.0.post1+cu130"
-requires-python = ">=3.9"
-requires-dist = []
-
-[[tool.uv.dependency-metadata]]
-name = "flashinfer-jit-cache-sm90a"
-version = "0.7.0.post1+cu130"
-requires-python = ">=3.9"
-requires-dist = []
-
-[[tool.uv.dependency-metadata]]
-name = "flashinfer-jit-cache-sm100a"
-version = "0.7.0.post1+cu130"
-requires-python = ">=3.9"
-requires-dist = []
-
-[[tool.uv.dependency-metadata]]
-name = "flashinfer-jit-cache-sm103a"
-version = "0.7.0.post1+cu130"
-requires-python = ">=3.9"
-requires-dist = []
-
-[[tool.uv.dependency-metadata]]
-name = "flashinfer-jit-cache-sm110a"
-version = "0.7.0.post1+cu130"
-requires-python = ">=3.9"
-requires-dist = []
-
-[[tool.uv.dependency-metadata]]
-name = "flashinfer-jit-cache-sm121a"
-version = "0.7.0.post1+cu130"
-requires-python = ">=3.9"
-requires-dist = []
 
 # lighteval-rwkv pins latex2sympy2_extended==1.0.6; keep SkyRL's math-verify parser
 # version. The last four packages come from its vLLM backend's optional imports.
@@ -489,64 +438,131 @@ requires-dist = [
     "aiolimiter", "diskcache", "more-itertools", "jsonlines",
 ]
 
-[[tool.uv.dependency-metadata]]
-name = "mamba-ssm"
-version = "2.3.2.post1"
-requires-python = ">=3.9"
-provides-extra = ["causal-conv1d", "dev"]
-requires-dist = [
-    "torch", "tilelang==0.1.8", "apache-tvm-ffi<=0.1.9", "quack-kernels>=0.3.4", "triton>=3.5.0",
-    "ninja", "einops", "transformers", "packaging", "setuptools>=61.0.0",
-    "causal-conv1d>=1.2.0; extra == 'causal-conv1d'", "pytest; extra == 'dev'",
-]
-
-[[tool.uv.dependency-metadata]]
-name = "causal-conv1d"
-version = "1.6.2.post1"
-requires-python = ">=3.9"
-requires-dist = ["torch", "packaging", "ninja"]
-
-[[tool.uv.dependency-metadata]]
-name = "flash-attn"
-version = "2.8.3+cu.13.0.torch.2.13.fa4b28.skyrl1"
-requires-python = ">=3.12,<3.15"
-requires-dist = [
-    "apache-tvm-ffi==0.1.12", "einops", "nvidia-cutlass-dsl[cu13]==4.6.2",
-    "pytest-xdist; extra == 'dev'", "pytest; extra == 'dev'", "quack-kernels[cu13]==0.6.4",
-    "ruff; extra == 'dev'", "torch-c-dlpack-ext", "torch==2.13.0", "typing_extensions",
-]
-
-[[tool.uv.dependency-metadata]]
-name = "flash-attn-4"
-version = "4.0.0b28+skyrl1"
-requires-python = ">=3.12,<3.15"
-provides-extra = ["cu13"]
-requires-dist = ["flash-attn==2.8.3+cu.13.0.torch.2.13.fa4b28.skyrl1"]
-
-[[tool.uv.dependency-metadata]]
-name = "transformer-engine-torch"
-version = "2.19.0"
-requires-python = ">=3.10.0"
-requires-dist = [
-    "torch>=2.1", "einops", "onnxscript", "onnx", "packaging", "pydantic",
-    "nvdlfw-inspect", "nvidia-cudnn-frontend>=1.28.0", "transformer_engine_cu13==2.19.0",
-]
-
+# Verified from the torch-2.14 release wheel metadata (cu13torch2.14).
 [[tool.uv.dependency-metadata]]
 name = "fast-hadamard-transform"
 version = "1.1.0"
 requires-python = ">=3.7"
 requires-dist = ["torch", "packaging", "ninja"]
 
+# Dependency metadata from Megatron-Bridge 7171584bd7452caf2adfa6afd12fb89cc37fbc64.
+# Reading metadata otherwise installs its torch/CUDA build requirements.
 [[tool.uv.dependency-metadata]]
-name = "flash-mla"
-version = "1.0.0+cu.13.0.torch.2.13.b7643bd"
+name = "megatron-bridge"
+version = "0.8.0+7171584b"
+requires-python = ">=3.12,<3.13"
+provides-extra = ["bagel", "recipes", "parquet", "tensor-inspect", "te", "ssm", "audio"]
+requires-dist = [
+    "transformers>=5.15,<5.21",
+    "mistral-common>=1.10.0",
+    "peft>=0.20.0,<=0.21.0",
+    "datasets>=2.20.0",
+    "accelerate",
+    "diffusers>=0.36.0",
+    "einops",
+    "omegaconf>=2.3.0",
+    "tensorboard>=2.19.0",
+    "typing-extensions",
+    "rich",
+    "wandb>=0.29.0",
+    "six>=1.17.0",
+    "regex>=2024.11.6",
+    "pyyaml>=6.0.2",
+    "tqdm>=4.67.1",
+    "hydra-core>=1.3.4,<1.4",
+    "megatron-core[dev,inference,mlm,te]",
+    "qwen-vl-utils",
+    "nvidia-resiliency-ext",
+    "flash-linear-attention",
+    "timm",
+    "open-clip-torch>=3.2.0",
+    "mlflow>=3.16.0",
+    "comet-ml>=3.50.0",
+    "torch>=2.6.0",
+    "flashinfer-python==0.6.18.post1",
+    "flashinfer-cubin==0.6.18.post1",
+    "fast-hadamard-transform>=1.1.0",
+    "opencv-python-headless>=4.7.0.72; extra == 'bagel'",
+    "safetensors>=0.4.5; extra == 'bagel'",
+    "nemo-run; extra == 'recipes'",
+    "pyarrow>=14.0.0; extra == 'parquet'",
+    "nvdlfw-inspect==0.2.1; extra == 'tensor-inspect'",
+    "megatron-core[te]; extra == 'te'",
+    "mamba-ssm==2.3.1; extra == 'ssm'",
+    "causal-conv1d; extra == 'ssm'",
+    "tilelang>=0.1.9; extra == 'ssm'",
+    "librosa; extra == 'audio'",
+]
+
+# Verified from FlashInfer release v0.7.2.post1 wheel metadata.
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-cubin"
+version = "0.7.2.post1"
+requires-python = ">=3.8"
 requires-dist = []
 
+# Verified from the FlashInfer v0.7.2.post1 aarch64 provider shim.
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache"
+version = "0.7.2.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = ["flashinfer-jit-cache-sm100a==0.7.2.post1+cu130", "flashinfer-jit-cache-sm103a==0.7.2.post1+cu130", "flashinfer-jit-cache-sm110a==0.7.2.post1+cu130", "flashinfer-jit-cache-sm120f==0.7.2.post1+cu130", "flashinfer-jit-cache-sm121a==0.7.2.post1+cu130", "flashinfer-jit-cache-sm80==0.7.2.post1+cu130", "flashinfer-jit-cache-sm89==0.7.2.post1+cu130", "flashinfer-jit-cache-sm90a==0.7.2.post1+cu130"]
+
+# Verified from every published v0.7.2.post1 CUDA-13 architecture wheel.
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache-sm100a"
+version = "0.7.2.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache-sm103a"
+version = "0.7.2.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache-sm110a"
+version = "0.7.2.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache-sm120f"
+version = "0.7.2.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache-sm121a"
+version = "0.7.2.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache-sm80"
+version = "0.7.2.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache-sm89"
+version = "0.7.2.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = []
+
+[[tool.uv.dependency-metadata]]
+name = "flashinfer-jit-cache-sm90a"
+version = "0.7.2.post1+cu130"
+requires-python = ">=3.9"
+requires-dist = []
+
+
 [tool.uv.extra-build-dependencies]
+megatron-bridge = [{requirement = "torch", match-runtime = true}]
 flash-attn = [{requirement = "torch", match-runtime = true}]
 fast-hadamard-transform = ["torch==2.14.0", "ninja"]
-vllm = ["torch==2.13.0"]
+vllm = ["torch==2.14.0"]
 
 [tool.uv.extra-build-variables]
 flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE"}
@@ -596,10 +612,11 @@ url = "https://wheels.astral.sh/simple/cu130/"
 explicit = true
 
 [tool.uv.sources]
+peft = { git = "https://github.com/Joluck/NoRA", rev = "4669c35ce0ffd027456272ee5050c0f58ac8d22a", subdirectory = "peft", extra = "rwkv" }
 skyrl-gym = { path = "./skyrl-gym", editable = true }
 skycap = { path = "./skycap", editable = true }
 transformers = { git = "https://github.com/rwkv-rs/transformers-rwkv", rev = "f93dd4e01e0b565ef0390f76c6726d1d121ebbab", extra = "rwkv" }
-vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "2852a7b1d597f6e2131ec801de331b886471cd95", extra = "rwkv" }
+vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "eb7d01bfb921291933c9c2bd50d8075b5b8b5ac7", extra = "rwkv" }
 lighteval = { git = "https://github.com/rwkv-rs/lighteval-rwkv", rev = "c5475e27a1e58184c9a6cdbd30572ec1ae601dd7", extra = "rwkv" }
 tokenizers = { git = "https://github.com/rwkv-rs/tokenizers-rwkv", rev = "c5d8dde5ff49c70e4656199d5033a84e03c21b2b", subdirectory = "bindings/python", extra = "rwkv" }
 # Match torch's CUDA variant (cu130).

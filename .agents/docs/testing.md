@@ -6,12 +6,14 @@ Mirrors `.github/workflows/cpu_skyrl.yaml` / `cpu_jax.yaml` -- keep in sync.
 ```bash
 # Core library tests. A backend extra is required: `ray` ships in `skyrl-train`/`fsdp`, and
 # without one, collection fails in tests/backends/skyrl_train/conftest.py with
-# "No module named 'ray'". CI splits on the `vllm` marker since the halves need different extras.
-uv run --isolated --extra skyrl-train --extra dev pytest tests/train/ tests/backends/skyrl_train/ --ignore=tests/backends/skyrl_train/gpu -m "not vllm"
-uv run --isolated --extra fsdp --extra dev pytest tests/train/ tests/backends/skyrl_train/ --ignore=tests/backends/skyrl_train/gpu -m "vllm"
+# "No module named 'ray'". CI splits on the `vllm` and `megatron` markers because each backend needs different extras.
+uv run --isolated --extra skyrl-train --extra dev pytest tests/train/ tests/backends/skyrl_train/ --ignore=tests/backends/skyrl_train/gpu -m "not (vllm or megatron)"
+uv run --isolated --extra fsdp --extra dev pytest tests/train/ tests/backends/skyrl_train/ --ignore=tests/backends/skyrl_train/gpu -m "vllm and not megatron"
+uv run --isolated --extra megatron --extra dev pytest tests/train/ tests/backends/skyrl_train/ --ignore=tests/backends/skyrl_train/gpu -m "megatron"
 
 # JAX / Tinker / Utils
-uv run --isolated --extra tinker --extra jax --extra dev pytest --forked -s tests/tx tests/backends/test_jax_backend.py --ignore=tests/tx/gpu
+uv run --isolated --extra tinker --extra jax --extra dev --with transformers==5.2.0 pytest --forked -s tests/tx/models/test_qwen3_5.py
+uv run --isolated --extra tinker --extra jax --extra dev pytest --forked -s tests/tx tests/backends/test_jax_backend.py --ignore=tests/tx/gpu --ignore=tests/tx/models/test_qwen3_5.py
 uv run --isolated --extra tinker --extra jax --extra dev pytest --forked -s tests/tinker tests/utils --ignore=tests/tinker/skyrl_train
 uv run --isolated --extra fsdp --extra tinker --extra dev pytest tests/tinker/skyrl_train/
 ```

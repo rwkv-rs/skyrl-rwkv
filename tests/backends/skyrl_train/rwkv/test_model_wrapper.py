@@ -19,7 +19,6 @@ from skyrl.backends.skyrl_train.utils.sample_support import (
     CompactSampleSupport,
 )
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
-from skyrl.backends.skyrl_train.weight_sync.sources import FsdpWeightSource
 from skyrl.backends.skyrl_train.workers import model_wrapper as model_wrapper_module
 from skyrl.backends.skyrl_train.workers.fsdp.fsdp_worker import (
     FSDPCriticWorkerBase,
@@ -31,6 +30,7 @@ from skyrl.train.config import SamplingParams
 
 @pytest.fixture(autouse=True)
 def use_torch_logprobs(monkeypatch):
+    monkeypatch.setattr(model_wrapper_module, "_patch_rwkv_training_state_contract", lambda: None)
     monkeypatch.setattr(torch_utils_module, "FLASH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE", False)
 
 
@@ -406,24 +406,28 @@ def test_rwkv_recurrent_forward_preserves_gradients():
     assert torch.isfinite(model.lm_head.weight.grad).all()
 
 
+@pytest.mark.vllm
 def test_rwkv_weight_source_matches_metadata_and_fsdp_bf16_forward_dtype(monkeypatch):
+    from skyrl.backends.skyrl_train.weight_sync.sources import FsdpWeightSource
+
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     weights = torch.tensor([1.003, -2.007], dtype=torch.float32)
     model = torch.nn.Module()
     model.register_parameter("weight", torch.nn.Parameter(weights))
     source = FsdpWeightSource(model, torch.bfloat16)
-    metadata = source.metadata()
-    [(name, actual)] = list(source)
+    metadata = source.metadata
+    [(name, actual)] = list(source.iter_full())
 
     assert metadata[0].name == name == "weight"
     assert metadata[0].dtype == actual.dtype == torch.bfloat16
     assert metadata[0].shape == tuple(actual.shape) == (2,)
     assert torch.equal(actual, weights.to(torch.bfloat16))
     assert not torch.equal(actual, weights.to(torch.float16))
-    [(_, direct)] = list(FsdpWeightSource(model, torch.float16))
+    [(_, direct)] = list(FsdpWeightSource(model, torch.float16).iter_full())
     assert torch.equal(direct, weights.to(torch.float16))
 
 
+@pytest.mark.vllm
 def test_rwkv_weight_reload_preserves_runtime_layout_and_derived_storage(monkeypatch):
     from vllm.distributed import parallel_state
 
@@ -651,6 +655,7 @@ def test_rwkv_string_load_does_not_force_attention_implementation(monkeypatch):
         ),
     ],
 )
+@pytest.mark.vllm
 def test_rwkv_sampling_parameters_are_forwarded_to_vllm(sampling_params, expected):
     passthrough_keys = {"presence_penalty", "frequency_penalty", "penalty_decay"}
     additional_kwargs = {key: value for key, value in sampling_params.items() if key in passthrough_keys}
@@ -677,6 +682,7 @@ def test_rwkv_rejects_sample_support_replay_before_forward():
     assert not model.calls
 
 
+@pytest.mark.vllm
 def test_rwkv_weight_reload_skips_missing_pp_parameters(monkeypatch):
     from vllm.distributed import parallel_state
     from vllm.model_executor.models.utils import PPMissingLayer

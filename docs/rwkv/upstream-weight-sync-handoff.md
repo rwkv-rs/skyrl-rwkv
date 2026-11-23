@@ -1,24 +1,25 @@
 # RWKV Fork Upstream Weight-Sync Handoff
 
 This document is for the maintainers of `transformers-rwkv` and `vllm-rwkv`.
-The SkyRL branch has merged the latest `upstream/main` weight-sync architecture and
-keeps RWKV support as a model-specific adapter.
+The SkyRL branch uses the SkyRL v0.5.0 weight-sync architecture and keeps RWKV
+support as a model-specific adapter.
 
 ## Required upstream alignment
 
 1. Rebase the RWKV forks onto the exact upstream dependency versions used by SkyRL:
-   - vLLM `0.30.0`
-   - Transformers `5.16.1`
-   - Torch `2.13.0` for the RWKV extra
+   - Native vLLM `0.33.0`; the RWKV extra uses the published v0.33 alignment
+     commit `eb7d01bfb921291933c9c2bd50d8075b5b8b5ac7`.
+   - Native Transformers `5.16.1`; the RWKV extra retains
+     `f93dd4e01e0b565ef0390f76c6726d1d121ebbab` (`5.21.0.dev0`).
+   - Torch `2.14.0` and FlashRWKV2 `0.1.0a17` for the RWKV extra.
 2. Preserve the RWKV model type identifier `rwkv` and the RWKV7 stateful execution
    contract.
 3. Preserve the existing RWKV vLLM entry points used by this repository:
    - `vllm.model_executor.models.rwkv`
    - `vllm.v1.worker.gpu.model_states.rwkv`
    - the dev RLHF API routes
-4. Do not require SkyRL's removed legacy `layerwise_reload.py` API from vLLM.
-   SkyRL now enters weight synchronization through vLLM's native weight-transfer
-   engine lifecycle.
+4. Enter weight synchronization through vLLM's native weight-transfer engine
+   lifecycle.
 
 ## Weight-sync contract
 

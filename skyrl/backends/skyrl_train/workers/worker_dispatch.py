@@ -1006,9 +1006,7 @@ class WorkerDispatch:
                     start = time.perf_counter()
                     await self._inference_engine_client.pause_generation()
                     self.last_pause_generation_seconds = time.perf_counter() - start
-                    async with cleanup_preserving_primary(
-                        _resume_generation_timed, "resume_generation"
-                    ):
+                    async with cleanup_preserving_primary(_resume_generation_timed, "resume_generation"):
                         await _broadcast_and_finish()
 
         # Advance the policy version so prefix-cache salting isolates blocks from the previous weights

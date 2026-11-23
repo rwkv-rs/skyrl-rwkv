@@ -88,8 +88,8 @@ from skyrl.train.utils.callbacks import (
     TrainingCallback,
     TrainingControl,
 )
-from skyrl.train.utils.mfu import MFUTracker, mfu_support
 from skyrl.train.utils.metrics import nvtx_range
+from skyrl.train.utils.mfu import MFUTracker, mfu_support
 from skyrl.train.utils.ray_gpu_monitor import RayGpuMonitor
 from skyrl.train.utils.tracking import Tracking
 from skyrl.train.utils.trainer_utils import (

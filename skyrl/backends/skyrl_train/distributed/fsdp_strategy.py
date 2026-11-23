@@ -290,6 +290,11 @@ class FSDPStrategy(DistributedStrategy):
             param_dtype = torch.bfloat16
             reduce_dtype = torch.float32
 
+        if getattr(model, "is_rwkv", False) and self.model_config is not None and self.model_config.lora.use_nora:
+            # Preserve the BF16 base and FP32 adapters. Rounding A before NoRA's
+            # FP32 normalization changes the policy relative to raw-adapter rollout.
+            param_dtype = None
+
         assert CPUOffloadPolicy is not None, "PyTorch version >= 2.4 is required for using fully_shard API (FSDP2)"
         # Recurrent RWKV chunks carry FP32 WKV state tensors between decoder
         # layers; casting forward inputs would round them to BF16 at every layer

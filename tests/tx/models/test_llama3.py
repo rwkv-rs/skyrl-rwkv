@@ -23,7 +23,9 @@ def test_llama3(tp: int):
     # Use a small LLama model for testing
     model_name = "unsloth/Llama-3.2-1B"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    hf_model = AutoModelForCausalLM.from_pretrained(model_name, attn_implementation="eager", use_safetensors=True)
+    hf_model = AutoModelForCausalLM.from_pretrained(
+        model_name, attn_implementation="eager", use_safetensors=True, torch_dtype=torch.float32
+    )
 
     inputs = ["The capital of France is", "The most popular programming language is"]
     batch = tokenizer(inputs, return_tensors="pt", padding=True)

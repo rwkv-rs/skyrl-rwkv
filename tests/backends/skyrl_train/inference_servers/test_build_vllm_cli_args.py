@@ -364,7 +364,16 @@ def test_resolve_policy_model_name_uses_served_model_name():
 
 
 @pytest.mark.parametrize("use_nora", [False, True])
-def test_fsdp_nora_serves_complete_weights_instead_of_adapter(use_nora):
+@pytest.mark.parametrize(
+    "targets, train_attn, train_mlp",
+    [
+        ("all-linear", True, True),
+        ("all-linear", True, False),
+        ("all-linear", False, True),
+        (["r_proj", "mlp.key", "mlp.value", "lm_head"], True, True),
+    ],
+)
+def test_fsdp_nora_serves_complete_weights_instead_of_adapter(use_nora, targets, train_attn, train_mlp):
     from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import (
         SKYRL_LORA_ADAPTER_NAME,
     )
@@ -382,6 +391,9 @@ def test_fsdp_nora_serves_complete_weights_instead_of_adapter(use_nora):
     )
     assert _uses_lora_weight_sync(cfg) is not use_nora
     assert resolve_policy_model_name(cfg) == ("rwkv-student" if use_nora else SKYRL_LORA_ADAPTER_NAME)
+    cfg.trainer.policy.model.lora.target_modules = targets
+    cfg.trainer.policy.model.lora.train_attn = train_attn
+    cfg.trainer.policy.model.lora.train_mlp = train_mlp
     args = build_vllm_cli_args(cfg)
     if use_nora:
         assert not args.enable_lora
@@ -389,7 +401,12 @@ def test_fsdp_nora_serves_complete_weights_instead_of_adapter(use_nora):
             "r": 8,
             "lora_alpha": cfg.trainer.policy.model.lora.alpha,
             "use_nora": True,
-            "target_modules": list(cfg.trainer.policy.model.lora.target_modules),
+            "target_modules": (
+                (["r_proj", "k_proj", "v_proj", "o_proj"] if train_attn else [])
+                + (["mlp.key", "mlp.value"] if train_mlp else [])
+                if targets == "all-linear"
+                else targets
+            ),
         }
     else:
         assert "rwkv_lora" not in (args.hf_overrides or {})

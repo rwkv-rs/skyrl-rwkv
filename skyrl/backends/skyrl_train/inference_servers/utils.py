@@ -142,6 +142,11 @@ def _apply_rwkv_lora_overrides(cfg: SkyRLTrainConfig, engine_kwargs: Dict[str, A
     if not isinstance(hf_overrides, dict):
         raise ValueError("engine_init_kwargs.hf_overrides must be a dict for a NoRA policy")
     target_modules = lora_cfg.target_modules
+    if isinstance(target_modules, str) and target_modules.lower() == "all-linear":
+        # PEFT's all-linear selection excludes the model's output layer.
+        target_modules = (["r_proj", "k_proj", "v_proj", "o_proj"] if lora_cfg.train_attn else []) + (
+            ["mlp.key", "mlp.value"] if lora_cfg.train_mlp else []
+        )
     hf_overrides["rwkv_lora"] = {
         "r": lora_cfg.rank,
         "lora_alpha": lora_cfg.alpha,

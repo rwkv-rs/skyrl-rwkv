@@ -130,6 +130,7 @@ class TestFsdpLoraWeightSource:
     @pytest.mark.parametrize(
         "targets",
         [
+            "all-linear",
             ["mlp.key", "mlp.value"],
             ["r_proj", "k_proj", "v_proj", "o_proj", "mlp.key", "mlp.value", "lm_head"],
         ],
@@ -160,6 +161,12 @@ class TestFsdpLoraWeightSource:
         meta, pairs = _assert_channels_agree(FsdpLoraWeightSource(model, torch.bfloat16))
         streamed = dict(pairs)
         assert not any("base_layer" in name or ".default." in name for name in streamed)
+        if targets == "all-linear":
+            adapters = [name for name in streamed if name.endswith(".lora_A.weight")]
+            assert len(adapters) == 6
+            for target in ("r_proj", "k_proj", "v_proj", "o_proj", "mlp.key", "mlp.value"):
+                assert any(name.endswith(f".{target}.lora_A.weight") for name in adapters)
+            assert "lm_head.lora_A.weight" not in streamed
         for projection in ("key", "value"):
             layer = getattr(model.get_base_model().model.layers[0].mlp, projection)
             prefix = f"model.layers.0.mlp.{projection}"

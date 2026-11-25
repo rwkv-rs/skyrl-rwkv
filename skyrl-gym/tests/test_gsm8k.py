@@ -49,6 +49,29 @@ def test_strict_reward_requires_complete_thinking_response():
     assert step_output["metadata"]["ended_eod"] is True
 
 
+def test_strict_reward_without_generation_metadata():
+    env = _make_strict_env()
+
+    step_output = env.step(r"reasoning </think> \boxed{42}")
+
+    assert step_output["reward"] == 0.0
+    assert step_output["metadata"]["ended_eod"] is False
+    assert step_output["metadata"]["stop_reason"] is None
+
+
+def test_strict_reward_scores_action_passed_to_step():
+    env = _make_strict_env()
+    response = r"reasoning </think> \boxed{42}"
+    env.set_generation_metadata(action=response, ended_eod=True, truncated=False, stop_reason="stop")
+
+    step_output = env.step(r"reasoning </think> \boxed{41}")
+
+    assert step_output["reward"] == 0.0
+    assert step_output["metadata"]["ended_eod"] is True
+    assert step_output["metadata"]["stop_reason"] == "stop"
+    assert env.step(response)["reward"] == 1.0
+
+
 def test_strict_reward_does_not_count_open_think_completion_as_reasoning():
     env = _make_strict_env()
     response = "></think> \\boxed{42}"

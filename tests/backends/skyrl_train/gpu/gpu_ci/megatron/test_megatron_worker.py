@@ -660,6 +660,16 @@ async def test_megatron_train(
             assert (
                 "moe/seq_load_balancing_loss_layer_1" in result.metrics
             ), "Load balancing loss layer 1 should be present"
+
+    cp_entropy_contribution = None
+    if use_entropy_loss and cp > 1 and remove_microbatch_padding and fused_lm_head_backend is None:
+        # The packed loss reports CP-local entropy contributions. Take one TP
+        # replica per CP shard on the last pipeline stage.
+        cp_entropy_contribution = sum(
+            result.metrics["final_loss"] - result.metrics["policy_loss"]
+            for info, result in zip(actor_group.actor_infos, results_megatron, strict=True)
+            if info.rank.dp == 0 and info.rank.tp == 0 and info.rank.pp == info.rank.pp_size - 1
+        )
     ray.shutdown()
     ray_init_for_tests()
 
@@ -719,8 +729,11 @@ async def test_megatron_train(
                 continue
             assert isinstance(result.metrics[k], (int, float)), f"{k} should be an int or float"
             expected = results_megatron[i].metrics[k]
+            if k == "final_loss" and cp_entropy_contribution is not None:
+                expected = results_megatron[i].metrics["policy_loss"] + cp_entropy_contribution
             if k in {"policy_loss", "final_loss"}:
-                assert result.metrics[k] == pytest.approx(expected, rel=2e-2, abs=0.0), f"diff in {k} is too large!"
+                abs_tol = 1e-4 if k == "policy_loss" else 0.0
+                assert result.metrics[k] == pytest.approx(expected, rel=2e-2, abs=abs_tol), f"diff in {k} is too large!"
             else:
                 assert abs(result.metrics[k] - expected) < 5e-1, f"diff in {k} is too large!"
 

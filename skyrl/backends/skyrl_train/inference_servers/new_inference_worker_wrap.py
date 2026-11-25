@@ -46,6 +46,7 @@ from skyrl.backends.skyrl_train.inference_servers.vllm_compat import (
     patch_vllm_dummy_weight_boot_detection,
     patch_vllm_fp8_kv_scale_boot_normalization,
     patch_vllm_fp8_kv_scale_completion,
+    patch_vllm_rwkv_lora_targets,
     patch_vllm_sleep_model_state,
     restore_model_state_tensors,
     save_model_state_tensors,
@@ -99,6 +100,7 @@ except ModuleNotFoundError:
 patch_vllm_dummy_weight_boot_detection()
 patch_vllm_fp8_kv_scale_boot_normalization()
 patch_vllm_fp8_kv_scale_completion()
+patch_vllm_rwkv_lora_targets()
 patch_vllm_sleep_model_state()
 
 try:

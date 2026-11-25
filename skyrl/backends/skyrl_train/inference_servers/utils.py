@@ -141,18 +141,30 @@ def _apply_rwkv_lora_overrides(cfg: SkyRLTrainConfig, engine_kwargs: Dict[str, A
     hf_overrides = {} if hf_overrides_value is None else copy.deepcopy(hf_overrides_value)
     if not isinstance(hf_overrides, dict):
         raise ValueError("engine_init_kwargs.hf_overrides must be a dict for a NoRA policy")
-    target_modules = lora_cfg.target_modules
-    if isinstance(target_modules, str) and target_modules.lower() == "all-linear":
+    attn_targets = ["r_proj", "k_proj", "v_proj", "o_proj"]
+    mlp_targets = ["mlp.key", "mlp.value"]
+    peft_targets = lora_cfg.target_modules
+    if isinstance(peft_targets, str) and peft_targets.lower() == "all-linear":
         # PEFT's all-linear selection excludes the model's output layer.
-        target_modules = (["r_proj", "k_proj", "v_proj", "o_proj"] if lora_cfg.train_attn else []) + (
-            ["mlp.key", "mlp.value"] if lora_cfg.train_mlp else []
-        )
-    hf_overrides["rwkv_lora"] = {
+        target_modules = (attn_targets if lora_cfg.train_attn else []) + (mlp_targets if lora_cfg.train_mlp else [])
+        peft_targets = target_modules if lora_cfg.exclude_modules else None
+    else:
+        # The vLLM allocator takes projection labels, while PEFT filters
+        # individual layers by applying the original selectors to their paths.
+        target_modules = attn_targets + mlp_targets + ["lm_head"]
+        peft_targets = peft_targets if isinstance(peft_targets, str) else list(peft_targets)
+    rwkv_lora = {
         "r": lora_cfg.rank,
         "lora_alpha": lora_cfg.alpha,
         "use_nora": True,
-        "target_modules": [target_modules] if isinstance(target_modules, str) else list(target_modules),
+        "target_modules": target_modules,
     }
+    if peft_targets is not None:
+        rwkv_lora["peft_targets"] = {
+            "target_modules": peft_targets,
+            "exclude_modules": lora_cfg.exclude_modules,
+        }
+    hf_overrides["rwkv_lora"] = rwkv_lora
     engine_kwargs["hf_overrides"] = hf_overrides
 
 

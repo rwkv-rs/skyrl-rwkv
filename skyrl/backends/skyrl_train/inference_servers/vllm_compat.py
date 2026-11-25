@@ -2,11 +2,40 @@
 
 import logging
 from functools import wraps
+from importlib import import_module
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+def patch_vllm_rwkv_lora_targets() -> None:
+    """Match PEFT selectors against the full RWKV module prefix before allocation."""
+    module_name = "vllm.model_executor.models.rwkv"
+    try:
+        rwkv = import_module(module_name)
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"vllm", module_name}:
+            raise
+        return
+    original = rwkv._add_lora
+    if getattr(original, "_skyrl_matches_peft_targets", False):
+        return
+
+    @wraps(original)
+    def _patched_add_lora(layer: torch.nn.Module, config: Any, target: str, prefix: str) -> None:
+        lora = getattr(config, "rwkv_lora", None)
+        if lora is not None and (selectors := lora.get("peft_targets")) is not None:
+            from peft.tuners.tuners_utils import check_target_module_exists
+
+            if not check_target_module_exists(SimpleNamespace(**selectors), prefix):
+                return
+        original(layer, config, target, prefix)
+
+    setattr(_patched_add_lora, "_skyrl_matches_peft_targets", True)
+    rwkv._add_lora = _patched_add_lora
 
 
 def normalize_serialized_fp8_kv_scales(model_runner: Any) -> int:

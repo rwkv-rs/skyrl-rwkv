@@ -8,6 +8,7 @@ carried. Fake workers stand in for vLLM so no GPU is needed.
 
 import types
 
+import pytest
 import torch
 
 from skyrl.backends.skyrl_train.inference_servers.vllm_compat import (
@@ -80,3 +81,70 @@ def test_full_wake_restores():
     worker.sleep(level=2)
     worker.wake_up()
     assert worker.model_runner.model_state.ngram_context_offsets.tolist() == [-2, -1]
+
+
+@pytest.mark.vllm
+@pytest.mark.parametrize(
+    "targets, excludes",
+    [
+        (["key"], None),
+        (r"model\.layers\.0\.mlp\.value|lm_head", None),
+        (["model.layers.1.linear_attn.o_proj", "key"], ["model.layers.1.mlp.key"]),
+        ("all-linear", r"model\.layers\.0\.linear_attn\.r_proj"),
+    ],
+)
+def test_rwkv_inference_allocates_exactly_the_peft_nora_targets(monkeypatch, targets, excludes):
+    from peft import LoraConfig, get_peft_model
+
+    from skyrl.backends.skyrl_train.inference_servers.utils import build_vllm_cli_args
+    from skyrl.train.config import SkyRLTrainConfig
+
+    if "use_nora" not in LoraConfig.__dataclass_fields__:
+        pytest.skip("RWKV NoRA allocation requires the rwkv extra")
+
+    from transformers import RwkvConfig, RwkvForCausalLM
+    from vllm.distributed import parallel_state
+    from vllm.model_executor.models import rwkv
+
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: types.SimpleNamespace(rank_in_group=0, world_size=1))
+    cfg = SkyRLTrainConfig()
+    cfg.trainer.policy.model.path = "rwkv-test"
+    cfg.trainer.policy.model.lora.rank = 2
+    cfg.trainer.policy.model.lora.use_nora = True
+    cfg.trainer.policy.model.lora.target_modules = targets
+    cfg.trainer.policy.model.lora.exclude_modules = excludes
+    args = build_vllm_cli_args(cfg)
+    inference_config = types.SimpleNamespace(**args.hf_overrides)
+
+    base = RwkvForCausalLM(
+        RwkvConfig(
+            vocab_size=32,
+            hidden_size=64,
+            intermediate_size=256,
+            num_hidden_layers=2,
+            num_attention_heads=1,
+            decay_low_rank_dim=64,
+            a_low_rank_dim=64,
+            gate_low_rank_dim=64,
+            v_low_rank_dim=64,
+        )
+    )
+    inference_adapters = {}
+    for path, module in base.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            target = path.split(".")[-1]
+            if target in {"key", "value"}:
+                target = f"mlp.{target}"
+            projection = torch.nn.Linear(module.in_features, module.out_features, bias=False)
+            rwkv._add_lora(projection, inference_config, target, path)
+            if hasattr(projection, "lora_A"):
+                inference_adapters[path] = projection
+
+    policy = get_peft_model(base, LoraConfig(r=2, target_modules=targets, exclude_modules=excludes, use_nora=True))
+    policy_adapters = {
+        path: module for path, module in policy.get_base_model().named_modules() if hasattr(module, "lora_A")
+    }
+    assert inference_adapters.keys() == policy_adapters.keys()
+    for path, projection in inference_adapters.items():
+        assert projection.lora_A.weight.shape == policy_adapters[path].lora_A["default"].weight.shape
+        assert projection.lora_B.weight.shape == policy_adapters[path].lora_B["default"].weight.shape

@@ -99,12 +99,12 @@ disagree.
 ### Weight sources
 
 RWKV NoRA policies (`trainer.policy.model.lora.use_nora=true`) use
-`FsdpLoraWeightSource` instead of vLLM's LoRA manager. It shares the complete-weight
-transport and metadata contract with `FsdpWeightSource`, merges the normalized
-adapters in FP32 with `iter_merged_lora_weights` from `distributed/fsdp_utils.py`,
-and sends ordinary projection names with BF16 effective weights that the native
-vLLM-RWKV model loads. The live adapter and frozen base are not modified; the
-existing RWKV cache reset runs after transfer.
+`FsdpLoraWeightSource` for complete-weight transport. Its metadata declares the
+BF16 base tensors and FP32 `lora_A.weight` and `lora_B.weight` tensors that
+`iter_full()` yields. vLLM-RWKV allocates the corresponding adapters during
+model initialization and passes the FP32 tensors to FlashRWKV2 for its forward.
+RWKV refreshes runtime weights and resets its cache after transfer. HF checkpoint
+export merges the normalized adapters in FP32.
 
 `sources.py` implements exactly vLLM's two-channel contract, and the two channels must
 agree element for element — `metadata` declares what `iter_full()` will yield, and the

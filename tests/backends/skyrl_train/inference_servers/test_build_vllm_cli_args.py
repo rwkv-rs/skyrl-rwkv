@@ -397,17 +397,18 @@ def test_fsdp_nora_serves_complete_weights_instead_of_adapter(use_nora, targets,
     args = build_vllm_cli_args(cfg)
     if use_nora:
         assert not args.enable_lora
-        assert args.hf_overrides["rwkv_lora"] == {
+        rwkv_lora = args.hf_overrides["rwkv_lora"]
+        expected = {
             "r": 8,
             "lora_alpha": cfg.trainer.policy.model.lora.alpha,
             "use_nora": True,
-            "target_modules": (
-                (["r_proj", "k_proj", "v_proj", "o_proj"] if train_attn else [])
-                + (["mlp.key", "mlp.value"] if train_mlp else [])
-                if targets == "all-linear"
-                else targets
-            ),
+            "target_modules": (["r_proj", "k_proj", "v_proj", "o_proj"] if train_attn else [])
+            + (["mlp.key", "mlp.value"] if train_mlp else []),
         }
+        if targets != "all-linear":
+            expected["target_modules"].append("lm_head")
+            expected["peft_targets"] = {"target_modules": targets, "exclude_modules": None}
+        assert rwkv_lora == expected
     else:
         assert "rwkv_lora" not in (args.hf_overrides or {})
 

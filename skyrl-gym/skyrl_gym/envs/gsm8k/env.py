@@ -23,6 +23,7 @@ class GSM8kEnv(BaseTextEnv):
         self.ground_truth = reward_spec["ground_truth"]
         self._generation_metadata = {"ended_eod": False, "truncated": False, "stop_reason": None}
         self._strict_reward_details: Dict[str, Any] = {}
+        self._prescored_action: str | None = None
 
     def set_generation_metadata(
         self,
@@ -39,18 +40,10 @@ class GSM8kEnv(BaseTextEnv):
             "stop_reason": stop_reason,
         }
         if self.strict_reward:
-            _, self._strict_reward_details = utils.compute_strict_score(
-                action,
-                self.ground_truth,
-                ended_eod=ended_eod,
-                truncated=truncated,
-            )
-            self._strict_reward_details["stop_reason"] = stop_reason
+            self._compute_strict_reward(action)
+            self._prescored_action = action
 
-    def _get_reward(self, action: str) -> float:
-        if not self.strict_reward:
-            return utils.compute_score(action, self.ground_truth)
-
+    def _compute_strict_reward(self, action: str) -> float:
         reward, self._strict_reward_details = utils.compute_strict_score(
             action,
             self.ground_truth,
@@ -59,6 +52,18 @@ class GSM8kEnv(BaseTextEnv):
         )
         self._strict_reward_details["stop_reason"] = self._generation_metadata["stop_reason"]
         return reward
+
+    def _get_reward(self, action: str) -> float:
+        if not self.strict_reward:
+            return utils.compute_score(action, self.ground_truth)
+
+        # The generator already scores this action in set_generation_metadata
+        # on its main thread. Math-Verify's signal timeout cannot run in the
+        # environment thread pool used for step().
+        if self._prescored_action == action:
+            return self._strict_reward_details["strict_reward"]
+        self._prescored_action = None
+        return self._compute_strict_reward(action)
 
     def get_metrics(self) -> Dict[str, Any]:
         return dict(self._strict_reward_details) if self.strict_reward else {}

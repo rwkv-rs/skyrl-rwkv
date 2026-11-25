@@ -84,10 +84,44 @@ skycap's exposure ([skycap's README](../../../skycap/README.md#expose-a-server-t
 
 Only the harness routes are reachable that way, never the control plane. An
 installed agent gets its trajectory's route on the exposed URL in its sandbox's
-environment (`OPENAI_API_BASE`, `HOSTED_VLLM_API_BASE`, and placeholder keys);
+environment (`OPENAI_API_BASE` and `HOSTED_VLLM_API_BASE` for LiteLLM agents such
+as mini-swe-agent, `OPENAI_BASE_URL` for Codex, and placeholder keys);
 Terminus-2 keeps the server's own URL. A quick tunnel takes at most 200 calls in
 flight, and a call whose reply hasn't started after about 125 s fails, so use
 `external_host` for many agents or long replies.
+
+If not one trajectory of the run's first batch has anything to train, the
+generator stops the run instead of taking zero-gradient steps. Each trial's
+`exception.txt` and agent logs under
+`harbor_trial_config.trials_dir` say why. `skycap.check_first_batch=false`
+skips the check, e.g. for an agent that never calls the model.
+
+## Sharing a sandbox provider
+
+A remote sandbox counts against the provider account's quota, which other runs
+may share. Cap trials in flight with `generator.rate_limit.enabled=true
+generator.rate_limit.max_concurrency=<n>`, which also bounds the load on the
+inference engines; eval and retries count against it too.
+
+When the trainer dies, Harbor never deletes its sandboxes. Harbor's Daytona
+environment can label each one, so a run's leftovers can be told apart from
+anyone else's, and have Daytona stop it once idle and then delete it:
+
+```bash
+  harbor_trial_config.environment.kwargs.labels.owner=<you> harbor_trial_config.environment.kwargs.labels.run=<run> \
+  harbor_trial_config.environment.kwargs.auto_stop_interval_mins=30 \
+  harbor_trial_config.environment.kwargs.auto_delete_interval_mins=0
+```
+
+## Images
+
+`skycap.include_images=true` trains a vision-language model on tasks whose prompts carry
+images: skycap renders them with the model's processor and its default settings
+(so the engine takes no `mm_processor_kwargs`), sends them to the engine with
+each prompt (the multimodal `/skyrl/v1/generate`, #2501), and each row carries
+its path's `pixel_values` and `image_grid_thw`. [`swebench_multimodal/`](swebench_multimodal)
+is a recipe: SWE-bench Multimodal with mini-swe-agent, the issue's screenshots
+inline.
 
 ## Records and W&B
 
@@ -124,7 +158,7 @@ pull one version, or none to pull every version:
 
 ```bash
 uv run --isolated --extra skyrl-train --extra harbor --extra skycap \
-  python -m examples.train_integrations.harbor_skycap.record_index \
+  python -m skyrl.integration.harbor_skycap.record_index \
   pull my-team/my-project/skycap-records-train-<run id>:train-step-3 ./run-records
 ```
 
@@ -142,11 +176,11 @@ non-zero only when it pulled nothing.
 | Piece | What it does |
 | --- | --- |
 | `entrypoints/main_harbor_skycap.py` | Starts the skycap servers in token mode, in front of the router, from the run's config. Stops them at the end, which writes every trajectory still in memory. |
-| `servers.py` | The server pool: one Ray actor per server, each running a `skycap.CaptureService` on a port of its own. skycap builds how calls reach the model from the options; the integration supplies only its engine wire. |
-| `engine.py` | `SkyRLEngine`: skycap's vLLM wire on `/skyrl/v1/generate`, with packed routed experts and sampler support decoded by SkyRL's own `generate_wire`, and sessions released at `/finish_session`. |
-| `harbor_generator.py` | Per trial: create a trajectory, point the agent's `api_base` at it, run Harbor, and `finish` with the reward to get the samples. A retry gets a fresh trajectory. |
-| `record_index.py` | `SkycapRecordIndex`, a trainer callback: the per-step W&B index of the trajectories the generator logged in a `RecordLog`; and `pull`, which brings a run's records and index back from W&B. Nothing in it is Harbor's. |
-| `compose.py` | Samples to a step-wise `GeneratorOutput`: a trial's paths are contiguous under its `TrajectoryID`, the last one marked `is_last_step` and carrying the reward. |
+| `skyrl/integration/harbor_skycap/servers.py` | The server pool: one Ray actor per server, each running a `skycap.CaptureService` on a port of its own. skycap builds how calls reach the model from the options; the integration supplies only its engine wire. |
+| `skyrl/integration/harbor_skycap/engine.py` | `SkyRLEngine`: skycap's vLLM wire on `/skyrl/v1/generate`, with packed routed experts and sampler support decoded by SkyRL's own `generate_wire`, and sessions released at `/finish_session`. |
+| `skyrl/integration/harbor_skycap/harbor_generator.py` | Per trial: create a trajectory, point the agent's `api_base` at it, run Harbor, and `finish` with the reward to get the samples. A retry gets a fresh trajectory. |
+| `skyrl/integration/harbor_skycap/record_index.py` | `SkycapRecordIndex`, a trainer callback: the per-step W&B index of the trajectories the generator logged in a `RecordLog`; and `pull`, which brings a run's records and index back from W&B. Nothing in it is Harbor's. |
+| `skyrl/integration/harbor_skycap/compose.py` | Samples to a step-wise `GeneratorOutput`: a trial's paths are contiguous under its `TrajectoryID`, the last one marked `is_last_step` and carrying the reward. |
 
 What's imposed on every call:
 - **Sampling:** `generator.sampling_params` (`temperature`, `top_p`, `top_k`, `min_p`), since the trainer computes logprobs with them.
@@ -175,7 +209,7 @@ counted in `generate/skycap/num_missing_route_trajectories`.
 ## Tests
 
 ```bash
-uv run --isolated --extra skyrl-train --extra harbor --extra skycap --extra dev pytest tests/integrations/harbor_skycap
+uv run --isolated --extra skyrl-train --extra harbor --extra skycap --extra dev pytest tests/integrations
 ```
 
 A fake Harbor trial talks HTTP to a real skycap server, which calls a mock of

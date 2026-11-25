@@ -8,6 +8,7 @@ Automatically handles GPU placement:
 The trainer interacts with the worker dispatch if all models are always on GPU.
 """
 
+import asyncio
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -91,6 +92,11 @@ class WorkerDispatch:
         # Not initialized yet -- callers register, then call init_model(), which
         # records the model as resident.
         self._gpu_state[model] = GPUState(model_on_gpu=False, optimizer_on_gpu=False)
+
+    def unregister_actor_group(self, model: str) -> None:
+        """Undo ``register_actor_group``, e.g. after the model failed to initialize. Does not stop its workers."""
+        self._actor_groups.pop(model, None)
+        self._gpu_state.pop(model, None)
 
     # ------------------------------------------------------------------
     # Multi-LoRA: per-model adapter swap orchestration.
@@ -493,17 +499,21 @@ class WorkerDispatch:
         self._save_memory_snapshot(model, "optim_step")
         return grad_norms[0]
 
-    def set_lr(self, model: str, learning_rate: float, model_id: Optional[str] = None) -> None:
-        """Set learning rate for model's optimizer.
+    def set_optimizer_hparams(self, model: str, adam_params, model_id: Optional[str] = None) -> None:
+        """Apply the request's AdamParams to the model's optimizer on all workers.
 
-        This directly updates the optimizer's param_groups on all workers,
-        bypassing the scheduler. Useful for external learning rate schedules.
+        lr, betas, eps and weight_decay are written into the optimizer's param groups
+        (replacing the scheduler-managed lr), and grad_clip_norm becomes the per-step
+        clip. Directly updates the param_groups, bypassing the scheduler; useful for
+        external optimization schedules (e.g. from Tinker).
         """
         self._ensure_on_gpu(model, need_optimizer=True, need_model=False)
         self.ensure_active_adapter(model, model_id)
         deadline.ray_get(
-            self._actor_groups[model].async_run_ray_method("pass_through", "set_lr", learning_rate=learning_rate),
-            "set_lr",
+            self._actor_groups[model].async_run_ray_method(
+                "pass_through", "set_optimizer_hparams", adam_params=adam_params
+            ),
+            "set_optimizer_hparams",
         )
 
     def set_algorithm_config(self, model: str, **kwargs) -> None:
@@ -592,6 +602,59 @@ class WorkerDispatch:
             logger.warning(f"[profiler] dump_profiler_summary dispatch for {model} failed: {e}")
             return None
 
+    def get_device_name(self, model: str) -> str:
+        """Returns the CUDA device name of ``model``'s first worker, or ``""`` if the call fails."""
+        actor = self._actor_groups[model]._actor_handlers[0]
+        try:
+            return deadline.ray_get(actor.get_device_name.remote(), "get_device_name")
+        except deadline.StepTimeoutError:
+            raise
+        except Exception as e:
+            logger.warning(f"[mfu] get_device_name dispatch for {model} failed: {e}")
+            return ""
+
+    def pop_train_compute_seconds(self, model: str) -> Optional[float]:
+        """Returns the slowest worker's seconds in ``forward_backward`` and ``optim_step``.
+
+        Counts time since the previous call and resets every worker's count. Returns None when the
+        backend doesn't track it or the call fails; this is telemetry.
+        """
+        if model not in self._actor_groups:
+            return None
+        refs = self._actor_groups[model].async_run_ray_method("pass_through", "pop_train_compute_seconds")
+        try:
+            seconds = [s for s in deadline.ray_get(refs, "pop_train_compute_seconds") if s is not None]
+        except deadline.StepTimeoutError:
+            raise
+        except Exception as e:
+            logger.warning(f"[mfu] pop_train_compute_seconds dispatch for {model} failed: {e}")
+            return None
+        return max(seconds) if seconds else None
+
+    def model_flops(
+        self, model: str, num_seqs: int, seqlen_sum: int, seqlen_squared_sum: int
+    ) -> Optional[Dict[str, float]]:
+        """Returns the forward + backward model FLOPs of a batch with these per-document statistics.
+
+        Every rank holds the same model config, so only the first worker is asked. Returns None
+        when the backend can't estimate FLOPs or the call fails; this is telemetry.
+        """
+        if model not in self._actor_groups:
+            return None
+        actor = self._actor_groups[model]._actor_handlers[0]
+        try:
+            return deadline.ray_get(
+                actor.model_flops.remote(
+                    num_seqs=num_seqs, seqlen_sum=seqlen_sum, seqlen_squared_sum=seqlen_squared_sum
+                ),
+                "model_flops",
+            )
+        except deadline.StepTimeoutError:
+            raise
+        except Exception as e:
+            logger.warning(f"[mfu] model_flops dispatch for {model} failed: {e}")
+            return None
+
     def _save_memory_snapshot(self, model: str, tag: str) -> None:
         """Save memory snapshot on workers."""
         deadline.ray_get(
@@ -618,6 +681,13 @@ class WorkerDispatch:
         deadline.ray_get(
             self._actor_groups[model].async_run_ray_method("pass_through", "finalize_pending_saves"),
             "finalize_pending_saves",
+        )
+
+    def release_optimizer_state_files(self, model: str) -> None:
+        """Delete ``model``'s optimizer state files at the end of training (no-op unless it keeps any)."""
+        deadline.ray_get(
+            self._actor_groups[model].async_run_ray_method("pass_through", "release_optimizer_state_files"),
+            "release_optimizer_state_files",
         )
 
     def load_checkpoint(
@@ -837,8 +907,19 @@ class WorkerDispatch:
         self.last_resume_generation_seconds = None
         adapter_only_sync = self.colocate_all and self._is_lora_no_merge()
 
-        def _broadcast_and_finish() -> None:
+        def _transfer() -> None:
+            self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
+            self._finish_weight_sync(adapter_only_sync=adapter_only_sync)
+
+        async def _broadcast_and_finish() -> None:
             """The weight transfer proper, timed on its own.
+
+            The transfer blocks on ``ray.get`` for the whole broadcast, so it runs in a
+            worker thread: on the event loop it would stall every coroutine sharing the
+            loop (the fully-async generators) and expire their timeouts. A cancellation
+            waits for the transfer to finish before propagating (chained to the transfer's
+            error, if any), so the enclosing resume bracket never resumes generation onto
+            partially transferred weights.
 
             ``last_weight_sync_seconds`` is surfaced as
             ``timing/sync_weights_only_transfer`` via :meth:`get_timing_metrics`,
@@ -846,8 +927,17 @@ class WorkerDispatch:
             enclosing pause/resume bracket too.
             """
             start = time.perf_counter()
-            self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
-            self._finish_weight_sync(adapter_only_sync=adapter_only_sync)
+            with deadline.operation("broadcast_to_inference_engines"):
+                transfer = asyncio.ensure_future(asyncio.to_thread(_transfer))
+                cancelled = False
+                while not transfer.done():
+                    try:
+                        await asyncio.wait({transfer})
+                    except asyncio.CancelledError:
+                        cancelled = True
+                if cancelled:
+                    raise asyncio.CancelledError() from transfer.exception()
+                transfer.result()
             self.last_weight_sync_seconds = time.perf_counter() - start
 
         async def _resume_generation_timed() -> None:
@@ -862,16 +952,17 @@ class WorkerDispatch:
         self.ensure_active_adapter("policy", model_id, require_model_resident=not adapter_only_sync)
         if self.colocate_all:
             await self._inference_engine_client.wake_up(tags=["weights"])
-            _broadcast_and_finish()
+            await _broadcast_and_finish()
             await self._inference_engine_client.wake_up(tags=["kv_cache"])
         else:
             strategy = self.cfg.trainer.strategy
-            is_lora = self.cfg.trainer.policy.model.lora.rank > 0
+            lora_cfg = self.cfg.trainer.policy.model.lora
+            is_lora = lora_cfg.rank > 0 and not lora_cfg.use_nora
             if is_lora and not (
                 strategy == "megatron" and self.cfg.trainer.policy.megatron_config.lora_config.merge_lora
             ):
                 # in-place lora case (mostly for multi-tenant training) - no need to pause - can just rely on load_lora_adapter to swap adapter in place
-                _broadcast_and_finish()
+                await _broadcast_and_finish()
             elif self.cfg.generator.inference_engine.offload_kv_for_weight_sync:
                 # Sleep the engine to free GPU memory during the sync (wake weights,
                 # broadcast, wake KV cache) so gpu_memory_utilization can run higher.
@@ -887,9 +978,14 @@ class WorkerDispatch:
                     self.last_pause_generation_seconds = time.perf_counter() - start
                     async with cleanup_preserving_primary(_resume_generation_timed, "resume_generation"):
                         await self._inference_engine_client.sleep_for_weight_sync(offload_kv=offload_kv)
-                        await self._inference_engine_client.wake_for_weight_sync(tags=["weights"])
-                        _broadcast_and_finish()
-                        await self._inference_engine_client.wake_for_weight_sync(tags=["kv_cache"])
+                        # Wake the KV cache even if the sync fails, so the resume above never
+                        # schedules the frozen requests onto a sleeping KV cache.
+                        async with cleanup_preserving_primary(
+                            lambda: self._inference_engine_client.wake_for_weight_sync(tags=["kv_cache"]),
+                            "wake_for_weight_sync(kv_cache)",
+                        ):
+                            await self._inference_engine_client.wake_for_weight_sync(tags=["weights"])
+                            await _broadcast_and_finish()
                 else:
                     # Synchronous trainer: generation is complete at sync time, so there
                     # are no in-flight requests to preserve. A plain sleep (discards KV,
@@ -899,20 +995,20 @@ class WorkerDispatch:
                         lambda: self._inference_engine_client.wake_up(tags=["kv_cache"]), "wake_up(kv_cache)"
                     ):
                         await self._inference_engine_client.wake_up(tags=["weights"])
-                        _broadcast_and_finish()
+                        await _broadcast_and_finish()
             else:
                 # Non-colocated single tenant: pause generation to prevent in-flight requests from
                 # reading partially-updated weights during the NCCL broadcast.
                 if self.cfg.generator.inference_engine.weight_sync_backend == "delta":
                     # Delta disk sync performs publish/fetch before pausing and
                     # pauses internally only around the final reload.
-                    _broadcast_and_finish()
+                    await _broadcast_and_finish()
                 else:
                     start = time.perf_counter()
                     await self._inference_engine_client.pause_generation()
                     self.last_pause_generation_seconds = time.perf_counter() - start
                     async with cleanup_preserving_primary(_resume_generation_timed, "resume_generation"):
-                        _broadcast_and_finish()
+                        await _broadcast_and_finish()
 
         # Advance the policy version so prefix-cache salting isolates blocks from the previous weights
         # (see `GeneratorConfig.use_cache_salt`).

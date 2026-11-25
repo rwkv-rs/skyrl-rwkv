@@ -162,6 +162,7 @@ def mock_env_cfg():
 @pytest.mark.parametrize("training_phase", [TRAINING_PHASE_TRAIN, TRAINING_PHASE_EVAL])
 @pytest.mark.parametrize("batched", [False, True])
 @pytest.mark.parametrize("strict_mode", [False, True])
+@pytest.mark.parametrize("max_env_workers", [0, 2])
 @pytest.mark.parametrize(
     "response, response_ids, stop_reason, strict_reward",
     [
@@ -182,6 +183,7 @@ async def test_generate_prepared_gsm8k_reward_contract(
     training_phase,
     batched,
     strict_mode,
+    max_env_workers,
     response,
     response_ids,
     stop_reason,
@@ -192,7 +194,7 @@ async def test_generate_prepared_gsm8k_reward_contract(
     generator_cfg.use_conversation_multi_turn = False
     generator_cfg.preserve_truncated_action_mask = True
     generator_cfg.sampling_params.logprobs = 1
-    gym_cfg = SkyRLGymConfig(max_env_workers=0)
+    gym_cfg = SkyRLGymConfig(max_env_workers=max_env_workers)
     gym_cfg.gsm8k.strict_reward = strict_mode
     mock_tokenizer.decode.side_effect = lambda ids: response
     mock_llm.generate.return_value = {
@@ -863,7 +865,9 @@ async def test_agent_loop_keeps_the_generated_eos_support_row_in_single_turn_mod
             "responses": ["mocked output"],
             "response_ids": [[10, 11, 4]],
             "stop_reasons": ["stop"],
-            "rollout_sample_support": [csr([[10, 110], [11, 111], eos_support_row])],
+            "rollout_sample_support": [
+                csr([[10, 110], [11, 111], eos_support_row], logprobs=[[-0.1, -2.0], [-0.2, -2.1], [-0.3, -2.2]])
+            ],
         }
 
     mock_llm.generate = AsyncMock(side_effect=generate)
@@ -888,6 +892,9 @@ async def test_agent_loop_keeps_the_generated_eos_support_row_in_single_turn_mod
     np.testing.assert_array_equal(
         dense(output.rollout_sample_support),
         np.array([[10, 110], [11, 111], eos_support_row], dtype=SAMPLE_SUPPORT_DTYPE),
+    )
+    np.testing.assert_array_equal(
+        output.rollout_sample_support.logprobs, np.float32([-0.1, -2.0, -0.2, -2.1, -0.3, -2.2])
     )
 
 
@@ -917,7 +924,7 @@ async def test_agent_loop_pads_a_stop_string_eos_support_row_in_single_turn_mode
             "responses": ["mocked output"],
             "response_ids": [[10, 11]],
             "stop_reasons": ["stop"],
-            "rollout_sample_support": [csr([[10, 110], [11, 111]])],
+            "rollout_sample_support": [csr([[10, 110], [11, 111]], logprobs=[[-0.1, -2.0], [-0.2, -2.1]])],
         }
 
     mock_llm.generate = AsyncMock(side_effect=generate)
@@ -938,6 +945,8 @@ async def test_agent_loop_pads_a_stop_string_eos_support_row_in_single_turn_mode
     )
 
     assert output.response_ids == [10, 11, 4]
+    # The appended EOS row has no members, so it adds no logprobs.
+    np.testing.assert_array_equal(output.rollout_sample_support.logprobs, np.float32([-0.1, -2.0, -0.2, -2.1]))
     padding_row = [-1, -1]
     np.testing.assert_array_equal(
         dense(output.rollout_sample_support),

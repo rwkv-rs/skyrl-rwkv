@@ -82,7 +82,6 @@ from skyrl.backends.skyrl_train.inference_servers.generate_wire import (
     PackedField,
     decode_packed_routed_experts,
     decode_packed_sample_support,
-    decode_packed_sample_support_logprobs,
     load_packed_body,
 )
 from skyrl.backends.skyrl_train.utils.routed_experts import RoutedExpertIndices
@@ -317,10 +316,14 @@ class RemoteGenerateClient:
     ) -> Any:
         """POST JSON with retries, optionally splicing packed arrays before parsing."""
         session = await self._get_session()
+        # Encode once, with orjson: a long-context request is ~100k+ token ids, which stdlib json (aiohttp's
+        # json=) encodes ~6x slower (~7 ms vs ~1.2 ms at 155k tokens), all on the client's single event loop.
+        data = orjson.dumps(json, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY)
+        headers = {"Content-Type": "application/json", **(headers or {})}
         last_exc: Optional[Exception] = None
         for attempt in range(_DATA_PLANE_RETRIES):
             try:
-                async with session.post(url, json=json, headers=headers) as resp:
+                async with session.post(url, data=data, headers=headers) as resp:
                     try:
                         raw = await resp.read()
                         body = load_packed_body(raw) if packed_side_channels else orjson.loads(raw)
@@ -365,11 +368,17 @@ class RemoteGenerateClient:
         return_routed_experts: bool = False,
         routed_experts_prompt_start: Optional[int] = None,
         return_sample_support: bool = False,
+        return_sample_support_logprobs: bool = False,
         sample_support_top_k: Optional[int] = None,
         mm_features: Optional[MultiModalFeatures] = None,
         cache_salt: Optional[str] = None,
     ) -> RemoteGenerateResult:
-        """Generate one raw-token completion with optional per-token replay metadata."""
+        """Generate one raw-token completion with optional per-token replay metadata.
+
+        ``return_sample_support_logprobs`` also returns each support member's sampler logprob.
+        """
+        if return_sample_support_logprobs and not return_sample_support:
+            raise ValueError("return_sample_support_logprobs requires return_sample_support=True")
         if routed_experts_prompt_start is not None:
             if not return_routed_experts:
                 raise ValueError("routed_experts_prompt_start requires return_routed_experts=True")
@@ -394,6 +403,8 @@ class RemoteGenerateClient:
             payload["return_sample_support"] = True
             if sample_support_top_k is not None:
                 payload["sample_support_top_k"] = sample_support_top_k
+        if return_sample_support_logprobs:
+            payload["return_sample_support_logprobs"] = True
         if mm_features:
             payload["features"] = mm_features
         # `cache_salt` is a top-level request field (forwarded to vLLM's TokensPrompt), not a sampling
@@ -432,12 +443,12 @@ class RemoteGenerateClient:
             packed_sample_support = choice.get(PackedField.ROLLOUT_SAMPLE_SUPPORT)
             if not isinstance(packed_sample_support, dict):
                 raise ValueError("/skyrl/v1/generate must return packed rollout_sample_support")
-            sample_support = decode_packed_sample_support(packed_sample_support)
-            packed_sample_support_logprobs = choice.get(PackedField.ROLLOUT_SAMPLE_SUPPORT_LOGPROBS)
-            if isinstance(packed_sample_support_logprobs, dict):
-                sample_support = sample_support.with_logprobs(
-                    decode_packed_sample_support_logprobs(packed_sample_support_logprobs)
-                )
+            packed_logprobs = None
+            if return_sample_support_logprobs:
+                packed_logprobs = choice.get(PackedField.ROLLOUT_SAMPLE_SUPPORT_LOGPROBS)
+                if not isinstance(packed_logprobs, dict):
+                    raise ValueError("/skyrl/v1/generate must return packed rollout_sample_support_logprobs")
+            sample_support = decode_packed_sample_support(packed_sample_support, packed_logprobs)
 
         return RemoteGenerateResult(
             raw_response=response,
@@ -524,6 +535,9 @@ class RemoteInferenceClient(InferenceEngineInterface):
     """Whether the engine may return the sampler's bounded top-k support per generated token.
     Capture is per-request: callers opt a batch in with ``InferenceEngineInput.return_sample_support``."""
 
+    enable_return_sample_support_logprobs: bool = False
+    """Whether captured support also carries each member's sampler logprob (score centering).
+    Requires ``enable_return_sample_support_set``."""
     sample_support_top_k: Optional[int] = None
     """Diagnostic support width; independent of the rollout sampler's ``top_k``."""
 
@@ -677,6 +691,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         return_sample_support = self.enable_return_sample_support_set and input_batch.get(
             "return_sample_support", False
         )
+        return_sample_support_logprobs = return_sample_support and self.enable_return_sample_support_logprobs
         sample_support_top_k = input_batch.get("sample_support_top_k", self.sample_support_top_k)
         get_logprobs = sampling_params.get("logprobs") is not None
 
@@ -705,6 +720,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
                         routed_experts_prompt_starts[idx] if routed_experts_prompt_starts is not None else None
                     ),
                     return_sample_support=return_sample_support,
+                    return_sample_support_logprobs=return_sample_support_logprobs,
                     sample_support_top_k=sample_support_top_k,
                     model=model,
                     cache_salt=cache_salt,
@@ -719,6 +735,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
                         routed_experts_prompt_starts[idx] if routed_experts_prompt_starts is not None else None
                     ),
                     return_sample_support=return_sample_support,
+                    return_sample_support_logprobs=return_sample_support_logprobs,
                     sample_support_top_k=sample_support_top_k,
                     model=model,
                     cache_salt=cache_salt,
@@ -759,6 +776,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         cache_salt: Optional[str] = None,
         routed_experts_prompt_start: Optional[int] = None,
         return_sample_support: bool = False,
+        return_sample_support_logprobs: bool = False,
         sample_support_top_k: Optional[int] = None,
     ) -> Dict[str, Any]:
         result = await self._get_generate_client().generate(
@@ -769,6 +787,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
             return_routed_experts=self.enable_return_routed_experts,
             routed_experts_prompt_start=routed_experts_prompt_start,
             return_sample_support=return_sample_support,
+            return_sample_support_logprobs=return_sample_support_logprobs,
             sample_support_top_k=sample_support_top_k,
             mm_features=mm_features,
             cache_salt=cache_salt,
@@ -1204,7 +1223,8 @@ class RemoteInferenceClient(InferenceEngineInterface):
         session = await self._get_session()
         url = f"{server_url}{endpoint}"
         async with _control_plane_request(session, method, url, json=json, params=params) as resp:
-            body = await _read_json_body(resp) if resp.content_length else None
+            raw_body = await resp.read()
+            body = await _read_json_body(resp) if raw_body else None
             raise_for_status(resp, body)
             return server_url, {"status": resp.status, "body": body}
 
@@ -1293,11 +1313,10 @@ class RemoteInferenceClient(InferenceEngineInterface):
             )
             level = 1
         # vLLM's /sleep pauses the scheduler (default mode "abort") and, at level >= 1, resets
-        # the prefix cache including running requests. With routed-experts capture enabled
-        # (`enable_return_routed_experts`), vLLM 0.31 only allows that reset after a "keep"
-        # pause, so a plain /sleep fails with "AuxOutput Connector only supports resetting
-        # running requests after pause(mode='keep')". Abort in-flight requests explicitly
-        # first, then sleep in "keep" mode: the same end state for every engine config.
+        # the prefix cache including running requests. vLLM 0.31 rejected that reset with
+        # routed-experts capture (`enable_return_routed_experts`) unless paused in "keep" mode;
+        # vllm#59060 (in 0.32) lifted that. Abort in-flight requests explicitly first, then sleep
+        # in "keep" mode: the same end state for every engine config.
         await self.pause(mode=PauseMode.ABORT, clear_cache=False)
         params: Dict[str, Any] = {"level": str(level), "mode": PauseMode.KEEP.value}
         if tags:
@@ -1353,8 +1372,37 @@ class RemoteInferenceClient(InferenceEngineInterface):
 
         Returns:
             Dict mapping server_url to response.
+
+        Raises:
+            RuntimeError: A server did not confirm the reset.
         """
-        return await self._call_all_servers("/reset_prefix_cache", {"reset_running_requests": reset_running_requests})
+        # Settle every reset before raising so none remain in flight on return.
+        with deadline.operation("/reset_prefix_cache"):
+            results = await asyncio.gather(
+                *[
+                    self._call_server(
+                        url,
+                        "/reset_prefix_cache",
+                        params={"reset_running_requests": str(reset_running_requests).lower()},
+                    )
+                    for url in self.server_urls
+                ],
+                return_exceptions=True,
+            )
+        responses = {}
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+            url, response = result
+            responses[url] = response
+        failed_servers = [
+            url
+            for url, response in responses.items()
+            if not isinstance(response["body"], dict) or response["body"].get("success") is not True
+        ]
+        if failed_servers:
+            raise RuntimeError(f"Prefix cache reset failed on {failed_servers}")
+        return responses
 
     # ---------------------------
     # Weight Sync (control plane - fan-out)

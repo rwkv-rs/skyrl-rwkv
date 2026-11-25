@@ -99,13 +99,14 @@ def test_full_weight_sync_uses_inference_namespace(monkeypatch, is_multimodal_lm
     model = SimpleNamespace(state_dict=lambda: {source_name: source_tensor})
     # Exercise the current source factory without initializing distributed workers.
     worker = object.__new__(FSDPPolicyWorkerBase)
+    worker.cfg = SimpleNamespace(policy=SimpleNamespace(model=SimpleNamespace(lora=SimpleNamespace(use_nora=False))))
     worker.model = SimpleNamespace(model=model)
     worker._is_multimodal_lm_only = is_multimodal_lm_only
     monkeypatch.setattr(sources_mod, "materialize_full_tensor", lambda tensor: tensor)
 
     source = worker._build_weight_source(torch.float32, backend="nccl")
-    assert [meta.name for meta in source.metadata()] == [expected_prefix + source_name]
-    exported = list(source)
+    assert [meta.name for meta in source.metadata] == [expected_prefix + source_name]
+    exported = list(source.iter_full())
     assert [name for name, _ in exported] == [expected_prefix + source_name]
     assert torch.equal(exported[0][1], source_tensor)
 

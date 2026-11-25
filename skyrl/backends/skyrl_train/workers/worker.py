@@ -16,8 +16,10 @@ from loguru import logger
 from omegaconf import OmegaConf
 from ray import ObjectRef
 from ray.util.placement_group import (
+    PlacementGroup,
     placement_group,
     placement_group_table,
+    remove_placement_group,
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from torch.optim import Optimizer
@@ -43,11 +45,20 @@ from skyrl.backends.skyrl_train.training_batch import (
 from skyrl.backends.skyrl_train.utils.io import io
 from skyrl.backends.skyrl_train.utils.ppo_utils import (
     PolicyLossRegistry,
+    PolicyLossType,
     compute_approx_kl,
     ppo_critic_loss,
+    score_centering_weight,
 )
 from skyrl.backends.skyrl_train.utils.profiler import Profiler
-from skyrl.backends.skyrl_train.utils.sample_support import SAMPLE_SUPPORT_FIELD
+from skyrl.backends.skyrl_train.utils.sample_support import (
+    SAMPLE_SUPPORT_FIELD,
+    SCORE_CENTERING_SCORES_KEY,
+)
+from skyrl.backends.skyrl_train.utils.sample_support_replay import (
+    score_centering_loss_inputs,
+    score_centering_metrics,
+)
 from skyrl.backends.skyrl_train.utils.torch_utils import masked_mean
 from skyrl.backends.skyrl_train.workers.worker_utils import (
     BaseBatchIterator,
@@ -62,17 +73,48 @@ from skyrl.env_vars import (
     SKYRL_RAY_PG_TIMEOUT_IN_S,
     SKYRL_WORKER_NCCL_TIMEOUT_IN_S,
 )
+from skyrl.tinker import types as tinker_types
 from skyrl.train.config import TorchProfilerConfig, TrainerConfig
 from skyrl.train.dataset.replay_buffer import Experience
 from skyrl.train.utils import deadline
 from skyrl.train.utils.utils import (
     ResolvedPlacementGroup,
+    cleanup_on_error,
     configure_ray_worker_logging,
     get_ray_pg_ready_with_timeout,
     ray_noset_visible_devices,
 )
 
 _SET_AFFINITY = False
+
+
+def _apply_adam_params_to_group(param_group: dict, adam_params: tinker_types.AdamParams) -> None:
+    """Write the request's AdamParams into one optimizer param group.
+
+    Every Adam implementation in play (torch's eager and fused, Megatron's, apex's)
+    reads ``lr``/``betas``/``eps``/``weight_decay`` from the group inside ``step()``,
+    so per-step writes take effect without touching the optimizer objects.
+    ``weight_decay`` is only written where the optimizer already decays at build time,
+    so groups excluded from decay (e.g. Megatron's no-decay groups, ``wd_mult == 0``)
+    keep their ``0`` instead of decaying by the request's value. Whether a group
+    decays is a build-time decision, so it is latched here on the first visit: a
+    request's ``weight_decay=0`` zeroes a decaying group for that step only and later
+    requests can decay again, while structurally no-decay groups stay ``0`` forever.
+    """
+    param_group["lr"] = adam_params.learning_rate
+    param_group["betas"] = (adam_params.beta1, adam_params.beta2)
+    param_group["eps"] = adam_params.eps
+    if "skyrl_decaying_group" not in param_group:
+        # Megatron's structural exclusion lives in wd_mult: bias and 1-shape groups get 0.0
+        # while every group's weight_decay holds the same build-time default until the param
+        # scheduler folds wd_mult into it (after optimizer.step). A torch-built group carries
+        # no wd_mult; there the build-time weight_decay is the decision.
+        param_group["skyrl_decaying_group"] = (
+            param_group["wd_mult"] != 0.0 if "wd_mult" in param_group else bool(param_group["weight_decay"])
+        )
+    if param_group["skyrl_decaying_group"]:
+        param_group["weight_decay"] = adam_params.weight_decay
+
 
 # Allocation/free events kept in the ``record_memory`` history ring buffer. Live
 # blocks in a snapshot keep their allocation stacks regardless of this cap; it
@@ -417,6 +459,10 @@ class Worker(DistributedTorchRayActor):
         """Return this rank's last-window kernel summary, or None."""
         return self.profiler.get_kernel_summary() if self.profiler is not None else None
 
+    def get_device_name(self) -> str:
+        """Returns this worker's CUDA device name, e.g. ``"NVIDIA B200"``, or ``""`` without a GPU."""
+        return torch.cuda.get_device_name() if torch.cuda.is_available() else ""
+
     def _get_module_for_offload(self):
         """Return the model module(s) to be offloaded/backloaded. Megatron offloads `self.actor_module`. FSDP workers use `self.model` directly."""
         return self.model
@@ -694,6 +740,12 @@ class Worker(DistributedTorchRayActor):
         if finalize is not None:
             finalize()
 
+    def release_optimizer_state_files(self):
+        """Delete optimizer state kept in files (Megatron ``optimizer_offload_to_disk``) at the end of training."""
+        release = getattr(self.strategy, "release_optimizer_state_files", None)
+        if release is not None and getattr(self, "optimizer", None) is not None:
+            release(self.optimizer)
+
     def load_checkpoint(self, ckpt_dir: str, load_optimizer_states: bool = True, load_lr_scheduler_states: bool = True):
         _, states = self.strategy.load_checkpoint(
             model=self.model,
@@ -722,18 +774,27 @@ class Worker(DistributedTorchRayActor):
             return None
         return self.optimizer.param_groups[0]["lr"]
 
-    def set_lr(self, learning_rate: float) -> None:
-        """
-        Set learning rate for the optimizer.
+    def set_optimizer_hparams(self, adam_params: tinker_types.AdamParams) -> None:
+        """Apply the request's ``AdamParams`` to the live optimizer before each ``optim_step``.
 
-        This directly updates the optimizer's param_groups, bypassing the scheduler.
-        Useful for external learning rate schedules (e.g., from Tinker). No-op when
-        ``policy.inference_only_init=True`` (no optimizer constructed).
+        ``lr``, ``betas``, ``eps`` and ``weight_decay`` live in the optimizer's param groups,
+        and every Adam implementation reads them from there on each step, so writing the
+        groups is all that is needed for the request's values to take effect.
+        ``weight_decay`` is only written where the optimizer already decays: groups excluded
+        at build time (e.g. Megatron's no-decay groups) keep their ``0``. ``grad_clip_norm``
+        (``0.0`` disables clipping, as in the Tinker SDK) is written wherever the backend
+        reads its per-step clip: an FSDP strategy clips with ``self.strategy.max_norm``,
+        and the Megatron worker overrides this method for its optimizer configs.
+        No-op when the worker was initialized with ``policy.inference_only_init=True``
+        (no optimizer constructed).
         """
         if self.optimizer is None:
             return
         for param_group in self.optimizer.param_groups:
-            param_group["lr"] = learning_rate
+            _apply_adam_params_to_group(param_group, adam_params)
+        # Only the FSDP strategies expose a per-step max_norm; other strategies clip elsewhere.
+        if hasattr(getattr(self, "strategy", None), "max_norm"):
+            self.strategy.max_norm = adam_params.grad_clip_norm
 
 
 # adapted from OpenReasonerZero: https://github.com/Open-Reasoner-Zero/Open-Reasoner-Zero/blob/main/orz/ppo/actors.py
@@ -785,7 +846,11 @@ class PPORayActorGroup:
         self.sequence_parallel_size = sequence_parallel_size
         self.record_memory = record_memory
         self._last_dp_size: Optional[int] = None
-        self._initiate_actors(pg, num_gpus_per_actor)
+        self._actor_handlers = []
+        self.actor_infos = []
+        self._internal_pg: Optional[PlacementGroup] = None
+        with cleanup_on_error(self.shutdown, "Shutting down the actor group"):
+            self._initiate_actors(pg, num_gpus_per_actor)
 
     def _initiate_actors(self, pg: Optional[ResolvedPlacementGroup], num_gpus_per_actor: float):
         """Initialize Ray actors in the worker group.
@@ -828,6 +893,7 @@ class PPORayActorGroup:
 
             raw_pg = placement_group(bundles, strategy="PACK")
             get_ray_pg_ready_with_timeout(raw_pg, timeout=SKYRL_RAY_PG_TIMEOUT_IN_S)
+            self._internal_pg = raw_pg
 
         def _scheduling_strategy_for_rank(rank):
             if reordered_bundle_indices:
@@ -899,6 +965,16 @@ class PPORayActorGroup:
         if self.actor_infos:
             self._last_dp_size = self.actor_infos[0].rank.dp_size
         logger.info(f"Mesh Ranks: {[actor_info.rank for actor_info in self.actor_infos]}")
+
+    def shutdown(self) -> None:
+        """Kill the workers and remove the placement group this group created, if any."""
+        for actor in self._actor_handlers:
+            ray.kill(actor)
+        self._actor_handlers = []
+        self.actor_infos = []
+        if self._internal_pg is not None:
+            remove_placement_group(self._internal_pg)
+            self._internal_pg = None
 
     def async_init_model(
         self,
@@ -1134,6 +1210,13 @@ class PolicyWorkerBase(Worker):
             new_loss_config = OmegaConf.merge(OmegaConf.create(asdict(loss_config)), OmegaConf.create(loss_fn_config))
             # NOTE: users can provide a custom loss config class, so we need to use the same class after applying overrides
             loss_config = type(loss_config).from_dict_config(new_loss_config)
+        centering_weight = (
+            score_centering_weight(resolved_loss_name, loss_config)
+            if self.cfg.algorithm.enable_score_centering
+            else None
+        )
+        # The FSDP forward returns logit positions, so action t is scored one column earlier.
+        action_positions = slice(-num_actions - 1, -1)
 
         score_centering = loss_config.flashreinforce.score_centering or loss_config.rollout_is.score_centering
         # TODO (sumanthrh): don't think this does anything for fsdp rn because autocast happens internally
@@ -1154,14 +1237,23 @@ class PolicyWorkerBase(Worker):
                 ),
                 loss_mask=loss_mask if (sample_support_replay or score_centering) else None,
                 enable_sample_support_replay=sample_support_replay,
+                centering_weight=centering_weight,
                 enable_score_centering=score_centering,
                 response_mask=experience.response_mask,
             )
             # loss function
             # TODO: recompute advantages
+            centering_inputs = None
+            loss_rollout_logprobs, score_centering_kwargs = rollout_action_logprobs, {}
+            if centering_weight is not None:
+                centering_inputs = score_centering_loss_inputs(
+                    output[SCORE_CENTERING_SCORES_KEY], action_positions, rollout_action_logprobs, advantages
+                )
+                loss_rollout_logprobs = centering_inputs.sampler_logprobs
+                score_centering_kwargs = centering_inputs.loss_kwargs()
             policy_loss_kwargs = {
                 "loss_mask": loss_mask,
-                "rollout_logprobs": rollout_action_logprobs,
+                "rollout_logprobs": loss_rollout_logprobs,
             }
             if resolved_loss_name == "async_opd":
                 policy_loss_kwargs["teacher_log_probs"] = base_action_log_probs
@@ -1176,10 +1268,11 @@ class PolicyWorkerBase(Worker):
                 advantages,
                 config=loss_config,
                 **policy_loss_kwargs,
+                **score_centering_kwargs,
             )
 
-        # SFT path: skip KL/entropy terms, return per-token outputs for Tinker API
-        if resolved_loss_name == "cross_entropy":
+        # SFT objectives contain their complete loss and need no RL KL/entropy terms.
+        if resolved_loss_name == PolicyLossType.CROSS_ENTROPY:
             # Policy loss masks are pre-scaled to achieve the correct reduction
             # when summing across the entire minibatch (see `DefaultCollator`).
             # FSDP averages loss value over DP ranks by default,
@@ -1303,6 +1396,12 @@ class PolicyWorkerBase(Worker):
             }
             for k, v in loss_metrics.items():
                 status["loss_metrics/" + k] = v
+            if centering_inputs is not None:
+                status.update(
+                    score_centering_metrics(
+                        output[SCORE_CENTERING_SCORES_KEY], centering_inputs, action_positions, loss_mask
+                    )
+                )
             if self.cfg.algorithm.use_kl_loss:
                 status["policy_kl"] = kl_loss.item()
             status.update(

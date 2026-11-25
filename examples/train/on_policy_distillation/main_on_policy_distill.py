@@ -52,6 +52,7 @@ class RWKVEvalConfig(BaseConfig):
 
 @dataclass
 class OnPolicyDistillationAlgorithmConfig(AlgorithmConfig):
+    loss_reduction: str = "token_mean"
     lighteval: RWKVEvalConfig = field(default_factory=RWKVEvalConfig)
     proximal_teacher_alpha: float = 1.0
     """TOP-D probability mixture weight for the teacher; 1.0 preserves native OPD."""

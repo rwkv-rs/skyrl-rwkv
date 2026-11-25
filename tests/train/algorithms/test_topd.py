@@ -718,6 +718,7 @@ async def test_native_group_streaming_matches_complete_topd_stopd_optimizer(obje
     for streaming in [False, True]:
         obj = object.__new__(trainer_class)
         obj.cfg, obj.global_step, obj.mini_batch_size = cfg, 1, 2
+        obj._mfu_tracker = None
         obj.stopd = STOPD(8, 2, 0, 11, require_denominator=False)
         obj.tokenizer = SimpleNamespace(pad_token_id=0)
         obj.all_metrics, obj.all_timings = {}, {}

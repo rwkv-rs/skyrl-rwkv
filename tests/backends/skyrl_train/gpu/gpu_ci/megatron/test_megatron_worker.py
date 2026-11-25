@@ -16,12 +16,17 @@ from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
     get_sampling_params_for_backend,
 )
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
+from skyrl.backends.skyrl_train.utils.ppo_utils import (
+    PolicyLossType,
+    apply_loss_reduction_to_advantages_minibatch,
+)
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
 from skyrl.train.config import (
     SkyRLLoraConfig,
     SkyRLTrainConfig,
     TorchProfilerConfig,
 )
+from skyrl.train.fused_lm_head import FusedLmHeadBackend
 from skyrl.train.utils.utils import (
     print_mem,
     validate_cfg,
@@ -506,19 +511,23 @@ async def test_megatron_lora_forward(ray_init_fixture, tp, pp, cp, ep, etp, gpus
         "gpus_per_node",
         "remove_microbatch_padding",
         "use_entropy_loss",
+        "fused_lm_head_backend",
         "lora",
         "cp_comm_type",
     ),
     [
-        ("policy", 2, 2, 1, 1, 1, 4, True, False, False, None),
-        ("policy", 2, 2, 1, 1, 1, 4, True, True, False, None),
-        ("policy", 2, 2, 1, 1, 1, 4, True, False, True, None),
-        ("policy", 2, 2, 1, 1, 1, 4, False, False, False, None),
-        ("policy", 2, 1, 2, 1, 1, 4, True, False, False, None),
-        ("policy", 2, 1, 2, 1, 1, 4, True, True, False, None),
-        ("policy", 2, 1, 2, 1, 1, 4, True, False, False, "a2a"),
-        ("policy", 4, 1, 1, 4, 1, 4, True, False, False, None),
-        ("policy", 4, 1, 1, 4, 1, 4, True, False, True, None),
+        ("policy", 2, 2, 1, 1, 1, 4, True, False, None, False, None),
+        ("policy", 2, 2, 1, 1, 1, 4, True, True, None, False, None),
+        ("policy", 2, 2, 1, 1, 1, 4, True, False, None, True, None),
+        ("policy", 2, 2, 1, 1, 1, 4, False, False, None, False, None),
+        ("policy", 2, 1, 2, 1, 1, 4, True, False, None, False, None),
+        ("policy", 2, 1, 2, 1, 1, 4, True, True, None, False, None),
+        ("policy", 2, 1, 2, 1, 1, 4, True, True, "torch", False, None),
+        ("policy", 2, 1, 2, 1, 1, 4, True, True, "triton", False, None),
+        ("policy", 2, 1, 2, 1, 1, 4, True, True, FusedLmHeadBackend.TRITON_BLOCK_SPARSE, False, None),
+        ("policy", 2, 1, 2, 1, 1, 4, True, False, None, False, "a2a"),
+        ("policy", 4, 1, 1, 4, 1, 4, True, False, None, False, None),
+        ("policy", 4, 1, 1, 4, 1, 4, True, False, None, True, None),
     ],
     ids=[
         "tp2_pp2_policy_seq_packing",
@@ -527,6 +536,9 @@ async def test_megatron_lora_forward(ray_init_fixture, tp, pp, cp, ep, etp, gpus
         "tp2_pp2_policy_unpacked",
         "tp2_cp2_policy_seq_packing_no_entropy_loss",
         "tp2_cp2_policy_seq_packing_with_entropy_loss",
+        "tp2_cp2_policy_seq_packing_fused_torch_entropy_loss",
+        "tp2_cp2_policy_seq_packing_fused_triton_entropy_loss",
+        "tp2_cp2_policy_seq_packing_fused_triton_block_sparse_entropy_loss",
         "tp2_cp2_policy_seq_packing_no_entropy_loss_a2a",
         "tp4_pp1_cp1_ep4_etp1_policy_seq_packing",
         "tp4_pp1_cp1_ep4_etp1_policy_seq_packing_lora",
@@ -544,6 +556,7 @@ async def test_megatron_train(
     gpus_per_node,
     remove_microbatch_padding,
     use_entropy_loss,
+    fused_lm_head_backend,
     lora,
     cp_comm_type,
 ):
@@ -568,6 +581,12 @@ async def test_megatron_train(
     if use_entropy_loss:
         cfg.trainer.algorithm.use_entropy_loss = True
         cfg.trainer.algorithm.entropy_loss_coef = 0.01
+    if fused_lm_head_backend is not None:
+        cfg.trainer.fused_lm_head_logprob = True
+        cfg.trainer.fused_lm_head_logprob_backend = fused_lm_head_backend
+        if fused_lm_head_backend == FusedLmHeadBackend.TRITON_BLOCK_SPARSE:
+            cfg.trainer.algorithm.policy_loss_type = PolicyLossType.ROLLOUT_IS
+            batch["action_log_probs"] = None
     if lora:
         cfg.trainer.policy.model.lora = SkyRLLoraConfig(rank=16, alpha=16)
 
@@ -590,6 +609,15 @@ async def test_megatron_train(
     cfg.trainer.policy_mini_batch_size = gpus_per_node
     cfg.generator.n_samples_per_prompt = 1
     cfg.trainer.micro_train_batch_size_per_gpu = 1
+    # Match the trainer's loss reduction before dispatching directly to the workers.
+    batch["advantages"] = apply_loss_reduction_to_advantages_minibatch(
+        advantages=batch["advantages"],
+        loss_mask=batch["loss_mask"],
+        loss_reduction=cfg.trainer.algorithm.loss_reduction,
+        micro_batch_size=cfg.trainer.micro_train_batch_size_per_gpu,
+        max_seq_len=cfg.trainer.algorithm.max_seq_len,
+        prompt_boundaries=[(i, i + 1) for i in range(batch_size)],
+    )
 
     actor_group = init_worker_with_type(
         "policy",
@@ -632,6 +660,16 @@ async def test_megatron_train(
             assert (
                 "moe/seq_load_balancing_loss_layer_1" in result.metrics
             ), "Load balancing loss layer 1 should be present"
+
+    cp_entropy_contribution = None
+    if use_entropy_loss and cp > 1 and remove_microbatch_padding and fused_lm_head_backend is None:
+        # The packed loss reports CP-local entropy contributions. Take one TP
+        # replica per CP shard on the last pipeline stage.
+        cp_entropy_contribution = sum(
+            result.metrics["final_loss"] - result.metrics["policy_loss"]
+            for info, result in zip(actor_group.actor_infos, results_megatron, strict=True)
+            if info.rank.dp == 0 and info.rank.tp == 0 and info.rank.pp == info.rank.pp_size - 1
+        )
     ray.shutdown()
     ray_init_for_tests()
 
@@ -690,7 +728,14 @@ async def test_megatron_train(
                 # the entropy calculation is different (fsdp has random logits for padding tokens)
                 continue
             assert isinstance(result.metrics[k], (int, float)), f"{k} should be an int or float"
-            assert abs(result.metrics[k] - results_megatron[i].metrics[k]) < 5e-1, f"diff in {k} is too large!"
+            expected = results_megatron[i].metrics[k]
+            if k == "final_loss" and cp_entropy_contribution is not None:
+                expected = results_megatron[i].metrics["policy_loss"] + cp_entropy_contribution
+            if k in {"policy_loss", "final_loss"}:
+                abs_tol = 1e-4 if k == "policy_loss" else 0.0
+                assert result.metrics[k] == pytest.approx(expected, rel=2e-2, abs=abs_tol), f"diff in {k} is too large!"
+            else:
+                assert abs(result.metrics[k] - expected) < 5e-1, f"diff in {k} is too large!"
 
 
 @pytest.mark.asyncio

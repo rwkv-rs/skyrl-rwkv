@@ -28,9 +28,8 @@ from skyrl.backends.skyrl_train.utils.routed_experts import (
 from skyrl.backends.skyrl_train.utils.sample_support import (
     SAMPLE_SUPPORT_DTYPE,
     SAMPLE_SUPPORT_DTYPES,
-    SAMPLE_SUPPORT_LOGPROBS_DTYPES,
+    SAMPLE_SUPPORT_LOGPROBS_DTYPE,
     CompactSampleSupport,
-    SampleSupportLogprobs,
 )
 
 # Matches the floor vLLM applies at its own serving boundaries.
@@ -50,6 +49,7 @@ class PackedField(StrEnum):
 
     ROUTED_EXPERTS = "routed_experts"
     ROLLOUT_SAMPLE_SUPPORT = "rollout_sample_support"
+    # float32 sampler logprob of each support member, in the support's member order.
     ROLLOUT_SAMPLE_SUPPORT_LOGPROBS = "rollout_sample_support_logprobs"
 
 
@@ -69,7 +69,7 @@ _ENVELOPE_KEYS = frozenset(PackedArrayKey)
 
 _ROUTED_EXPERTS_NDIM = 3
 _SAMPLE_SUPPORT_NDIM = 1
-_SAMPLE_SUPPORT_LOGPROBS_NDIM = 1
+_SAMPLE_SUPPORT_LOGPROBS_DTYPES = frozenset({SAMPLE_SUPPORT_LOGPROBS_DTYPE})
 
 _QUOTE = b'"'
 
@@ -218,7 +218,22 @@ def pack_sample_support(sample_support: CompactSampleSupport) -> dict[str, Any]:
     )
 
 
-def decode_packed_sample_support(payload: dict[str, Any]) -> CompactSampleSupport:
+def pack_sample_support_logprobs(sample_support: CompactSampleSupport) -> dict[str, Any]:
+    if sample_support.logprobs is None:
+        raise ValueError("sample support carries no member logprobs to pack")
+    return pack_ndarray(sample_support.logprobs, allowed_dtypes=_SAMPLE_SUPPORT_LOGPROBS_DTYPES)
+
+
+def decode_packed_sample_support(
+    payload: dict[str, Any],
+    logprobs_payload: Optional[dict[str, Any]] = None,
+) -> CompactSampleSupport:
+    """Decode support rows, with each member's sampler logprob when ``logprobs_payload`` is given."""
+    member_logprobs = None
+    if logprobs_payload is not None:
+        member_logprobs, _ = unpack_ndarray(
+            logprobs_payload, allowed_dtypes=_SAMPLE_SUPPORT_LOGPROBS_DTYPES, ndim=_SAMPLE_SUPPORT_NDIM
+        )
     decoded, sidecar = unpack_ndarray(payload, allowed_dtypes=SAMPLE_SUPPORT_DTYPES, ndim=_SAMPLE_SUPPORT_NDIM)
     try:
         num_rows = sidecar[SampleSupportWireKey.NUM_ROWS]
@@ -229,29 +244,11 @@ def decode_packed_sample_support(payload: dict[str, Any]) -> CompactSampleSuppor
         raise ValueError(f"packed rollout_sample_support has invalid {SampleSupportWireKey.NUM_ROWS} {num_rows!r}")
     if not isinstance(top_k, int) or isinstance(top_k, bool):
         raise ValueError(f"packed rollout_sample_support has invalid {SampleSupportWireKey.TOP_K} {top_k!r}")
-    # CompactSampleSupport validates the offsets against the member count and top_k.
-    return CompactSampleSupport.from_token_ids(decoded[num_rows:], decoded[:num_rows], top_k=top_k)
-
-
-def pack_sample_support_logprobs(sample_support: CompactSampleSupport) -> Optional[dict[str, Any]]:
-    """Encode the sampler logprob member column, or None when the rows carry none.
-
-    The column holds one float32 score per support member and shares the support's rows, so
-    it needs no offsets of its own.
-    """
-    logprobs = sample_support.sample_support_logprobs
-    if logprobs is None:
-        return None
-    return pack_ndarray(logprobs, allowed_dtypes=SAMPLE_SUPPORT_LOGPROBS_DTYPES)
-
-
-def decode_packed_sample_support_logprobs(payload: dict[str, Any]) -> SampleSupportLogprobs:
-    decoded, _ = unpack_ndarray(
-        payload,
-        allowed_dtypes=SAMPLE_SUPPORT_LOGPROBS_DTYPES,
-        ndim=_SAMPLE_SUPPORT_LOGPROBS_NDIM,
+    # CompactSampleSupport validates the offsets against the member count and top_k, and the
+    # logprobs against the member count.
+    return CompactSampleSupport.from_token_ids(
+        decoded[num_rows:], decoded[:num_rows], top_k=top_k, logprobs=member_logprobs
     )
-    return decoded
 
 
 def _data_prefix(field: str) -> bytes:

@@ -16,7 +16,10 @@ from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
     get_sampling_params_for_backend,
 )
 from skyrl.backends.skyrl_train.training_batch import TrainingInputBatch
-from skyrl.backends.skyrl_train.utils.ppo_utils import PolicyLossType
+from skyrl.backends.skyrl_train.utils.ppo_utils import (
+    PolicyLossType,
+    apply_loss_reduction_to_advantages_minibatch,
+)
 from skyrl.backends.skyrl_train.utils.torch_utils import logprobs_from_logits
 from skyrl.train.config import (
     SkyRLLoraConfig,
@@ -606,6 +609,15 @@ async def test_megatron_train(
     cfg.trainer.policy_mini_batch_size = gpus_per_node
     cfg.generator.n_samples_per_prompt = 1
     cfg.trainer.micro_train_batch_size_per_gpu = 1
+    # Match the trainer's loss reduction before dispatching directly to the workers.
+    batch["advantages"] = apply_loss_reduction_to_advantages_minibatch(
+        advantages=batch["advantages"],
+        loss_mask=batch["loss_mask"],
+        loss_reduction=cfg.trainer.algorithm.loss_reduction,
+        micro_batch_size=cfg.trainer.micro_train_batch_size_per_gpu,
+        max_seq_len=cfg.trainer.algorithm.max_seq_len,
+        prompt_boundaries=[(i, i + 1) for i in range(batch_size)],
+    )
 
     actor_group = init_worker_with_type(
         "policy",
@@ -706,7 +718,11 @@ async def test_megatron_train(
                 # the entropy calculation is different (fsdp has random logits for padding tokens)
                 continue
             assert isinstance(result.metrics[k], (int, float)), f"{k} should be an int or float"
-            assert abs(result.metrics[k] - results_megatron[i].metrics[k]) < 5e-1, f"diff in {k} is too large!"
+            expected = results_megatron[i].metrics[k]
+            if k in {"policy_loss", "final_loss"}:
+                assert result.metrics[k] == pytest.approx(expected, rel=2e-2, abs=0.0), f"diff in {k} is too large!"
+            else:
+                assert abs(result.metrics[k] - expected) < 5e-1, f"diff in {k} is too large!"
 
 
 @pytest.mark.asyncio

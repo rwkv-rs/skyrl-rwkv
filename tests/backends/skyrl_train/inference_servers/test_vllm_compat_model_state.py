@@ -93,7 +93,7 @@ def test_full_wake_restores():
         ("all-linear", r"model\.layers\.0\.linear_attn\.r_proj"),
     ],
 )
-def test_rwkv_inference_allocates_exactly_the_peft_nora_targets(monkeypatch, targets, excludes):
+def test_rwkv_inference_allocates_exactly_the_peft_nora_targets(monkeypatch, tmp_path, targets, excludes):
     from peft import LoraConfig, get_peft_model
 
     from skyrl.backends.skyrl_train.inference_servers.utils import build_vllm_cli_args
@@ -103,32 +103,41 @@ def test_rwkv_inference_allocates_exactly_the_peft_nora_targets(monkeypatch, tar
         pytest.skip("RWKV NoRA allocation requires the rwkv extra")
 
     from transformers import RwkvConfig, RwkvForCausalLM
+    from vllm.config import ModelConfig
     from vllm.distributed import parallel_state
     from vllm.model_executor.models import rwkv
+    from vllm.model_executor.models.config import RwkvForCausalLMConfig
 
     monkeypatch.setattr(parallel_state, "get_tp_group", lambda: types.SimpleNamespace(rank_in_group=0, world_size=1))
+    base_config = RwkvConfig(
+        architectures=["RwkvForCausalLM"],
+        vocab_size=32,
+        hidden_size=64,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=1,
+        decay_low_rank_dim=64,
+        a_low_rank_dim=64,
+        gate_low_rank_dim=64,
+        v_low_rank_dim=64,
+    )
+    base_config.save_pretrained(tmp_path)
     cfg = SkyRLTrainConfig()
-    cfg.trainer.policy.model.path = "rwkv-test"
+    cfg.trainer.policy.model.path = str(tmp_path)
     cfg.trainer.policy.model.lora.rank = 2
     cfg.trainer.policy.model.lora.use_nora = True
     cfg.trainer.policy.model.lora.target_modules = targets
     cfg.trainer.policy.model.lora.exclude_modules = excludes
     args = build_vllm_cli_args(cfg)
-    inference_config = types.SimpleNamespace(**args.hf_overrides)
+    inference_config = ModelConfig(
+        model=args.model,
+        dtype="bfloat16",
+        logprobs_mode="raw_logprobs",
+        hf_overrides=args.hf_overrides,
+    ).hf_config
+    RwkvForCausalLMConfig.verify_lora_config(inference_config.rwkv_lora)
 
-    base = RwkvForCausalLM(
-        RwkvConfig(
-            vocab_size=32,
-            hidden_size=64,
-            intermediate_size=256,
-            num_hidden_layers=2,
-            num_attention_heads=1,
-            decay_low_rank_dim=64,
-            a_low_rank_dim=64,
-            gate_low_rank_dim=64,
-            v_low_rank_dim=64,
-        )
-    )
+    base = RwkvForCausalLM(base_config)
     inference_adapters = {}
     for path, module in base.named_modules():
         if isinstance(module, torch.nn.Linear):

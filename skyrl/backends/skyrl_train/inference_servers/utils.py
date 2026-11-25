@@ -153,18 +153,18 @@ def _apply_rwkv_lora_overrides(cfg: SkyRLTrainConfig, engine_kwargs: Dict[str, A
         # individual layers by applying the original selectors to their paths.
         target_modules = attn_targets + mlp_targets + ["lm_head"]
         peft_targets = peft_targets if isinstance(peft_targets, str) else list(peft_targets)
-    rwkv_lora = {
+    hf_overrides["rwkv_lora"] = {
         "r": lora_cfg.rank,
         "lora_alpha": lora_cfg.alpha,
         "use_nora": True,
         "target_modules": target_modules,
     }
     if peft_targets is not None:
-        rwkv_lora["peft_targets"] = {
+        # vLLM validates the exact set of keys in rwkv_lora.
+        hf_overrides["rwkv_lora_peft_targets"] = {
             "target_modules": peft_targets,
             "exclude_modules": lora_cfg.exclude_modules,
         }
-    hf_overrides["rwkv_lora"] = rwkv_lora
     engine_kwargs["hf_overrides"] = hf_overrides
 
 

@@ -27,7 +27,7 @@ def patch_vllm_rwkv_lora_targets() -> None:
     @wraps(original)
     def _patched_add_lora(layer: torch.nn.Module, config: Any, target: str, prefix: str) -> None:
         lora = getattr(config, "rwkv_lora", None)
-        if lora is not None and (selectors := lora.get("peft_targets")) is not None:
+        if lora is not None and (selectors := getattr(config, "rwkv_lora_peft_targets", None)) is not None:
             from peft.tuners.tuners_utils import check_target_module_exists
 
             if not check_target_module_exists(SimpleNamespace(**selectors), prefix):

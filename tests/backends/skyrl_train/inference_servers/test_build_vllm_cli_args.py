@@ -363,6 +363,7 @@ def test_resolve_policy_model_name_uses_served_model_name():
     assert resolve_policy_model_name(cfg) == "served-alias"
 
 
+@pytest.mark.vllm
 @pytest.mark.parametrize("use_nora", [False, True])
 @pytest.mark.parametrize(
     "targets, train_attn, train_mlp",
@@ -407,7 +408,12 @@ def test_fsdp_nora_serves_complete_weights_instead_of_adapter(use_nora, targets,
         }
         if targets != "all-linear":
             expected["target_modules"].append("lm_head")
-            expected["peft_targets"] = {"target_modules": targets, "exclude_modules": None}
+            assert args.hf_overrides["rwkv_lora_peft_targets"] == {
+                "target_modules": targets,
+                "exclude_modules": None,
+            }
+        else:
+            assert "rwkv_lora_peft_targets" not in args.hf_overrides
         assert rwkv_lora == expected
     else:
         assert "rwkv_lora" not in (args.hf_overrides or {})

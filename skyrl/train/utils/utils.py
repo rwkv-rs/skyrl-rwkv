@@ -1321,8 +1321,6 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         "HF_ENDPOINT",
         # Keep kernel preparation and Ray actors on the driver's cache paths.
         "FLASHRWKV2_CACHE_DIR",
-        "VLLM_RWKV_TUNING_MODE",
-        "VLLM_RWKV_TUNING_LEGACY_DIR",
         "XDG_CACHE_HOME",
         "TORCH_HOME",
         "TORCH_EXTENSIONS_DIR",

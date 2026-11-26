@@ -17,7 +17,6 @@ from collections.abc import Mapping
 from concurrent.futures import ProcessPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
 
 import orjson
 
@@ -272,7 +271,6 @@ async def start_servers(
     devices = visible.split(",")[:count] if visible is not None else [str(index) for index in range(count)]
     env = {
         **os.environ,
-        "VLLM_RWKV_TUNING_MODE": os.environ.get("VLLM_RWKV_TUNING_MODE", "require"),
         "OMP_NUM_THREADS": "1",
         "MKL_NUM_THREADS": "1",
         # RWKV has no fixed positional embeddings; prefill remains chunked.

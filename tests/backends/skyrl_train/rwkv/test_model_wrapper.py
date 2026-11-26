@@ -8,8 +8,8 @@ from skyrl.backends.skyrl_train.inference_servers.engine_utils import (
     get_vllm_sampling_params,
 )
 from skyrl.backends.skyrl_train.inference_servers.layerwise_reload import (
+    finalize_rwkv_runtime_weights,
     load_rwkv_checkpoint_weights,
-    refresh_rwkv_runtime_weights,
 )
 from skyrl.backends.skyrl_train.utils import torch_utils as torch_utils_module
 from skyrl.backends.skyrl_train.utils.packed_ragged_tensor import PackedRaggedTensor
@@ -103,13 +103,13 @@ def test_rwkv_fused_head_view_preserves_autograd(temperature):
 
 
 class ToyRecurrentCausalLM(ToyCausalLM):
-    def forward(self, input_ids, past_key_values=None, use_cache=False):
+    def forward(self, input_ids, cache=None, use_cache=False):
         self.calls.append((input_ids.detach().clone(), {}))
         hidden = self.embed_tokens(input_ids).cumsum(dim=1)
-        if past_key_values is not None:
-            hidden = hidden + past_key_values.state.unsqueeze(1)
+        if cache is not None:
+            hidden = hidden + cache.state.unsqueeze(1)
         cache = ToyRecurrentCache(hidden[:, -1]) if use_cache else None
-        return {"logits": self.lm_head(hidden), "past_key_values": cache}
+        return {"logits": self.lm_head(hidden), "cache": cache}
 
 
 @pytest.mark.parametrize("distributed", [False, True])
@@ -191,9 +191,12 @@ def test_rwkv_infctx_preserves_cross_chunk_labels_states_and_gradients():
 
 
 class ToyRwkvAttention(torch.nn.Module):
-    def __init__(self, layer_idx: int) -> None:
+    def __init__(self, layer_idx: int, rwkv) -> None:
         super().__init__()
         self.layer_idx = layer_idx
+        self.hidden_size = 2
+        self.config = SimpleNamespace(v_low_rank_dim=3)
+        self.process_weights_after_loading = rwkv.RwkvAttention.process_weights_after_loading.__get__(self)
         for name in ("w1", "a1", "g1", "w2", "a2", "g2", "v1", "v2"):
             self.register_parameter(name, torch.nn.Parameter(torch.randn(2, 3)))
         for name in (
@@ -207,40 +210,39 @@ class ToyRwkvAttention(torch.nn.Module):
             "v2_canonical",
         ):
             self.register_buffer(name, torch.full((3, 2), torch.nan))
-        self.register_buffer("layer_zero_v0", torch.full((2,), torch.nan))
-        self.register_buffer("layer_zero_v1_runtime", torch.full((2, 3), torch.nan))
-        self.register_buffer("layer_zero_v2_runtime", torch.full((3, 2), torch.nan))
+        if layer_idx == 0:
+            self.v1_canonical = torch.empty(0)
 
 
 class ToyRwkvLayer(torch.nn.Module):
-    def __init__(self, layer_idx: int) -> None:
+    def __init__(self, layer_idx: int, rwkv) -> None:
         super().__init__()
-        self.linear_attn = ToyRwkvAttention(layer_idx)
+        self.linear_attn = ToyRwkvAttention(layer_idx, rwkv)
         self.mlp = torch.nn.Module()
         self.mlp.value = torch.nn.Module()
         self.mlp.value.weight = torch.nn.Parameter(torch.empty(4, 2))
+        self.mlp.value.weight.weight_loader = rwkv.RwkvFeedForward._load_value_weight
 
 
 class ToyVllmRwkv(torch.nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, rwkv) -> None:
         super().__init__()
         self.config = SimpleNamespace(model_type="rwkv")
         self.model = torch.nn.Module()
         self.model.config = SimpleNamespace(layer_norm_epsilon=1e-5)
         self.model.embed_tokens = torch.nn.Embedding(5, 2, dtype=torch.float16)
         self.model.embedding_norm = torch.nn.LayerNorm(2, dtype=torch.bfloat16)
-        self.model.layers = torch.nn.ModuleList([ToyRwkvLayer(0), ToyRwkvLayer(1)])
-        self.model.start_layer = 0
-        self.model.end_layer = 2
+        self.model.layers = torch.nn.ModuleList([ToyRwkvLayer(0, rwkv), ToyRwkvLayer(1, rwkv)])
         self.model._embedding_norm_folded = False
-
-    def load_weights(self, weights):
-        loaded = set()
-        with torch.no_grad():
-            for name, weight in weights:
-                self.get_parameter(name).copy_(weight)
-                loaded.add(name)
-        return loaded
+        self.model._fold_embedding_norm = rwkv.RwkvModel._fold_embedding_norm.__get__(self.model)
+        self._reload_names = set()
+        self.checkpoint_weights_requiring_full_load = (
+            rwkv._EMBEDDING_NORM_WEIGHTS | {rwkv._EMBEDDING_WEIGHT}
+            if rwkv.get_pp_group().is_first_rank
+            else frozenset()
+        )
+        for name in ("load_weights", "record_checkpoint_weights_loaded", "process_weights_after_loading"):
+            setattr(self, name, getattr(rwkv.RwkvForCausalLM, name).__get__(self))
 
 
 def expected_action_log_probs(model, sequences, attention_mask, num_actions):
@@ -428,11 +430,45 @@ def test_rwkv_weight_source_matches_metadata_and_fsdp_bf16_forward_dtype(monkeyp
 
 
 @pytest.mark.vllm
-def test_rwkv_weight_reload_preserves_runtime_layout_and_derived_storage(monkeypatch):
-    from vllm.distributed import parallel_state
+@pytest.mark.parametrize("requested", [None, False, True])
+def test_rwkv_requires_fully_allocated_state_pool(monkeypatch, requested):
+    from vllm.config import CacheConfig
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 
-    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
-    model = ToyVllmRwkv()
+    from skyrl.backends.skyrl_train.inference_servers.vllm_compat import (
+        patch_vllm_rwkv_state_pool,
+    )
+
+    rwkv = MODELS_CONFIG_MAP.get("RwkvForCausalLM")
+    if rwkv is None or "enable_extensible_kv_cache" not in CacheConfig.__dataclass_fields__:
+        pytest.skip("requires the vLLM-RWKV extensible cache option")
+    seen = []
+    monkeypatch.setattr(
+        rwkv,
+        "verify_and_update_config",
+        staticmethod(lambda cfg: seen.append(cfg.cache_config.enable_extensible_kv_cache)),
+    )
+    patch_vllm_rwkv_state_pool()
+
+    config = SimpleNamespace(cache_config=SimpleNamespace(enable_extensible_kv_cache=requested))
+    if requested is True:
+        with pytest.raises(ValueError, match="requires enable_extensible_kv_cache=False"):
+            rwkv.verify_and_update_config(config)
+        assert not seen
+    else:
+        rwkv.verify_and_update_config(config)
+        assert seen == [False]
+
+
+@pytest.mark.vllm
+def test_rwkv_weight_reload_preserves_runtime_layout_and_derived_storage(monkeypatch):
+    rwkv = pytest.importorskip("vllm.model_executor.models.rwkv")
+    monkeypatch.setattr(rwkv, "get_pp_group", lambda: SimpleNamespace(is_first_rank=True))
+    monkeypatch.setattr(
+        rwkv, "_load_flashrwkv2", lambda: SimpleNamespace(infer_embedding_ln0_forward_varlen=lambda x, *a, **k: x + 1)
+    )
+    model = ToyVllmRwkv(rwkv)
+    model.model._embedding_norm_folded = True
     checkpoint_value = torch.arange(8, dtype=torch.float16).view(2, 4)
     checkpoint_embedding = torch.arange(10, dtype=torch.float16).view(5, 2)
     canonical = model.model.layers[1].linear_attn.w1_canonical
@@ -445,10 +481,7 @@ def test_rwkv_weight_reload_preserves_runtime_layout_and_derived_storage(monkeyp
             ("model.embed_tokens.weight", checkpoint_embedding),
         ],
     )
-    refresh_rwkv_runtime_weights(
-        model,
-        lambda embedding, weight, bias, eps: embedding.to(torch.float16) + 1,
-    )
+    finalize_rwkv_runtime_weights(model)
 
     assert loaded == {
         "model.layers.0.mlp.value.weight",
@@ -460,6 +493,11 @@ def test_rwkv_weight_reload_preserves_runtime_layout_and_derived_storage(monkeyp
     assert canonical.data_ptr() == canonical_data_ptr
     assert torch.equal(canonical, model.model.layers[1].linear_attn.w1.T)
     assert torch.count_nonzero(model.model.layers[0].linear_attn.v1_canonical) == 0
+
+    # A partial update that leaves the embedding untouched keeps the already-folded weights.
+    load_rwkv_checkpoint_weights(model, [("model.layers.0.mlp.value.weight", checkpoint_value)])
+    finalize_rwkv_runtime_weights(model)
+    assert torch.equal(model.model.embed_tokens.weight, checkpoint_embedding + 1)
 
 
 @pytest.mark.parametrize(
@@ -684,15 +722,14 @@ def test_rwkv_rejects_sample_support_replay_before_forward():
 
 @pytest.mark.vllm
 def test_rwkv_weight_reload_skips_missing_pp_parameters(monkeypatch):
-    from vllm.distributed import parallel_state
     from vllm.model_executor.models.utils import PPMissingLayer
 
-    model = ToyVllmRwkv()
+    rwkv = pytest.importorskip("vllm.model_executor.models.rwkv")
+    monkeypatch.setattr(rwkv, "get_pp_group", lambda: SimpleNamespace(is_first_rank=False))
+    model = ToyVllmRwkv(rwkv)
     model.model.embed_tokens = PPMissingLayer()
     model.model.embedding_norm = PPMissingLayer()
     model.model.layers[0] = PPMissingLayer()
-    model.model.start_layer = 1
-    monkeypatch.setattr(parallel_state, "get_pp_group", lambda: SimpleNamespace(is_first_rank=False))
     value = torch.arange(8, dtype=torch.float16).view(2, 4)
     loaded = load_rwkv_checkpoint_weights(
         model,
@@ -707,7 +744,8 @@ def test_rwkv_weight_reload_skips_missing_pp_parameters(monkeypatch):
     def unexpected_fold(*args, **kwargs):
         pytest.fail("non-first PP rank must not fold embeddings")
 
-    refresh_rwkv_runtime_weights(model, unexpected_fold)
+    monkeypatch.setattr(model.model, "_fold_embedding_norm", unexpected_fold)
+    finalize_rwkv_runtime_weights(model)
     assert loaded == {"model.layers.1.mlp.value.weight"}
     assert torch.equal(model.model.layers[1].mlp.value.weight, value.T)
     assert not model.model._embedding_norm_folded

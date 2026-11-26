@@ -904,8 +904,7 @@ def test_http_failure_stops_pipeline_and_keeps_external_server(tmp_path, tokeniz
     assert summary["Knowledge"]["num_questions"] == 0
 
 
-@pytest.mark.parametrize("tuning_mode", [None, "tune"])
-def test_partial_startup_failure_cleans_only_owned_process_groups(tmp_path, tokenizer, monkeypatch, tuning_mode):
+def test_partial_startup_failure_cleans_only_owned_process_groups(tmp_path, tokenizer, monkeypatch):
     processes, killed = [], []
 
     class Process:
@@ -915,8 +914,6 @@ def test_partial_startup_failure_cleans_only_owned_process_groups(tmp_path, toke
             assert env["XDG_CACHE_HOME"] == "/shared/cache"
             assert env["TORCH_EXTENSIONS_DIR"] == "/shared/extensions"
             assert env["FLASHRWKV2_CACHE_DIR"] == "/shared/flashrwkv2"
-            assert env["VLLM_RWKV_TUNING_MODE"] == (tuning_mode or "require")
-            assert env["VLLM_RWKV_TUNING_LEGACY_DIR"] == "/shared/legacy/namespace"
             if command[-1] == "--check":
                 self.returncode = 0
             else:
@@ -936,11 +933,6 @@ def test_partial_startup_failure_cleans_only_owned_process_groups(tmp_path, toke
     monkeypatch.setenv("XDG_CACHE_HOME", "/shared/cache")
     monkeypatch.setenv("TORCH_EXTENSIONS_DIR", "/shared/extensions")
     monkeypatch.setenv("FLASHRWKV2_CACHE_DIR", "/shared/flashrwkv2")
-    monkeypatch.setenv("VLLM_RWKV_TUNING_LEGACY_DIR", "/shared/legacy/namespace")
-    if tuning_mode is None:
-        monkeypatch.delenv("VLLM_RWKV_TUNING_MODE", raising=False)
-    else:
-        monkeypatch.setenv("VLLM_RWKV_TUNING_MODE", tuning_mode)
     monkeypatch.setattr(rollout.asyncio, "create_subprocess_exec", create_subprocess_exec)
     monkeypatch.setattr(rollout.os, "killpg", lambda pid, sig: killed.append((pid, sig)))
     with pytest.raises(RuntimeError, match="vLLM exited"):
@@ -1034,9 +1026,11 @@ def preparation(monkeypatch):
     rwkv._load_flashrwkv2 = MagicMock()
     compile_module = ModuleType("flashrwkv2.compile")
     compile_module.load_extension = MagicMock()
+    execution = ModuleType("flashrwkv2._internal.execution")
+    execution.native_cache_root = MagicMock()
     flashrwkv2 = ModuleType("flashrwkv2")
     flashrwkv2.compile = compile_module
-    for module in (rwkv, compile_module, flashrwkv2):
+    for module in (rwkv, execution, compile_module, flashrwkv2):
         monkeypatch.setitem(sys.modules, module.__name__, module)
     common = importlib.import_module("examples.train.rwkv.train.common")
     name = f"{common.__name__}.prepare_flashrwkv2"
@@ -1091,9 +1085,7 @@ def test_rwkv_native_artifact_environment_records_verified_installed_revision(
     library = tmp_path / "extension.so"
     library.write_bytes(b"mock native artifact")
     cache_root = tmp_path / "shared-cache"
-    monkeypatch.setattr(
-        preparation, "_load_flashrwkv2", lambda: SimpleNamespace(get_tuning_cache_dir=lambda: cache_root)
-    )
+    monkeypatch.setattr(preparation, "native_cache_root", lambda: cache_root)
     monkeypatch.setattr(
         preparation,
         "load_extension",
@@ -1109,4 +1101,40 @@ def test_rwkv_native_artifact_environment_records_verified_installed_revision(
     assert environment["cache_root"] == str(cache_root)
     output = capsys.readouterr().out
     assert "native build: cached" in output
-    assert "Model dispatch coverage: pending vLLM worker preparation" in output
+
+
+@pytest.mark.parametrize("cached", [False, True])
+def test_rwkv_native_preflight_checks_cache_before_loading(tmp_path, monkeypatch, preparation, cached):
+    import hashlib
+    from unittest.mock import MagicMock
+
+    key = hashlib.sha256(b'{"target":"sm120"}').hexdigest()
+    artifact_dir = tmp_path / "native" / f"_flashrwkv2_{key[:16]}"
+    library = artifact_dir / "extension.so"
+    if cached:
+        artifact_dir.mkdir(parents=True)
+        library.touch()
+        (artifact_dir / "manifest.json").write_text(json.dumps({"cache_key": key, "library": str(library)}))
+
+    monkeypatch.setattr(preparation, "validate_vllm_revision", lambda: "project-pin")
+    monkeypatch.setattr(preparation, "native_cache_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        preparation,
+        "c",
+        SimpleNamespace(
+            _cache_payload=lambda *args: {"target": "sm120"},
+            source_root=lambda: tmp_path,
+            _capability=lambda torch: (12, 0),
+            _toolchain=lambda torch: {},
+        ),
+    )
+    load = MagicMock(return_value=SimpleNamespace(status="cached"))
+    monkeypatch.setattr(preparation, "load_extension", load)
+
+    if cached:
+        preparation.check()
+        load.assert_called_once_with()
+    else:
+        with pytest.raises(SystemExit, match="native cache is missing"):
+            preparation.check()
+        load.assert_not_called()

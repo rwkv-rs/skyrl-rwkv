@@ -293,8 +293,6 @@ def test_runtime_env_forwards_te_block_scale_mode(monkeypatch):
 def test_runtime_env_preserves_kernel_cache_paths(monkeypatch, configured):
     paths = {
         "FLASHRWKV2_CACHE_DIR": "/shared/flashrwkv2",
-        "VLLM_RWKV_TUNING_MODE": "require",
-        "VLLM_RWKV_TUNING_LEGACY_DIR": "/shared/legacy/namespace",
         "XDG_CACHE_HOME": "/shared/cache",
         "TORCH_HOME": "/shared/torch",
         "TORCH_EXTENSIONS_DIR": "/shared/torch_extensions",

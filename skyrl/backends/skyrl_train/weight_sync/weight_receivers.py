@@ -261,9 +261,8 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
             return
         skyrl_before_weight_update()
         with torch.device(self.device):
-            # RWKV loads processed tensors in place, including the transposed
-            # channel-mix value projection. Generic layerwise reload would move
-            # that destination to meta and discard the direct copy on finalize.
+            # The RWKV checkpoint loaders write into live kernel storage,
+            # including the transposed channel-mix value projection.
             if getattr(getattr(self.model, "config", None), "model_type", None) != "rwkv":
                 super().start_weight_update()
 

@@ -56,14 +56,12 @@ Prefill-Decode disaggregation:
 
 ## Key Config Knobs
 
-RWKV example launchers use the upstream FlashRWKV2 cache rooted at
-`FLASHRWKV2_CACHE_DIR` (default `~/.cache/flashrwkv2`) and default to
-`VLLM_RWKV_TUNING_MODE=require`. Prepare missing actual model dispatches with
-`tune`, optionally revalidating one old namespace through
-`VLLM_RWKV_TUNING_LEGACY_DIR`, then restart in `require` mode before capture.
-All three settings and explicit Torch/XDG paths are forwarded to Ray actors.
-The shared native-extension preflight reports native build readiness; vLLM's
-worker coverage reports establish model tuning readiness. See
+RWKV example launchers use the FlashRWKV2 native cache rooted at
+`FLASHRWKV2_CACHE_DIR` (default `~/.cache/flashrwkv2`). The driver forwards
+that path and explicit Torch/XDG cache paths to Ray actors. The shared
+preflight checks the native extension, and vLLM warms model and sampling
+kernels before CUDA Graph capture. RWKV's layer-major state pool uses a fully
+allocated KV cache so all layers are backed during warmup. See
 `examples/train/rwkv/train/common/README.md` for the preparation lifecycle.
 
 All under `generator.inference_engine.*`:

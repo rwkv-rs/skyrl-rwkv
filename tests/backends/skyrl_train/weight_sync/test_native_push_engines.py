@@ -126,7 +126,7 @@ def test_native_nccl_trainer_preserves_serialized_fp8_mixed_stream(monkeypatch):
 
     _, engine_cls = get_skyrl_nccl_trainer()
     engine = engine_cls(client=client, source=source, packed=True)
-    engine.model_update_group = object()
+    engine.model_update_group = SimpleNamespace(rank=0)
     engine.send_weights()
 
     _assert_update_matches(source, client.update_infos[0])
@@ -152,7 +152,7 @@ def test_native_nccl_trainer_agrees_packing_during_initialization(monkeypatch):
     source = _StaticWeightSource([("model.norm.weight", torch.ones(4, dtype=torch.bfloat16))])
     client = _RecordingClient()
 
-    monkeypatch.setattr(nccl_engine, "open_trainer_endpoint", lambda _init_info: object())
+    monkeypatch.setattr(nccl_engine, "open_trainer_endpoint", lambda *_: object())
 
     init_info_cls, engine_cls = get_skyrl_nccl_trainer()
     engine = engine_cls.trainer_init(
@@ -169,20 +169,18 @@ def test_native_nccl_trainer_agrees_packing_during_initialization(monkeypatch):
         source=source,
     )
 
-    assert client.events == [
-        (
-            "init",
-            {
-                "master_address": "127.0.0.1",
-                "master_port": 12345,
-                "rank_offset": 1,
-                "world_size": 5,
-                "packed": True,
-                "packed_buffer_size_bytes": 1024,
-                "packed_num_buffers": 3,
-            },
-        )
-    ]
+    expected_payload = {
+        "master_address": "127.0.0.1",
+        "master_port": 12345,
+        "rank_offset": 1,
+        "world_size": 5,
+        "packed": True,
+        "packed_buffer_size_bytes": 1024,
+        "packed_num_buffers": 3,
+    }
+    if "use_load_plan" in init_info_cls.__dataclass_fields__:
+        expected_payload["use_load_plan"] = False
+    assert client.events == [("init", expected_payload)]
     assert engine.packed is True
     assert engine.packed_buffer_size_bytes == 1024
     assert engine.packed_num_buffers == 3
@@ -214,7 +212,7 @@ def test_native_nccl_trainer_uses_precomputed_weight_source_metadata(monkeypatch
 
     _, engine_cls = get_skyrl_nccl_trainer()
     engine = engine_cls(client=client, source=source, packed=True)
-    engine.model_update_group = object()
+    engine.model_update_group = SimpleNamespace(rank=0)
     engine.send_weights()
 
     _assert_update_matches(source, client.update_infos[0])
@@ -289,8 +287,18 @@ def test_native_receive_repeated_updates_preserve_processed_weights(monkeypatch,
             self.model.layers[0].mlp = torch.nn.Module()
             self.model.layers[0].mlp.value = torch.nn.Module()
             self.model.layers[0].mlp.value.weight = torch.nn.Parameter(torch.ones(3, 2, dtype=torch.float16))
+            if model_type == "rwkv":
+                self.model.layers[0].mlp.value.weight.weight_loader = self.load_rwkv_value
             self.model.norm = torch.nn.Module()
             self.model.norm.weight = torch.nn.Parameter(torch.ones(2, dtype=torch.float16))
+            self.loaded_names = set()
+
+        @staticmethod
+        def load_rwkv_value(param, weight):
+            default_weight_loader(param, weight.T)
+
+        def record_checkpoint_weights_loaded(self, names):
+            self.loaded_names = names
 
         def load_weights(self, weights):
             loaded = set()
@@ -309,10 +317,14 @@ def test_native_receive_repeated_updates_preserve_processed_weights(monkeypatch,
     engine_cls = (
         weight_receivers._build_skyrl_nccl_engine() if backend == "nccl" else weight_receivers._build_skyrl_ipc_engine()
     )
-    engine = object.__new__(engine_cls)
-    engine.model = CheckpointModel()
-    engine.device = torch.device("cpu")
-    engine.model_config = SimpleNamespace(dtype=torch.float16)
+    engine = engine_cls(
+        config=SimpleNamespace(),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(), model_config=SimpleNamespace(dtype=torch.float16)
+        ),
+        device=torch.device("cpu"),
+        model=CheckpointModel(),
+    )
     if backend == "ipc":
         engine._packed_importer = SimpleNamespace(close=lambda: events.append("close"))
     record_metadata_for_reloading(engine.model)
@@ -332,6 +344,8 @@ def test_native_receive_repeated_updates_preserve_processed_weights(monkeypatch,
         assert torch.equal(target, source.T if model_type == "rwkv" else source)
         assert torch.equal(engine.model.model.norm.weight, norm)
         assert target.data_ptr() == original_ptr
+        if model_type == "rwkv":
+            assert engine.model.loaded_names == {name, "model.norm.weight"}
 
     expected_events = ["before", "runtime", "graphs"] if model_type == "rwkv" else ["before"]
     if backend == "ipc":

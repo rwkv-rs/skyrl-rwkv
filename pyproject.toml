@@ -19,7 +19,7 @@ dependencies = [
     # Floor tracks the transformers pin below: transformers 5.16.1 requires
     # tokenizers>=0.23.1.
     "tokenizers>=0.23.1",
-    "transformers>=5.6.1,<=5.21.0.dev0",
+    "transformers>=5.6.1,<=5.24.1",
     "typer>=0.17.4",
     # Native backends pin PEFT 0.21.0; RWKV selects the NoRA fork below.
     "peft>=0.19.2.dev0,<=0.21.0",
@@ -154,9 +154,9 @@ rwkv = [
     "skyrl[skyrl-train]",
     "peft==0.19.2.dev0",
     "torch==2.14.0; sys_platform == 'linux'",
-    "transformers==5.21.0.dev0; sys_platform == 'linux'",
+    "transformers==5.24.1; sys_platform == 'linux'",
     "vllm; sys_platform == 'linux'",
-    "FlashRWKV2==0.1.0a17; sys_platform == 'linux'",
+    "FlashRWKV2==0.2.0a4; sys_platform == 'linux'",
     "tokenizers; sys_platform == 'linux'",
     # Native RWKV LightEval benchmarks and rollout summary plots.
     "lighteval; sys_platform == 'linux'",
@@ -317,6 +317,8 @@ skyrl_deepseek_v41 = "skyrl.backends.skyrl_train.patches.vllm.patch_deepseek_v41
 skyrl_kimi_k25_lora = "skyrl.backends.skyrl_train.patches.vllm_kimi_k25_lora:vllm_general_plugin"
 # Serves Beam with vLLM's BeamForCausalLM plus SupportsLoRA (vLLM 0.33's class has no LoRA support).
 skyrl_beam_lora = "skyrl.backends.skyrl_train.patches.vllm.patch_beam_lora:vllm_general_plugin"
+# Use a fully allocated state pool for the RWKV fork's layer-major state layout.
+skyrl_rwkv_state_pool = "skyrl.backends.skyrl_train.inference_servers.vllm_compat:patch_vllm_rwkv_state_pool"
 
 [tool.uv]
 required-version = ">=0.13.0"
@@ -365,7 +367,7 @@ override-dependencies = [
     # Widen Bridge's bound without overriding RWKV's direct Git requirement.
     { package = { name = "megatron-bridge" }, dependencies = ["transformers>=5.6.1,<=5.16.1; sys_platform == 'linux'"] },
     # Keep the RWKV Transformers source selected by this project.
-    { package = { name = "vllm", version = "0.23.1rc1.dev6383+geb7d01bfb.rwkv" }, dependencies = ["transformers==5.21.0.dev0; sys_platform == 'linux'", "tilelang==0.1.15; sys_platform == 'linux'", "apache-tvm-ffi==0.1.12; sys_platform == 'linux'"] },
+    { package = { name = "vllm", version = "0.23.1rc1.dev7914+gfcbe042f9.rwkv" }, dependencies = ["transformers==5.24.1; sys_platform == 'linux'"] },
     { package = { name = "vllm", version = "0.33.0" }, dependencies = ["tilelang==0.1.13; sys_platform == 'linux'", "apache-tvm-ffi==0.1.12; sys_platform == 'linux'"] },
     { package = { name = "mamba-ssm" }, dependencies = ["tilelang==0.1.13; sys_platform == 'linux'", "apache-tvm-ffi==0.1.12; sys_platform == 'linux'"] },
     "megatron-core>=0.16.0; sys_platform == 'linux'",
@@ -615,8 +617,8 @@ explicit = true
 peft = { git = "https://github.com/Joluck/NoRA", rev = "4669c35ce0ffd027456272ee5050c0f58ac8d22a", subdirectory = "peft", extra = "rwkv" }
 skyrl-gym = { path = "./skyrl-gym", editable = true }
 skycap = { path = "./skycap", editable = true }
-transformers = { git = "https://github.com/rwkv-rs/transformers-rwkv", rev = "f93dd4e01e0b565ef0390f76c6726d1d121ebbab", extra = "rwkv" }
-vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "eb7d01bfb921291933c9c2bd50d8075b5b8b5ac7", extra = "rwkv" }
+transformers = { git = "https://github.com/rwkv-rs/transformers-rwkv", rev = "fc8f40d7f1746b8b96ab3f8312db2e16ce93d463", extra = "rwkv" }
+vllm = { git = "https://github.com/rwkv-rs/vllm-rwkv", rev = "fcbe042f9ec4bdd61aa53b229079d380f3b414bf", extra = "rwkv" }
 lighteval = { git = "https://github.com/rwkv-rs/lighteval-rwkv", rev = "c5475e27a1e58184c9a6cdbd30572ec1ae601dd7", extra = "rwkv" }
 tokenizers = { git = "https://github.com/rwkv-rs/tokenizers-rwkv", rev = "c5d8dde5ff49c70e4656199d5033a84e03c21b2b", subdirectory = "bindings/python", extra = "rwkv" }
 # Match torch's CUDA variant (cu130).

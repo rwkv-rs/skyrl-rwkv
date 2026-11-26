@@ -10,6 +10,7 @@ engine hooks can find it later in the same worker process.
 from __future__ import annotations
 
 import weakref
+from importlib.util import find_spec
 from typing import Any
 
 _PATCHED = False
@@ -17,24 +18,18 @@ _CURRENT_MODEL_RUNNER: weakref.ReferenceType[Any] | None = None
 
 
 def apply_model_runner_registry_patch() -> None:
-    """Install the process-local runner recorder on every ``GPUModelRunner.load_model``.
-
-    vLLM ships two runners and picks one per engine (``VllmConfig.use_v2_model_runner``,
-    the default in vLLM 0.30), so both classes are wrapped.
-    """
+    """Wrap the current runner and the legacy runner on vLLM versions that ship it."""
     global _PATCHED
     if _PATCHED:
         return
 
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
     runner_classes = [GPUModelRunner]
-    try:
-        from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
-    except ImportError:
-        pass
-    else:
-        runner_classes.append(GPUModelRunnerV2)
+    if find_spec("vllm.v1.worker.gpu_model_runner") is not None:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
+
+        runner_classes.append(GPUModelRunnerV1)
 
     for runner_cls in runner_classes:
         _record_runner_on_load(runner_cls)

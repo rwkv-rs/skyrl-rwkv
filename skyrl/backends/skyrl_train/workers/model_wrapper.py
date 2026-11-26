@@ -55,7 +55,7 @@ from skyrl.backends.skyrl_train.utils.torch_utils import (
     logprobs_from_logits_vllm,
 )
 
-# RwkvCache._chunk_length: full-sequence kernels operate on 16-token chunks.
+# Align recurrent training sequences to the FlashRWKV2 kernel's tile length.
 RWKV_CHUNK_LENGTH = 16
 
 
@@ -67,10 +67,10 @@ def _patch_rwkv_training_state_contract() -> None:
         return
     original_training_forward = RwkvAttention._training_forward
 
-    def training_forward(self, hidden_states, v_first, attention_shift, wkv_state, training_metadata):
+    def training_forward(self, hidden_states, v_first, attention_shift, wkv_state):
         if wkv_state is not None:
             wkv_state = wkv_state.to(dtype=torch.float32).contiguous()
-        return original_training_forward(self, hidden_states, v_first, attention_shift, wkv_state, training_metadata)
+        return original_training_forward(self, hidden_states, v_first, attention_shift, wkv_state)
 
     RwkvAttention._training_forward = training_forward
     RwkvAttention._skyrl_fp32_state_contract = True
@@ -414,7 +414,7 @@ class HFModelWrapper(nn.Module):
             # Recompute from an immutable snapshot: the HF forward updates its cache.
             previous_cache = previous_cache.clone() if previous_cache is not None else None
             with torch.autocast(device_type=ids.device.type, enabled=False):
-                result = self.model(ids, past_key_values=previous_cache, use_cache=True)
+                result = self.model(ids, cache=previous_cache, use_cache=True)
             logits = result["logits"] / temperature
             token_logprobs = logprobs_from_logits_vllm(logits, targets)
             token_entropy = (
@@ -427,7 +427,7 @@ class HFModelWrapper(nn.Module):
                 if compute_entropy
                 else None
             )
-            return token_logprobs, token_entropy, result["past_key_values"]
+            return token_logprobs, token_entropy, result["cache"]
 
         was_training = self.model.training
         self.model.train()
@@ -993,12 +993,9 @@ def _get_critic_model(
                         hidden_chunks = []
                         for start in range(0, length, chunk_size):
                             end = min(start + chunk_size, length)
-                            chunk_kwargs = {"use_cache": True}
-                            if cache is not None:
-                                chunk_kwargs["past_key_values"] = cache
-                            chunk_outputs = base_model(recurrent_ids[:, start:end], **chunk_kwargs)
+                            chunk_outputs = base_model(recurrent_ids[:, start:end], use_cache=True, cache=cache)
                             hidden_chunks.append(chunk_outputs["last_hidden_state"])
-                            cache = chunk_outputs["past_key_values"]
+                            cache = chunk_outputs["cache"]
                         outputs = chunk_outputs
                         outputs["last_hidden_state"] = torch.cat(hidden_chunks, dim=1)
                 finally:

@@ -1,11 +1,8 @@
 """RWKV checkpoint-to-runtime weight loading for vLLM receive engines."""
 
-import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 
 import torch
-
-logger = logging.getLogger(__name__)
 
 
 @torch.no_grad()
@@ -13,105 +10,19 @@ def load_rwkv_checkpoint_weights(
     model: torch.nn.Module,
     weights: Iterable[tuple[str, torch.Tensor]],
 ) -> set[str]:
-    """Load RWKV checkpoint tensors into its already-processed vLLM model.
-
-    vLLM transposes the channel-mix value projection after the initial model
-    load.  Reloading that checkpoint tensor through the generic layerwise path
-    therefore tries to copy a ``[hidden, intermediate]`` tensor into the live
-    ``[intermediate, hidden]`` kernel storage.  Keep the live storage (and its
-    CUDA-graph references) and apply that one runtime-layout transform here;
-    all shape-preserving tensors continue through RWKV's native loader.
-    """
-    from vllm.model_executor.models.utils import is_pp_missing_parameter
-
-    loaded = set()
-
-    def iter_regular_weights():
-        for name, weight in weights:
-            if is_pp_missing_parameter(name, model):
-                continue
-            if name.endswith(".mlp.value.weight"):
-                target = model.get_parameter(name)
-                if tuple(target.shape) == tuple(weight.T.shape):
-                    target.copy_(weight.T)
-                elif tuple(target.shape) == tuple(weight.shape):
-                    target.copy_(weight)
-                else:
-                    raise ValueError(
-                        f"RWKV value weight shape mismatch for {name!r}: "
-                        f"target={tuple(target.shape)}, source={tuple(weight.shape)}"
-                    )
-                loaded.add(name)
-            else:
-                yield name, weight
-
-    loaded.update(model.load_weights(weights=iter_regular_weights()))
+    """Load a checkpoint chunk with vLLM's RWKV tensor loaders."""
+    loaded = model.load_weights(weights=weights)
+    # SkyRL's receive engines stream into live storage without vLLM's reload
+    # context. Record the names so vLLM can fold a newly loaded embedding once.
+    model.record_checkpoint_weights_loaded(loaded)
     return loaded
 
 
-@torch.no_grad()
-def refresh_rwkv_runtime_weights(model: torch.nn.Module, fold_embedding: Callable) -> None:
-    """Refresh RWKV runtime-only tensors after checkpoint weights are loaded.
-
-    This mirrors ``RwkvModel.process_weights_after_loading`` while copying into
-    the existing parameter/buffer storage so captured CUDA graphs keep valid
-    addresses.
-    """
-    from vllm.distributed.parallel_state import get_pp_group
-
-    rwkv_model = model.model
-    if get_pp_group().is_first_rank:
-        embedding = rwkv_model.embed_tokens.weight
-        embedding_norm = rwkv_model.embedding_norm
-        for start in range(0, embedding.shape[0], 4096):
-            end = min(start + 4096, embedding.shape[0])
-            folded = fold_embedding(
-                embedding[start:end].to(torch.bfloat16).contiguous(),
-                embedding_norm.weight,
-                embedding_norm.bias,
-                eps=rwkv_model.config.layer_norm_epsilon,
-            )
-            embedding[start:end].copy_(folded)
-        rwkv_model._embedding_norm_folded = True
-
-    for layer_idx, layer in enumerate(
-        rwkv_model.layers[rwkv_model.start_layer : rwkv_model.end_layer],
-        start=rwkv_model.start_layer,
-    ):
-        attention = layer.linear_attn
-        for runtime_name, checkpoint_name in (
-            ("w1_canonical", "w1"),
-            ("a1_canonical", "a1"),
-            ("g1_canonical", "g1"),
-            ("w2_canonical", "w2"),
-            ("a2_canonical", "a2"),
-            ("g2_canonical", "g2"),
-        ):
-            getattr(attention, runtime_name).copy_(getattr(attention, checkpoint_name).T)
-
-        if layer_idx == 0:
-            for name in (
-                "v1_canonical",
-                "v2_canonical",
-                "layer_zero_v0",
-                "layer_zero_v1_runtime",
-                "layer_zero_v2_runtime",
-            ):
-                getattr(attention, name).zero_()
-        else:
-            attention.v1_canonical.copy_(attention.v1.T)
-            attention.v2_canonical.copy_(attention.v2.T)
-
-
 def finalize_rwkv_runtime_weights(model: torch.nn.Module) -> None:
-    """Refresh RWKV derived weights with the authoritative vLLM kernel."""
-    from vllm.model_executor.models.rwkv import _load_flashrwkv2
+    """Run vLLM's RWKV post-load hooks after all checkpoint chunks arrive."""
+    from vllm.model_executor.model_loader.weight_utils import finalize_model_weights
 
-    flashrwkv2 = _load_flashrwkv2()
-    refresh_rwkv_runtime_weights(
-        model,
-        flashrwkv2.infer_embedding_ln0_forward_varlen,
-    )
+    finalize_model_weights(model)
 
 
 def clear_rwkv_cudagraphs() -> None:

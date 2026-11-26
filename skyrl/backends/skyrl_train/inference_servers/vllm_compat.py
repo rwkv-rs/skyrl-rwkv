@@ -11,6 +11,31 @@ import torch
 logger = logging.getLogger(__name__)
 
 
+def patch_vllm_rwkv_state_pool() -> None:
+    """Use a fully allocated KV cache for vLLM-RWKV's layer-major state views."""
+    from vllm.config import CacheConfig
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP
+
+    rwkv = MODELS_CONFIG_MAP.get("RwkvForCausalLM")
+    if rwkv is None or "enable_extensible_kv_cache" not in CacheConfig.__dataclass_fields__:
+        return
+    original = rwkv.verify_and_update_config
+    if getattr(original, "_skyrl_rwkv_state_pool", False):
+        return
+
+    @wraps(original)
+    def verify_and_update_config(vllm_config: Any) -> None:
+        # The fork's state pool visits every layer even when only the first few
+        # slots are needed. The dynamically backed cache leaves those pages unmapped.
+        if vllm_config.cache_config.enable_extensible_kv_cache is True:
+            raise ValueError("RWKV requires enable_extensible_kv_cache=False for its recurrent state pool")
+        vllm_config.cache_config.enable_extensible_kv_cache = False
+        original(vllm_config)
+
+    setattr(verify_and_update_config, "_skyrl_rwkv_state_pool", True)
+    rwkv.verify_and_update_config = staticmethod(verify_and_update_config)
+
+
 def patch_vllm_rwkv_lora_targets() -> None:
     """Match PEFT selectors against the full RWKV module prefix before allocation."""
     module_name = "vllm.model_executor.models.rwkv"

@@ -63,7 +63,7 @@ ensure_ray_rdt_libfabric()
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
 
 # Must run inside EVERY vLLM worker process: post-sync hooks in the receive
 # engines need the process-local model runner, but vLLM only gives engines the

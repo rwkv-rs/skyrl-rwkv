@@ -7,9 +7,10 @@ import tomllib
 from pathlib import Path
 
 import torch
-from vllm.model_executor.models.rwkv import _load_flashrwkv2
 from flashrwkv2 import compile as c
+from flashrwkv2._internal.execution import native_cache_root
 from flashrwkv2.compile import load_extension
+from vllm.model_executor.models.rwkv import _load_flashrwkv2
 
 
 def validate_vllm_revision() -> str:
@@ -27,7 +28,7 @@ def validate_vllm_revision() -> str:
 
 def prepare() -> None:
     commit = validate_vllm_revision()
-    flashrwkv2 = _load_flashrwkv2()
+    _load_flashrwkv2()
     result = load_extension()
     assert Path(result.library).is_file()
     driver = subprocess.check_output(
@@ -44,22 +45,20 @@ def prepare() -> None:
         "compute_capability": result.target,
         "artifact": result.library,
         "build": result.status,
-        "cache_root": str(flashrwkv2.get_tuning_cache_dir()),
+        "cache_root": str(native_cache_root()),
     }
     Path(result.library).with_name("environment.json").write_text(json.dumps(info, indent=2) + "\n")
     print(f"FlashRWKV2 cache: {Path(result.library).parent}")
     print(f"FlashRWKV2 artifact: {result.library}")
     print(f"FlashRWKV2 native build: {result.status}")
-    print(f"FlashRWKV2 verified tuning cache: {flashrwkv2.get_tuning_cache_dir()}")
-    print("Model dispatch coverage: pending vLLM worker preparation (VLLM_RWKV_TUNING_MODE=tune or require)")
 
 
 def check() -> None:
     validate_vllm_revision()
-    flashrwkv2 = _load_flashrwkv2()
+    _load_flashrwkv2()
     payload = c._cache_payload(torch, c.source_root(), c._capability(torch), c._toolchain(torch))
     key = hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    manifest = flashrwkv2.get_tuning_cache_dir() / "native" / f"_flashrwkv2_{key[:16]}" / "manifest.json"
+    manifest = native_cache_root() / "native" / f"_flashrwkv2_{key[:16]}" / "manifest.json"
     if not manifest.is_file():
         raise SystemExit(
             f"FlashRWKV2 native cache is missing: {manifest}; run --prepare-flashrwkv2 after uv sync --extra rwkv"
@@ -68,14 +67,12 @@ def check() -> None:
     artifact = Path(record["library"])
     if record["cache_key"] != key or not artifact.is_file():
         raise SystemExit(f"FlashRWKV2 native cache is incomplete: {manifest}; run --prepare-flashrwkv2")
-    result = c.load_extension()
+    result = load_extension()
     if result.status != "cached":
         raise SystemExit(f"FlashRWKV2 unexpectedly compiled during preflight: {result.status}")
     print(f"FlashRWKV2 cache: {manifest.parent}")
     print(f"FlashRWKV2 artifact: {artifact}")
     print("FlashRWKV2 native build: cached / no native compilation")
-    print(f"FlashRWKV2 verified tuning cache: {flashrwkv2.get_tuning_cache_dir()}")
-    print("Model dispatch coverage: pending vLLM worker preparation (VLLM_RWKV_TUNING_MODE=tune or require)")
 
 
 if __name__ == "__main__":

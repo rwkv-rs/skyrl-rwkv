@@ -13,7 +13,6 @@ PYTHON="${PYTHON:-$PROJECT_ROOT/.venv/bin/python3}"
 export UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-$PROJECT_ROOT/.venv}"
 export RAY_ENABLE_UV_RUN_RUNTIME_ENV=0
 export FLASHRWKV2_CACHE_DIR="${FLASHRWKV2_CACHE_DIR:-$HOME/.cache/flashrwkv2}"
-export VLLM_RWKV_TUNING_MODE="${VLLM_RWKV_TUNING_MODE:-require}"
 # The repository contains the separately packaged skyrl-gym project.  Export
 # both roots so every launcher works when invoked directly, without requiring
 # callers to repair imports in their shell first.

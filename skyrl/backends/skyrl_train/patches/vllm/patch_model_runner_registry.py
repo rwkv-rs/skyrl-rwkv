@@ -10,7 +10,7 @@ engine hooks can find it later in the same worker process.
 from __future__ import annotations
 
 import weakref
-from importlib.util import find_spec
+from importlib import import_module
 from typing import Any
 
 _PATCHED = False
@@ -23,13 +23,15 @@ def apply_model_runner_registry_patch() -> None:
     if _PATCHED:
         return
 
-    from vllm.v1.worker.gpu.model_runner import GPUModelRunner
-
-    runner_classes = [GPUModelRunner]
-    if find_spec("vllm.v1.worker.gpu_model_runner") is not None:
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunner as GPUModelRunnerV1
-
-        runner_classes.append(GPUModelRunnerV1)
+    runner_classes = []
+    for module_name in ("vllm.v1.worker.gpu.model_runner", "vllm.v1.worker.gpu_model_runner"):
+        try:
+            runner = import_module(module_name)
+        except ModuleNotFoundError as error:
+            if error.name != module_name:
+                raise
+        else:
+            runner_classes.append(runner.GPUModelRunner)
 
     for runner_cls in runner_classes:
         _record_runner_on_load(runner_cls)

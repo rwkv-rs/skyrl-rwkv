@@ -51,11 +51,15 @@ def test_apply_is_idempotent(fake_runners):
     assert v1.load_model is wrapped
 
 
-def test_v2_module_missing_still_patches_v1(fake_runners, monkeypatch):
-    v1, _ = fake_runners
-    monkeypatch.setitem(sys.modules, "vllm.v1.worker.gpu.model_runner", None)
+@pytest.mark.parametrize(
+    ("missing_module", "installed"),
+    [("gpu.model_runner", 0), ("gpu_model_runner", 1)],
+    ids=["v1-only", "v2-only"],
+)
+def test_one_installed_runner_is_recorded(fake_runners, monkeypatch, missing_module, installed):
+    monkeypatch.setitem(sys.modules, f"vllm.v1.worker.{missing_module}", None)
     registry.apply_model_runner_registry_patch()
-    runner = v1()
+    runner = fake_runners[installed]()
     runner.load_model()
     assert registry.current_model_runner() is runner
 
